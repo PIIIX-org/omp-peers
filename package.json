@@ -12,6 +12,21 @@
   "bugs": "https://github.com/PIIIX-org/omp-peers/issues",
   "keywords": ["omp", "omp-extension", "omp-plugin", "peers", "multi-agent"],
   "files": ["extensions", "tools", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint extensions/peers.ts",
+    "test:watcher": "python3 -m unittest discover -s tests -p 'test_*.py'",
+    "test:smoke": "python3 tests/smoke.py",
+    "scan": "python3 scripts/leak_scan.py"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@oh-my-pi/pi-coding-agent": "18.18.1",
+    "@types/bun": "1.4.4",
+    "eslint": "9.39.5",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.72.2"
+  },
   "omp": {
     "extensions": ["./extensions/peers.ts"]
   }

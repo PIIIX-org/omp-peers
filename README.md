@@ -133,6 +133,8 @@ It reads the default-profile session files to inspect a peer's last assistant te
 
 ## Contributing
 
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the protected branch, CI, independent review, and merge-commit workflow. Every change goes through a pull request.
+
 Keep patches scoped and verify them with isolated OMP sessions. Use a temporary OS home when testing so you cannot send control requests to your real sessions. Do not commit credentials, transcripts, registry snapshots, watcher state, or logs. Preserve PR history with merge commits; squash/rebase merges and force pushes are not accepted.
 
 Run the integration smoke from this checkout:
