@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (c) 2026 PIIIX-org contributors
 """Exercise the installed plugin in two real OMP processes, without provider credentials."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -18,13 +19,15 @@ OMP = shutil.which("omp")
 
 
 class Peer:
-    def __init__(self, env, cwd):
+    def __init__(self, env, cwd, resume=None):
         self.frames = []
         self.responses = queue.Queue()
+        session_args = ["--session", resume] if resume else []
         self.proc = subprocess.Popen(
-            [OMP, "--mode", "rpc", "--no-session", "--no-title", "--no-tools",
+            [OMP, "--mode", "rpc", "--no-title", "--no-tools",
              "--no-skills", "--no-rules", "--no-context-files", "--no-lsp",
-             "--model", "smoke/first", "--system-prompt", "Offline plugin smoke."],
+             "--model", "smoke/first", "--system-prompt", "Offline plugin smoke.",
+             *session_args],
             env=env, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True,
         )
@@ -139,6 +142,7 @@ def main():
                 peer = Peer(env, root)
                 peers.append(peer)
                 peer.call("get_state")
+                peer.call("new_session")
             registry = home / ".omp" / "run" / "peers"
 
             def identities():
@@ -164,6 +168,106 @@ def main():
             master.command(f"/peers do {worker_id} effort high", "effort=high")
             master.command(f"/peers do {worker_id} subagents task=smoke/second:high", "task=smoke/second:high")
             master.command(f"/peers set {worker_id} get auth.broker.url", "protected")
+            # Persist names through the host API; no user prompts or provider turns.
+            master.call("set_session_name", name="smoke-master")
+            master.command("/peers master --restore", "Restore on resume enabled")
+            worker.command("/peers master", "master already held")
+            master_file = master.call("get_state")["sessionFile"]
+            worker_file = worker.call("get_state")["sessionFile"]
+
+            def row(peer_id):
+                try:
+                    return json.loads((registry / (peer_id + ".json")).read_text())
+                except (OSError, ValueError):
+                    return None
+
+            first_instance = row(master_id)["instance"]
+            master.close()
+            master = Peer(env, root, resume=master_file)
+            peers.append(master)
+            master.call("get_state")
+            wait_for(lambda: row(master_id) and row(master_id)["pid"] == master.proc.pid)
+            wait_for(lambda: row("master") and row("master")["id"] == master_id)
+            assert row(master_id)["instance"] != first_instance
+            assert row(master_id)["name"] == "smoke-master"
+            worker.command(f"/peers do {master_id} status", "smoke-master")
+            print("PASS clean restart: stable master address/name; new incarnation; role restored")
+
+            worker.close()
+            worker = Peer(env, root, resume=worker_file)
+            peers.append(worker)
+            worker.call("get_state")
+            wait_for(lambda: row(worker_id) and row(worker_id)["pid"] == worker.proc.pid)
+            master.command(f"/peers do {worker_id} status", "smoke-worker")
+            duplicate = Peer(env, root, resume=worker_file)
+            peers.append(duplicate)
+            duplicate.call("get_state")
+            duplicate.command("/peers master", "session already owned")
+            assert row(worker_id)["pid"] == worker.proc.pid
+            assert row("master")["id"] == master_id
+            duplicate.close()
+            master.command(f"/peers do {worker_id} status", "smoke-worker")
+            print("PASS duplicate writer denied without replacing owner or master")
+            print("PASS worker restart: original ID and name still route")
+
+            # A crash leaves stale registry/socket/claim files; kernel locks must recover.
+            master.proc.kill()
+            master.proc.wait(timeout=10)
+            master.close()
+            worker.command("/peers master", "now the master")
+            master = Peer(env, root, resume=master_file)
+            peers.append(master)
+            master.call("get_state")
+            wait_for(lambda: row(master_id) and row(master_id)["pid"] == master.proc.pid)
+            master.command("/peers master --restore", "master already held")
+            assert json.loads((registry / "master.json").read_text())["id"] == worker_id
+            worker.command("/peers release", "released")
+            wait_for(lambda: row("master") and row("master")["id"] == master_id)
+            master.command(f"/peers do {worker_id} status", "smoke-worker")
+            print("PASS crash recovery: stale claim replaced; live master not stolen; restore retries")
+
+            master.command("/peers release", "restore on resume disabled")
+            master.close()
+            master = Peer(env, root, resume=master_file)
+            peers.append(master)
+            master.call("get_state")
+            wait_for(lambda: row(master_id) and row(master_id)["pid"] == master.proc.pid)
+            assert not (registry / "master.json").exists()
+            master.command("/peers master", "now the master")
+            print("PASS release persists opt-out across restart")
+            # Switching to a new logical session must drop the old live claim.
+            result = master.call("new_session")
+            assert not result.get("cancelled")
+            new_session = master.call("get_state")["sessionId"]
+            wait_for(lambda: not (registry / (master_id + ".json")).exists())
+            assert not (registry / "master.json").exists()
+            master.call("switch_session", sessionPath=master_file)
+            assert master.call("get_state")["sessionId"] != new_session
+            master.command("/peers list", master_id)
+            assert not (registry / "master.json").exists()
+            master.command("/peers master", "now the master")
+            print("PASS session switch changes logical identity and releases old master claim")
+            master.command("/peers release", "released")
+            candidates = [master, worker]
+            starts = [len(peer.frames) for peer in candidates]
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                attempts = [executor.submit(peer.call, "prompt", message="/peers master")
+                            for peer in candidates]
+                for attempt in attempts:
+                    attempt.result(timeout=15)
+            notices = wait_for(lambda: [
+                [frame for frame in peer.frames[start:] if frame.get("method") == "notify"]
+                for peer, start in zip(candidates, starts)
+            ] if all(any(frame.get("method") == "notify" for frame in peer.frames[start:])
+                     for peer, start in zip(candidates, starts)) else None)
+            assert sum("now the master" in json.dumps(frames) for frames in notices) == 1
+            winner = master if row("master")["id"] == master_id else worker
+            winner.command("/peers release", "released")
+            master.command("/peers master", "now the master")
+            saved_dir = agent / "peer-sessions"
+            assert saved_dir.stat().st_mode & 0o777 == 0o700
+            assert all(file.stat().st_mode & 0o777 == 0o600 for file in saved_dir.glob("*.json"))
+            print("PASS simultaneous claims elect one master; durable metadata remains private")
             # Refuse inbound messages so an unexpected notification cannot start
             # a provider turn in this integration smoke.
             master.command("/peers refuse", "refuse")
