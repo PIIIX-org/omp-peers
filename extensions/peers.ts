@@ -559,11 +559,13 @@ export default function peers(pi: ExtensionAPI) {
 		if (state.timer) ctx.clearTimer(state.timer as never);
 		state.timer = ctx.setInterval(() => refresh(ctx), 5_000);
 	});
-	for (const ev of ["session_switch", "agent_start", "agent_end", "turn_end"] as const) {
-		pi.on(ev, async (_e, ctx) => {
-			if (ctx.agent.kind === "main" && state.server) refresh(ctx);
-		});
-	}
+	const refreshAfterEvent = async (_event: unknown, ctx: ExtensionContext) => {
+		if (ctx.agent.kind === "main" && state.server) refresh(ctx);
+	};
+	pi.on("session_switch", refreshAfterEvent);
+	pi.on("agent_start", refreshAfterEvent);
+	pi.on("agent_end", refreshAfterEvent);
+	pi.on("turn_end", refreshAfterEvent);
 	// Track the session's current task tier from the prompt it is about to work on (the master's explicit tier wins).
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind !== "main" || event.reason === "revive" || !event.prompt) return;
@@ -572,7 +574,7 @@ export default function peers(pi: ExtensionAPI) {
 		state.forcedTier = undefined;
 	});
 	// Subagent models: manual overrides set by the master win, then automatic tiering, never over an operator pin.
-	pi.on("before_subagent_spawn", async (event, ctx) => {
+	pi.on("before_subagent_spawn", async event => {
 		const manual = state.subModels[event.agent] ?? state.subModels["*"];
 		if (manual) return { model: manual, note: `peers master override: ${manual}` };
 		if (!autoActive() || event.agent === "seance" || (await operatorPinned(pi, event.agent))) return;
@@ -617,45 +619,49 @@ export default function peers(pi: ExtensionAPI) {
 		},
 	});
 
+	// The published host's Static<S> currently erases Zod parameter inference.
+	// Derive handler inputs directly from each validated schema instead.
+	const sendParameters = z.object({
+		to: z.string().describe("Peer id, name (or unique prefix), or 'all'"),
+		text: z.string().describe("Message body"),
+	});
 	pi.registerTool({
 		name: "peers_send",
 		label: "Message Peer",
 		description:
 			"Send a text message to another omp session (by id or name, or 'all'). It arrives as a peer message at the receiver's next step boundary, or starts a turn if it is idle. Use for hand-offs, findings, and questions; never to run commands.",
-		parameters: z.object({
-			to: z.string().describe("Peer id, name (or unique prefix), or 'all'"),
-			text: z.string().describe("Message body"),
-		}),
-		async execute(_id, p) {
+		parameters: sendParameters,
+		async execute(_id, p: typeof sendParameters.infer) {
 			const text = await fanout(p.to, { op: "message", text: p.text });
 			return { content: [{ type: "text", text }], details: {} };
 		},
 	});
 
+	const controlParameters = z.object({
+		to: z.string().describe("Peer id, name (or unique prefix), or 'all'"),
+		action: z.enum(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "status"]),
+		text: z
+			.string()
+			.optional()
+			.describe(
+				"prompt: the task. model: selector/@role. effort: off|minimal|low|medium|high|xhigh|max. subagents: 'auto' (automatic per-task tiering, always on) | 'auto-off' | 'auto-managed' (default: on only while a master exists) | 'clear' (drop manual overrides) | '<spec>' (pin all subagents) | 'agent=spec,agent2=spec2' where spec is a model selector (optionally ':high'), an @role, or a tier light|standard|heavy; manual pins beat auto and apply to subagents spawned afterwards. setting: mode get|set|clear|list (default get). rename: new name. tail: message count.",
+			),
+		key: z.string().optional().describe("setting only: setting id, e.g. task.agentModelOverrides, modelRoles, retry.fallbackChains; for mode=list an id prefix"),
+		value: z.string().optional().describe("setting set only: JSON value, e.g. {\"task\":\"@smol\"} or \"high\" or true"),
+		tier: z
+			.enum(["light", "standard", "heavy", "keep"])
+			.optional()
+			.describe(
+				"prompt only. Cost tier for the task: light (trivial/lookup), standard (normal coding), heavy (design/debug/refactor). Omit to auto-classify; 'keep' leaves the peer's model/effort unchanged. Prefer the cheapest tier that fits.",
+			),
+	});
 	pi.registerTool({
 		name: "peers_control",
 		label: "Control Peer",
 		description:
 			"MASTER ONLY. Control other omp sessions (by id/name or 'all'): prompt (give the session a task as if the user typed it), abort, compact, model (text=model spec), rename (text=name), tail (read its last messages; text=count), shutdown, status. Fails unless this session is the master (claimed by the user with /peers master).",
-		parameters: z.object({
-			to: z.string().describe("Peer id, name (or unique prefix), or 'all'"),
-			action: z.enum(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "status"]),
-			text: z
-				.string()
-				.optional()
-				.describe(
-					"prompt: the task. model: selector/@role. effort: off|minimal|low|medium|high|xhigh|max. subagents: 'auto' (automatic per-task tiering, always on) | 'auto-off' | 'auto-managed' (default: on only while a master exists) | 'clear' (drop manual overrides) | '<spec>' (pin all subagents) | 'agent=spec,agent2=spec2' where spec is a model selector (optionally ':high'), an @role, or a tier light|standard|heavy; manual pins beat auto and apply to subagents spawned afterwards. setting: mode get|set|clear|list (default get). rename: new name. tail: message count.",
-				),
-			key: z.string().optional().describe("setting only: setting id, e.g. task.agentModelOverrides, modelRoles, retry.fallbackChains; for mode=list an id prefix"),
-			value: z.string().optional().describe("setting set only: JSON value, e.g. {\"task\":\"@smol\"} or \"high\" or true"),
-			tier: z
-				.enum(["light", "standard", "heavy", "keep"])
-				.optional()
-				.describe(
-					"prompt only. Cost tier for the task: light (trivial/lookup), standard (normal coding), heavy (design/debug/refactor). Omit to auto-classify; 'keep' leaves the peer's model/effort unchanged. Prefer the cheapest tier that fits.",
-				),
-		}),
-		async execute(_id, p) {
+		parameters: controlParameters,
+		async execute(_id, p: typeof controlParameters.infer) {
 			if (p.action !== "status" && masterId() !== state.id) {
 				return { content: [{ type: "text", text: "error: this session is not the master; ask the user to run /peers master" }], details: {}, isError: true };
 			}

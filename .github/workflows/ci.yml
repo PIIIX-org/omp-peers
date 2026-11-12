@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Scan repository for private material
+        run: python3 scripts/leak_scan.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+      - name: Install locked tooling and published OMP host
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Typecheck against the published host API
+        run: npm run typecheck
+      - name: Lint extension
+        run: npm run lint
+      - name: Compile Python and run quick watcher and scanner tests
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/omp-peers-pycache
+        run: |
+          python3 -m py_compile tools/watch.py tests/smoke.py tests/test_watcher.py tests/test_leak_scan.py scripts/leak_scan.py
+          npm run test:watcher
+      - name: Exercise two real pinned OMP processes without provider calls
+        run: npm run test:smoke
