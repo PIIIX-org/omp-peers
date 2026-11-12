@@ -6,11 +6,13 @@ This repository contains the OMP extension and the optional Python peer watcher.
 
 ## Install
 
-Requires OMP 18.18.1 or newer on macOS or Linux. The extension uses Unix-domain sockets; Windows is unsupported. OMP supplies the TypeScript runtime and host APIs. No build step or separate npm dependencies are required. The optional watcher requires Python 3.
+Requires OMP 18.18.1 or newer on macOS or Linux, plus npm for installation. The extension uses Unix-domain sockets and OMP's native `FileLock` library; Windows is unsupported. OMP supplies the TypeScript runtime and host APIs. No build step is required. The optional watcher requires Python 3.
 
 ```sh
 git clone https://github.com/PIIIX-org/omp-peers.git
-omp plugin link ./omp-peers
+cd omp-peers
+npm ci --omit=dev --ignore-scripts
+omp plugin link .
 ```
 
 Start new OMP sessions after linking. For a one-session trial without installing:
@@ -35,7 +37,23 @@ Open two OMP sessions. In the coordinating session:
 /peers release
 ```
 
-Target a peer by its ID, exact name, or unique name/ID prefix. Use `all` to target the other peers. Targets exclude the sending session. `/peers` opens the interactive dashboard.
+Target a peer by its stable ID, exact name, or unique name/ID prefix. Use `all` to target the other peers. Targets exclude the sending session. `/peers` opens the interactive dashboard.
+
+### Session identity and master restoration
+
+Resume the same saved OMP session (`omp --session <session-file>` or OMP's resume picker) to keep its peer ID and name. Each ID derives from the host's session ID; PID and random `instance` identify the current process incarnation. Starting a new session or branching creates a new logical peer. Sessions without saved files cannot resume after exit.
+
+To remember master ownership for this session:
+
+```text
+/peers master --restore
+```
+
+`/peers master` claims the role without enabling restoration. The extension checks remembered ownership on startup and every five seconds. It waits while another live master owns the role; it does not replace that master. `/peers release` releases ownership and disables restoration for the current logical session, including after restart. Until you release it, closing or crashing a remembered master preserves that preference.
+
+Kernel-backed locks permit one plugin writer per logical session and one master. A second process opening the same session cannot publish a server, send peer requests or claim master; it reports `session already owned`. Close that process and resume it after the owner exits. The host may also reject duplicate sessions through its own session lease. Process exit releases the locks, including after a crash. A live legacy master also blocks a new claim, but legacy versions cannot honor the new lock protocol; upgrade all peers before relying on concurrent master claims.
+
+The extension stores names and restore preferences under `~/.omp/agent/peer-sessions` (`0700` directory, `0600` files), with lock/registry files under `~/.omp/run/peers`. Preserve this metadata when moving a saved session to another home. Do not publish it. The first upgrade changes the old process-only peer ID once; new peers still discover legacy six-hex IDs. Restart upgraded sessions to obtain stable addresses. Deleting a session's metadata forgets its restore preference and fallback name, but its session-derived ID stays the same.
 
 ### Tools
 
@@ -117,7 +135,7 @@ Registry files expose session names, working directories, models, session IDs, a
 
 `lock` rejects master control while permitting messages and status. `refuse` rejects all inbound requests. Set `OMP_PEERS_INBOUND=refuse` before launching a session to refuse inbound requests from startup. A new process starts unlocked unless configured to refuse.
 
-The registry and tier configuration use the fixed paths above, shared across OMP profiles under the same OS home. Profile isolation alone does not isolate these peers. Print/JSON sessions do not start a peer server; child agents do not get separate peer identities. On normal shutdown, the extension removes its registry/socket and releases its master claim. Listing peers also removes entries for dead processes.
+The registry and tier configuration use the fixed paths above, shared across OMP profiles under the same OS home. Profile isolation alone does not isolate these peers. Print/JSON sessions do not start a peer server; child agents share the main session's identity. On normal shutdown or a session switch, the extension removes its registry/socket and releases its live master claim; remembered master preferences remain until `/peers release`. Listing peers also removes entries for dead processes after acquiring their identity lock.
 
 ## Optional persistent peer watcher
 
@@ -151,7 +169,7 @@ Run the integration smoke from this checkout:
 python3 tests/smoke.py
 ```
 
-The smoke links the plugin into a temporary home, starts two real OMP RPC processes with a keyless local-only model configuration, and exercises control gates, model switching, and watcher cleanup. It uses no real provider credentials or model turns and removes its temporary state on exit.
+The smoke links the plugin into a temporary home and runs real OMP RPC processes with a keyless local-only model configuration. It exercises control gates, model switching, saved-session restarts, crash recovery, master contention/restore opt-out, and watcher cleanup. It uses no real provider credentials or model turns and removes its temporary state on exit.
 
 ## License
 

@@ -19,6 +19,9 @@
     "test:smoke": "python3 tests/smoke.py",
     "scan": "python3 scripts/leak_scan.py"
   },
+  "peerDependencies": {
+    "@oh-my-pi/pi-natives": ">=18.18.1"
+  },
   "devDependencies": {
     "@eslint/js": "9.39.5",
     "@oh-my-pi/pi-coding-agent": "18.18.1",

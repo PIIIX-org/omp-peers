@@ -18,12 +18,15 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { FileLock } from "@oh-my-pi/pi-natives";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as SettingsRegistry from "@oh-my-pi/pi-coding-agent/config/registry";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
+const SESSION_ROOT = path.join(os.homedir(), ".omp", "agent", "peer-sessions");
+const MASTER_LOCK = path.join(ROOT, "master.lock");
 const CONTROL_OPS = new Set(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown"]);
 // Settings the master may never touch remotely (credentials, trust/approval/sandbox, transports).
 const SETTING_DENY = /^(auth|secrets|collab|share|mcp|providers)\.|approval|token|apikey|api_key|password|credential|trust|sandbox|extension/i;
@@ -114,6 +117,7 @@ function routeFor(text: string, tier?: string): { tier: string; reason: string; 
 interface PeerInfo {
 	id: string;
 	pid: number;
+	instance: string;
 	name: string;
 	cwd: string;
 	sessionId: string;
@@ -140,10 +144,15 @@ interface Req {
 	n?: number;
 }
 
-// Module state is shared by every session bound in this process (subagents too), so it is
-// strictly per-process: one server, one identity.
+// Child agents share the main session's server; only one process may publish a logical session.
 const state = {
-	id: `p${randomBytes(3).toString("hex")}`,
+	id: "",
+	sessionId: "",
+	instance: randomBytes(8).toString("hex"),
+	sessionLock: undefined as FileLock | undefined,
+	masterLock: undefined as FileLock | undefined,
+	saved: { name: "", restoreMaster: false },
+	identityError: "",
 	startedAt: new Date().toISOString(),
 	server: undefined as net.Server | undefined,
 	ctx: undefined as ExtensionContext | undefined,
@@ -159,6 +168,68 @@ const state = {
 };
 const sockPath = () => path.join(ROOT, `${state.id}.sock`);
 const infoPath = (id: string) => path.join(ROOT, `${id}.json`);
+const sessionPath = () => path.join(SESSION_ROOT, `${state.id}.json`);
+
+function saveSession(): void {
+	writeJson(sessionPath(), { sessionId: state.sessionId, ...state.saved });
+}
+
+function releaseMaster(): void {
+	if (!state.masterLock) return;
+	const m = readJson<{ id: string; pid: number }>(MASTER_FILE);
+	if (m?.id === state.id && m.pid === process.pid) fs.rmSync(MASTER_FILE, { force: true });
+	state.masterLock.release();
+	state.masterLock = undefined;
+}
+
+function claimMaster(): string | undefined {
+	if (!state.sessionLock?.acquired) return state.identityError || "session identity unavailable";
+	const current = masterId();
+	if (current === state.id && state.masterLock?.acquired) return;
+	if (current) return `master already held by ${current}; ask that session to /peers release`;
+	const lock = FileLock.tryAcquire(MASTER_LOCK);
+	if (!lock.acquired) return "master claim in progress; retry after the next refresh";
+	// Recheck legacy masters which do not hold the kernel lock.
+	if (masterId()) {
+		lock.release();
+		return "another session holds the master role";
+	}
+	try {
+		writeJson(MASTER_FILE, { id: state.id, pid: process.pid, instance: state.instance, since: new Date().toISOString() });
+		state.masterLock = lock;
+	} catch (error) {
+		lock.release();
+		throw error;
+	}
+}
+
+function bindIdentity(sessionId: string): void {
+	if (state.sessionId === sessionId) return;
+	teardown();
+	state.sessionId = sessionId;
+	state.id = `p${createHash("sha256").update(sessionId).digest("hex").slice(0, 16)}`;
+	state.saved = { name: "", restoreMaster: false };
+	state.identityError = "";
+	for (const dir of [ROOT, SESSION_ROOT]) {
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		fs.chmodSync(dir, 0o700);
+	}
+	const lock = FileLock.tryAcquire(path.join(ROOT, `${state.id}.lock`));
+	if (!lock.acquired) {
+		state.identityError = `session already owned by another process (${state.id}); no peer server or master claim started`;
+		return;
+	}
+	state.sessionLock = lock;
+	const saved = readJson<{ sessionId: string; name?: string; restoreMaster?: boolean }>(sessionPath());
+	if (saved && saved.sessionId !== sessionId) {
+		lock.release();
+		state.sessionLock = undefined;
+		state.identityError = "session identity collision; refusing to overwrite stored identity";
+		return;
+	}
+	state.saved = { name: typeof saved?.name === "string" ? saved.name : "", restoreMaster: saved?.restoreMaster === true };
+	saveSession();
+}
 
 function alive(pid: number): boolean {
 	try {
@@ -189,8 +260,9 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 	const model = ctx?.model as { provider?: string; id?: string } | undefined;
 	return {
 		id: state.id,
+		instance: state.instance,
 		pid: process.pid,
-		name: pi.getSessionName() || path.basename(ctx?.cwd ?? process.cwd()),
+		name: pi.getSessionName() || state.saved.name || path.basename(ctx?.cwd ?? process.cwd()),
 		cwd: ctx?.cwd ?? process.cwd(),
 		sessionId: ctx?.sessionManager.getSessionId() ?? "",
 		model: model?.id ? `${model.provider ?? ""}/${model.id}` : "",
@@ -212,6 +284,11 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 function publish(pi: ExtensionAPI): void {
 	if (!state.server) return;
 	try {
+		const name = pi.getSessionName();
+		if (name && name !== state.saved.name) {
+			state.saved.name = name;
+			saveSession();
+		}
 		writeJson(infoPath(state.id), selfInfo(pi));
 	} catch {
 		// registry write is best-effort; the socket still serves `status`
@@ -219,19 +296,17 @@ function publish(pi: ExtensionAPI): void {
 }
 
 function masterId(): string | undefined {
-	const m = readJson<{ id: string; pid: number }>(MASTER_FILE);
-	if (!m) return undefined;
-	if (!alive(m.pid) || !fs.existsSync(infoPath(m.id))) {
-		fs.rmSync(MASTER_FILE, { force: true });
-		return undefined;
-	}
+	const m = readJson<{ id: string; pid: number; instance?: string }>(MASTER_FILE);
+	if (!m || !/^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/.test(m.id) || !alive(m.pid)) return undefined;
+	const peer = readJson<PeerInfo>(infoPath(m.id));
+	if (!peer || peer.pid !== m.pid || (m.instance && peer.instance !== m.instance)) return undefined;
 	return m.id;
 }
 
 function listPeers(): PeerInfo[] {
 	let files: string[] = [];
 	try {
-		files = fs.readdirSync(ROOT).filter(f => /^p[0-9a-f]{6}\.json$/.test(f));
+		files = fs.readdirSync(ROOT).filter(f => /^p(?:[0-9a-f]{6}|[0-9a-f]{16})\.json$/.test(f));
 	} catch {
 		return [];
 	}
@@ -240,8 +315,14 @@ function listPeers(): PeerInfo[] {
 		const info = readJson<PeerInfo>(path.join(ROOT, f));
 		if (!info || typeof info.pid !== "number" || typeof info.sock !== "string") continue;
 		if (!alive(info.pid)) {
-			fs.rmSync(path.join(ROOT, f), { force: true });
-			fs.rmSync(info.sock, { force: true });
+			const lock = FileLock.tryAcquire(path.join(ROOT, `${info.id}.lock`));
+			if (!lock.acquired) continue;
+			try {
+				fs.rmSync(path.join(ROOT, f), { force: true });
+				fs.rmSync(info.sock, { force: true });
+			} finally {
+				lock.release();
+			}
 			continue;
 		}
 		out.push(info);
@@ -466,7 +547,7 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 }
 
 function startServer(pi: ExtensionAPI): void {
-	if (state.server) return;
+	if (state.server || !state.sessionLock?.acquired) return;
 	fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
 	fs.chmodSync(ROOT, 0o700);
 	fs.rmSync(sockPath(), { force: true });
@@ -499,6 +580,7 @@ function startServer(pi: ExtensionAPI): void {
 			fs.chmodSync(sockPath(), 0o600);
 		} catch {}
 		publish(pi);
+		if (state.saved.restoreMaster) claimMaster();
 	});
 	server.unref();
 	state.server = server;
@@ -506,13 +588,15 @@ function startServer(pi: ExtensionAPI): void {
 }
 
 function teardown(): void {
-	if (!state.server) return;
-	state.server.close();
-	state.server = undefined;
-	fs.rmSync(sockPath(), { force: true });
-	fs.rmSync(infoPath(state.id), { force: true });
-	const m = readJson<{ id: string }>(MASTER_FILE);
-	if (m?.id === state.id) fs.rmSync(MASTER_FILE, { force: true });
+	releaseMaster();
+	if (state.server) {
+		state.server.close();
+		state.server = undefined;
+		fs.rmSync(sockPath(), { force: true });
+		fs.rmSync(infoPath(state.id), { force: true });
+	}
+	state.sessionLock?.release();
+	state.sessionLock = undefined;
 }
 
 function fmt(p: PeerInfo, master: string | undefined): string {
@@ -541,23 +625,29 @@ export default function peers(pi: ExtensionAPI) {
 
 	const bind = (ctx: ExtensionContext): boolean => {
 		if (ctx.agent.kind !== "main") return false;
+		bindIdentity(ctx.sessionManager.getSessionId());
 		state.ctx = ctx;
 		return true;
 	};
 	const refresh = (ctx: ExtensionContext) => {
 		if (!bind(ctx)) return;
+		if (state.identityError) {
+			ctx.ui.setStatus("peers", state.identityError);
+			return;
+		}
 		startServer(pi);
 		publish(pi);
+		if (state.saved.restoreMaster && state.server?.listening) claimMaster();
 		const n = listPeers().filter(p => p.id !== state.id).length;
 		const m = masterId();
 		ctx.ui.setStatus("peers", `peers:${n}${m === state.id ? " ★master" : m ? ` master:${m}` : ""}`);
 	};
 
 	pi.on("session_start", async (_e, ctx) => {
-		if (!bind(ctx) || ctx.mode === "print" || ctx.mode === "json") return;
+		if (ctx.mode === "print" || ctx.mode === "json" || !bind(ctx)) return;
 		refresh(ctx);
 		if (state.timer) ctx.clearTimer(state.timer as never);
-		state.timer = ctx.setInterval(() => refresh(ctx), 5_000);
+		state.timer = ctx.setInterval(() => refresh(state.ctx ?? ctx), 5_000);
 	});
 	const refreshAfterEvent = async (_event: unknown, ctx: ExtensionContext) => {
 		if (ctx.agent.kind === "main" && state.server) refresh(ctx);
@@ -590,6 +680,7 @@ export default function peers(pi: ExtensionAPI) {
 	const senderInfo = () => ({ id: state.id, name: selfInfo(pi).name });
 
 	async function fanout(spec: string, req: Omit<Req, "from">): Promise<string> {
+		if (!state.sessionLock?.acquired) return `error: ${state.identityError || "session identity unavailable"}`;
 		const { peers: targets, error } = resolveTargets(spec);
 		if (error) return `error: ${error}`;
 		let out = req;
@@ -622,7 +713,7 @@ export default function peers(pi: ExtensionAPI) {
 	// The published host's Static<S> currently erases Zod parameter inference.
 	// Derive handler inputs directly from each validated schema instead.
 	const sendParameters = z.object({
-		to: z.string().describe("Peer id, name (or unique prefix), or 'all'"),
+		to: z.string().describe("Stable peer id, name (or unique prefix), or 'all'"),
 		text: z.string().describe("Message body"),
 	});
 	pi.registerTool({
@@ -638,7 +729,7 @@ export default function peers(pi: ExtensionAPI) {
 	});
 
 	const controlParameters = z.object({
-		to: z.string().describe("Peer id, name (or unique prefix), or 'all'"),
+		to: z.string().describe("Stable peer id, name (or unique prefix), or 'all'"),
 		action: z.enum(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "status"]),
 		text: z
 			.string()
@@ -689,18 +780,29 @@ export default function peers(pi: ExtensionAPI) {
 			const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			const m = masterId();
 			const say = (s: string) => ctx.ui.notify(s, "info");
+			if (!state.sessionLock?.acquired) return say(state.identityError || "session identity unavailable");
 			switch (sub) {
 				case "list": {
 					return say(listPeers().map(p => fmt(p, m)).join("\n") || "(no peers)");
 				}
-				case "master":
-					fs.writeFileSync(MASTER_FILE, JSON.stringify({ id: state.id, pid: process.pid, since: new Date().toISOString() }), { mode: 0o600 });
+				case "master": {
+					if (rest.length && (rest.length !== 1 || rest[0] !== "--restore")) return say("usage: /peers master [--restore]");
+					const error = claimMaster();
+					if (error) return say(error);
+					if (rest[0] === "--restore") {
+						state.saved.restoreMaster = true;
+						saveSession();
+					}
 					refresh(ctx);
-					return say(`This session (${state.id}) is now the master.`);
+					return say(`This session (${state.id}) is now the master.${state.saved.restoreMaster ? " Restore on resume enabled." : ""}`);
+				}
 				case "release":
-					if (m === state.id) fs.rmSync(MASTER_FILE, { force: true });
+					if (!state.sessionLock?.acquired) return say(state.identityError);
+					state.saved.restoreMaster = false;
+					saveSession();
+					releaseMaster();
 					refresh(ctx);
-					return say("Master role released.");
+					return say("Master role released; restore on resume disabled.");
 				case "set": {
 					const [to, mode, key, ...v] = rest;
 					if (!to || !mode) return say("usage: /peers set <peer|all> <get|set|clear|list> [key] [json]");
