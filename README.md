@@ -119,17 +119,25 @@ Registry files expose session names, working directories, models, session IDs, a
 
 The registry and tier configuration use the fixed paths above, shared across OMP profiles under the same OS home. Profile isolation alone does not isolate these peers. Print/JSON sessions do not start a peer server; child agents do not get separate peer identities. On normal shutdown, the extension removes its registry/socket and releases its master claim. Listing peers also removes entries for dead processes.
 
-## Optional peer watcher
+## Optional persistent peer watcher
 
-From this checkout:
+Run from this checkout with Python 3.9 or newer:
 
 ```sh
 python3 tools/watch.py
 ```
 
-The watcher waits for a new/departed peer or a busy-to-idle transition that appears to need attention, prints a report, then exits. Run it as a supervised command if you want its completion to wake a coordinating session. It does not dispatch work or control peers.
+The watcher keeps running without OMP or a master. It queues metadata-only turn-ended notifications and sends batches to the current master through the local message RPC. **Delivery can start a model turn in the master and consume provider quota.** A turn-ended or idle event does not prove task completion; current peers do not report background-work quiescence.
 
-It reads the default-profile session files to inspect a peer's last assistant text. It stores its snapshot in `~/.omp-peer-watch/state.json` and skipped acknowledgement excerpts in `~/.omp-peer-watch/skipped.log`. Those files can contain private text; keep them local. Add peer IDs, one per line, to `~/.omp-peer-watch/ignore.txt` to exclude them. Phrase matching is heuristic and can miss a request for attention. The watcher polls at five-second intervals and waits two seconds for a finished peer to flush its reply.
+The watcher deduplicates by stable session and event IDs, keeps an outbox across restarts, and excludes the current master's events to prevent feedback. Initial idle peers, replacement-process initial idle states and departures do not count as completions. It reads peer registry and selected lifecycle-log metadata, never session transcripts. State lives under `$HOME/.omp-peer-watch` with a `0700` directory and `0600` files; state and logs still contain private session metadata. Only one watcher may use a runtime directory.
+
+For macOS startup independent of OMP:
+
+```sh
+python3 tools/install_watcher.py install
+```
+
+The installer renders a portable LaunchAgent template with `RunAtLoad` and `KeepAlive`. It accepts `--label`, `--state-dir` and `--python`; it refuses to overwrite an unmanaged watcher. Use `python3 tools/install_watcher.py uninstall` to stop and remove the default installation, or add `--purge` to remove its known state/log files. [Installation, migration, privacy and completion semantics](docs/watcher.md) cover custom labels and runtime directories, Linux foreground use, delivery limitations, and offline checks.
 
 ## Contributing
 

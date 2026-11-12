@@ -43,6 +43,7 @@ class LeakScanner(unittest.TestCase):
             "~/.omp/agent/sessions/*/*{sid}.jsonl",
             "~/.omp-peer-watch/state.json", "~/.omp-peer-watch/skipped.log",
             "~/.omp/run/peers/master.json",
+            "$HOME/.omp-peer-watch/watch.py",
         ):
             with self.subTest(kind="public metadata"):
                 self.assertEqual(leak_scan.line_findings(value), set())

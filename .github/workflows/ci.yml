@@ -43,7 +43,7 @@ jobs:
         env:
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}/omp-peers-pycache
         run: |
-          python3 -m py_compile tools/watch.py tests/smoke.py tests/test_watcher.py tests/test_leak_scan.py scripts/leak_scan.py
+          python3 -m py_compile tools/watch.py tools/install_watcher.py tests/smoke.py tests/test_watcher.py tests/test_leak_scan.py scripts/leak_scan.py
           npm run test:watcher
       - name: Exercise two real pinned OMP processes without provider calls
         run: npm run test:smoke

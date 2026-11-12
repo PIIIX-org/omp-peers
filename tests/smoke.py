@@ -164,15 +164,38 @@ def main():
             master.command(f"/peers do {worker_id} effort high", "effort=high")
             master.command(f"/peers do {worker_id} subagents task=smoke/second:high", "task=smoke/second:high")
             master.command(f"/peers set {worker_id} get auth.broker.url", "protected")
+            # Refuse inbound messages so an unexpected notification cannot start
+            # a provider turn in this integration smoke.
+            master.command("/peers refuse", "refuse")
             watcher = subprocess.Popen(
-                [sys.executable, str(REPO / "tools" / "watch.py")],
+                [sys.executable, str(REPO / "tools" / "watch.py"),
+                 "--home", root, "--interval", "0.05"],
                 env=env, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
-            wait_for(lambda: (home / ".omp-peer-watch" / "state.json").exists())
+            state_path = home / ".omp-peer-watch" / "completions.json"
+
+            def watcher_state():
+                try:
+                    state = json.loads(state_path.read_text())
+                    return state if len(state.get("sessions", {})) == 2 else None
+                except (OSError, ValueError):
+                    return None
+
+            wait_for(watcher_state)
+            assert watcher.poll() is None
+            assert watcher_state()["outbox"] == [], "initial idle is not a completion"
             worker.close()
-            report, errors = watcher.communicate(timeout=15)
-            assert watcher.returncode == 0 and "session GONE" in report, (report, errors)
-            print("PASS watcher:", report.strip())
+            wait_for(lambda: not (registry / (worker_id + ".json")).exists())
+            assert watcher.poll() is None, "persistent watcher exited on a departed peer"
+            assert watcher_state()["outbox"] == [], "departure is not a completion"
+            watcher.terminate()
+            report, errors = watcher.communicate(timeout=10)
+            assert watcher.returncode == 0, (report, errors)
+            assert "WATCHER_READY" in report and "WATCHER_STOPPED" in report, (report, errors)
+            assert "WATCHER_DELIVERED" not in report, report
+            assert state_path.stat().st_mode & 0o777 == 0o600
+            assert (home / ".omp-peer-watch").stat().st_mode & 0o777 == 0o700
+            print("PASS persistent watcher: initial idle/departure silent; clean shutdown")
             master.command("/peers release", "released")
             master.close()
             assert not list(registry.glob("p*.json"))
@@ -183,7 +206,11 @@ def main():
             if watcher is not None:
                 if watcher.poll() is None:
                     watcher.terminate()
-                watcher.communicate(timeout=10)
+                try:
+                    watcher.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    watcher.kill()
+                    watcher.communicate(timeout=5)
             for peer in peers:
                 peer.close()
     print("PASS temporary home removed; no real sessions or credentials used")
