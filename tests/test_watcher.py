@@ -339,6 +339,47 @@ class InstallerChecks(unittest.TestCase):
                 install_watcher.uninstall(home, runtime, label, purge=True)
                 self.assertFalse(runtime.exists())
 
+    def test_managed_upgrade_and_uninstall_wait_for_kernel_lock_release(self):
+        for action in ("upgrade", "uninstall"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
+                home = Path(root)
+                runtime = home / "runtime"
+                label = "org.example.watcher"
+                with patch.object(install_watcher, "launchctl") as ctl:
+                    ctl.return_value.returncode = 0
+                    install_watcher.install(home, runtime, label, Path(sys.executable))
+                child = subprocess.Popen(
+                    [sys.executable, "-c",
+                     "import fcntl,sys,time; f=open(sys.argv[1],'a+'); "
+                     "fcntl.flock(f,fcntl.LOCK_EX); print('LOCKED',flush=True); "
+                     "sys.stdin.readline(); time.sleep(0.1); f.close()",
+                     str(runtime / "completion.lock")],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                )
+                try:
+                    self.assertEqual(child.stdout.readline().strip(), "LOCKED")
+
+                    def stop_before_exit(*arguments, **_kwargs):
+                        if arguments[0] == "bootout":
+                            child.stdin.write("stop\n")
+                            child.stdin.flush()
+                        return subprocess.CompletedProcess(arguments, 0)
+
+                    with patch.object(install_watcher, "launchctl", side_effect=stop_before_exit):
+                        if action == "upgrade":
+                            install_watcher.install(home, runtime, label, Path(sys.executable))
+                            self.assertTrue((runtime / "watch.py").exists())
+                        else:
+                            install_watcher.uninstall(home, runtime, label, purge=True)
+                            self.assertFalse(runtime.exists())
+                    self.assertEqual(child.wait(timeout=5), 0)
+                finally:
+                    if child.poll() is None:
+                        child.terminate()
+                        child.wait(timeout=5)
+                    child.stdin.close()
+                    child.stdout.close()
+
     def test_installer_refuses_unmanaged_or_running_watcher(self):
         with tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
             home = Path(root)

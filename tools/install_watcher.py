@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from watch import private_directory, private_open
 
@@ -71,6 +72,19 @@ def launchctl(*arguments, check=True):
     return subprocess.run(["launchctl", *arguments], check=check, capture_output=True, text=True)
 
 
+def acquire_runtime_lock(lock, wait_for_exit=False):
+    # launchctl bootout can return before the managed Python process exits.
+    deadline = time.monotonic() + (10 if wait_for_exit else 0)
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("a watcher is still running; stop it before changing installation") from None
+            time.sleep(0.05)
+
+
 def install(home, state_dir, label, python):
     state_dir = private_directory(state_dir)
     agents = home / "Library/LaunchAgents"
@@ -84,16 +98,15 @@ def install(home, state_dir, label, python):
         raise ValueError("refusing to overwrite an unmanaged watcher or launch agent")
     domain = "gui/" + str(os.getuid())
     service = domain + "/" + label
+    wait_for_exit = False
     if manifest is not None:
         bootout = launchctl("bootout", service, check=False)
         if bootout.returncode and launchctl("print", service, check=False).returncode == 0:
             raise RuntimeError("could not stop the installed launch agent")
+        wait_for_exit = bootout.returncode == 0
     # Do not replace files used by a manually launched or operational watcher.
     with private_open(state_dir / "completion.lock") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError("a watcher is still running; stop it before installing") from None
+        acquire_runtime_lock(lock, wait_for_exit)
         source = Path(__file__).resolve().parent
         rendered = render_plist(source / "launchd/peer-watcher.plist.in", home, state_dir, python, label)
         for name in ("watcher.stdout.log", "watcher.stderr.log"):
@@ -121,10 +134,7 @@ def uninstall(home, state_dir, label, purge=False):
     if result.returncode and launchctl("print", service, check=False).returncode == 0:
         raise RuntimeError("could not stop the installed launch agent")
     with private_open(state_dir / "completion.lock") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError("a watcher is still running; stop it before uninstalling") from None
+        acquire_runtime_lock(lock, result.returncode == 0)
         for path in (plist, state_dir / "watch.py", state_dir / "install.json"):
             path.unlink(missing_ok=True)
         if purge:
