@@ -1,0 +1,18 @@
+{
+  "name": "@piiix/omp-peers",
+  "version": "0.1.0",
+  "description": "Local peer-session messaging, master control, and model routing for OMP.",
+  "license": "(MIT OR Apache-2.0)",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PIIIX-org/omp-peers.git"
+  },
+  "homepage": "https://github.com/PIIIX-org/omp-peers#readme",
+  "bugs": "https://github.com/PIIIX-org/omp-peers/issues",
+  "keywords": ["omp", "omp-extension", "omp-plugin", "peers", "multi-agent"],
+  "files": ["extensions", "tools", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
+  "omp": {
+    "extensions": ["./extensions/peers.ts"]
+  }
+}
