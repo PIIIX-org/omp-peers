@@ -66,6 +66,7 @@ def line_findings(line):
                 "~/.omp-peer-watch/state.json", "~/.omp-peer-watch/skipped.log",
                 "~/.omp-peer-watch/ignore.txt",
                 "~/.omp/run/peers/master.json",
+                "$HOME/.omp-peer-watch/watch.py",
             }:
                 found.add("runtime artifact path")
     for pattern in (IPV4, IPV6):
