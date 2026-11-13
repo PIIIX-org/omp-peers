@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Structured reports
+
+- Replace kind-only markers with strict DONE/BLOCKED/WAITING/DECISION objects, per-kind required human fields, explicit WAITING background state and separate DONE evidence references.
+- Validate tool, JSON command and inbound socket reports before delivery; render readable labeled lines without reconstructing compressed prose. Preserve multilingual segmentation, attribution, ordinary messages and metadata-only receipt correlation.
+- Add deterministic consumer coverage and an isolated keyless OMP/local-socket report scenario.
+
+
 - Require branch-based pull requests, independent review as wafa, passing CI, and merge commits before updating `main`.
 - Add hosted CI for TypeScript checks, Python verification, publication leak checks, and isolated plugin smoke coverage.
 - Document the contribution workflow and add a pull request template.

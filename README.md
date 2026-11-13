@@ -60,10 +60,45 @@ The extension stores names and restore preferences under `~/.omp/agent/peer-sess
 ### Tools
 
 - `peers_list`: list sessions, models, effort, busy/idle state, background job/subagent counts, settled state, context usage, and the master.
-- `peers_send`: deliver an agent-attributed message to a peer or `all`. Set optional `report: "DONE" | "BLOCKED" | "WAITING" | "DECISION"` for an explicit report. The body takes the ordinary route immediately; a successful same-turn delivery to the current master can suppress a redundant watcher notice. Use `/peers report <peer|all> <kind> <text>` from the command interface.
+- `peers_send`: deliver an agent-attributed message to a peer or `all`. Supply either `text` for an ordinary message or `report` for a structured report, never both. Reports deliver immediately; successful same-turn main-session delivery to the current master can suppress a redundant watcher notice.
 - `peers_control`: master-only prompt, abort, compact, model, effort, subagents, setting, rename, tail, or shutdown. `status` does not require master ownership.
 
 A message to an idle peer can start a model turn and consume its provider quota. A master's `prompt` starts or queues user work. `abort`, `compact`, and `shutdown` affect running sessions; review your target before sending them. Status and tail inspect local state without asking a model.
+
+### Structured reports
+
+Tool input is `{ "to": "<peer|all>", "report": { ... } }`. The command accepts the same report object as JSON: `/peers report <peer|all> <json-report>`. No shell quoting around the JSON is needed. Ordinary `/peers msg` and `text` messages are unchanged.
+
+| `kind` | Required report fields |
+| --- | --- |
+| `DONE` | `unit`, `evidence: { description, references? }` |
+| `BLOCKED` | `unit`, `blocker`, `nextAction` |
+| `WAITING` | `unit`, `background: "pending" \| "none" \| "unknown"`, `nextAction` |
+| `DECISION` | `unit`, `question` |
+
+All objects reject unknown fields. `unit`, `description`, `blocker`, `nextAction` and `question` are human descriptions, not identifiers: one trimmed line, 1–240 UTF-16 code units, no control/format characters, with at least two letter-bearing Unicode word segments. Two segments must have whitespace between them or a natural adjacent word boundary from `Intl.Segmenter("und")`. This rejects single identifiers, URLs and space-stripped Latin prose without guessing missing spaces. CJK and other naturally segmented scripts need no ASCII spaces. Segmentation is Unicode/ICU-dependent; single-word descriptions must be expanded, punctuation-only boundaries do not count, and format characters (including joiners) are deliberately unsupported. This checks explicit readable structure, not grammar, truth, language or hidden compression inside otherwise valid text.
+
+DONE evidence requires a readable `description`; optional `references` holds 1–8 nonempty whitespace-free identifiers/URLs (at most 512 code units each, no controls/format characters). References alone cannot replace that description. WAITING always states background work explicitly; `none` and `unknown` are not inferred DONE. Reports do not inspect jobs or prove completion. Include any decision choices/context in `question`.
+
+For example:
+
+```text
+/peers report <peer> {"kind":"DONE","unit":"Report validation","evidence":{"description":"Consumer checks passed","references":["tests/notifications.ts"]}}
+```
+
+The attributed agent message contains exactly:
+
+```text
+DONE
+Unit: Report validation
+Evidence: Consumer checks passed
+References: tests/notifications.ts
+```
+
+Other kinds render `KIND`, `Unit: …`, then `Blocker: …` and `Next action: …`; `Background: pending|none|unknown` and `Next action: …`; or `Question: …`, respectively, on separate lines. References are comma-separated on a single optional line. Invalid tool, command or inbound socket reports fail before delivery/rate consumption; no reconstruction or partial delivery is attempted.
+
+The local message RPC carries `{ "op": "message", "report": { ... }, "from": { ... } }` without `text`. Same-user trust, refusal, rate limits, attribution and master controls are unchanged. Receipt journals store only kind and session/turn/destination metadata, never report fields. Child-agent reports still deliver but cannot suppress their parent's turn notice. Upgrade both ends: the old `report: "DONE"` marker API and old command syntax are rejected, not interpreted as missing structured fields. Old receivers reject report-only messages as empty; new structured reports are not silently downgraded. Explicitly send ordinary `text` if a legacy peer must receive a message (without report suppression).
+
 
 ### Background activity and quiescence
 

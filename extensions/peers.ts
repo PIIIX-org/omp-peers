@@ -22,8 +22,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as SettingsRegistry from "@oh-my-pi/pi-coding-agent/config/registry";
-import { Notifications, type ReportKind } from "./notifications";
+import { Notifications } from "./notifications";
 import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
+import { readMessage, sendParameters, type Report } from "../lib/reports";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
@@ -147,7 +148,7 @@ interface Req {
 	key?: string;
 	value?: unknown;
 	n?: number;
-	report?: ReportKind;
+	report?: Report;
 }
 
 // Child agents share the main session's server; only one process may publish a logical session.
@@ -459,6 +460,7 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 	const ctx = state.ctx;
 	if (!ctx) return { ok: false, error: "session not ready" };
 	if (state.inbound === "refuse") return { ok: false, error: "peer refuses inbound requests" };
+	if (req.report !== undefined && req.op !== "message") return { ok: false, error: "report is valid only for message requests" };
 	const text = typeof req.text === "string" ? req.text : "";
 	if (CONTROL_OPS.has(req.op)) {
 		if (!state.control) return { ok: false, error: "peer is locked (control refused)" };
@@ -468,7 +470,12 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 		case "status":
 			return { ok: true, info: selfInfo(pi) };
 		case "message": {
-			if (!text) return { ok: false, error: "empty message" };
+			let text: string;
+			try {
+				text = readMessage(req).text;
+			} catch (error) {
+				return { ok: false, error: `invalid message/report: ${(error as Error).message}` };
+			}
 			const from = req.from ?? { id: "?", name: "unknown" };
 			if (!rateOk(from.id)) return { ok: false, error: "rate limited" };
 			pi.sendMessage(
@@ -698,7 +705,16 @@ export default function peers(pi: ExtensionAPI) {
 
 	const senderInfo = () => ({ id: state.id, name: selfInfo(pi).name });
 
-	async function fanout(spec: string, req: Omit<Req, "from">): Promise<string> {
+	async function fanout(spec: string, req: Omit<Req, "from">, recordReport = true): Promise<string> {
+		if (req.op === "message") {
+			try {
+				const message = readMessage(req);
+				// Reports travel as structured data, never as a legacy marker plus rendered text.
+				req = message.report ? { op: "message", report: message.report } : { op: "message", text: message.text };
+			} catch (error) {
+				return `error: invalid message/report: ${(error as Error).message}`;
+			}
+		}
 		if (!state.sessionLock?.acquired) return `error: ${state.identityError || "session identity unavailable"}`;
 		const { peers: targets, error } = resolveTargets(spec);
 		if (error) return `error: ${error}`;
@@ -714,8 +730,8 @@ export default function peers(pi: ExtensionAPI) {
 		const lines = await Promise.all(
 			targets.map(async t => {
 				const response = await call(t, { ...out, from: senderInfo() });
-				if (req.op === "message" && req.report && reportMaster === t.id && masterId() === t.id) {
-					notifications.reported(turn, req.report, t, response);
+				if (req.op === "message" && req.report && recordReport && reportMaster === t.id && masterId() === t.id) {
+					notifications.reported(turn, req.report.kind, t, response);
 				}
 				return `${t.name} (${t.id}): ${summarize(response)}`;
 			}),
@@ -739,21 +755,19 @@ export default function peers(pi: ExtensionAPI) {
 
 	// The published host's Static<S> currently erases Zod parameter inference.
 	// Derive handler inputs directly from each validated schema instead.
-	const sendParameters = z.object({
-		to: z.string().describe("Stable peer id, name (or unique prefix), or 'all'"),
-		text: z.string().describe("Message body"),
-		report: z.enum(["DONE", "BLOCKED", "WAITING", "DECISION"]).optional().describe("Explicit report kind; deliver immediately and avoid a redundant same-turn watcher notice to this recipient"),
-	});
 	pi.registerTool({
 		name: "peers_send",
 		label: "Message Peer",
 		description:
-			"Send a text message to another omp session (by id or name, or 'all'). It arrives as a peer message at the receiver's next step boundary, or starts a turn if it is idle. Use for hand-offs, findings, and questions; never to run commands. Set report for an explicit DONE/BLOCKED/WAITING/DECISION report; ordinary messages do not suppress watcher notices.",
+			"Send an agent-attributed message to a peer or 'all'. Supply either ordinary text or a structured report (kind plus required human-readable fields). Reports deliver immediately; only acknowledged main-session reports suppress exact same-turn watcher notices. Idle recipients may start a turn.",
 		parameters: sendParameters,
 		async execute(_id, p: typeof sendParameters.infer, _signal, _onUpdate, ctx) {
-			const report = ctx.agent.kind === "main" && ctx.sessionManager.getSessionId() === state.sessionId ? p.report : undefined;
-			const text = await fanout(p.to, { op: "message", text: p.text, report });
-			return { content: [{ type: "text", text }], details: {} };
+			const parsed = sendParameters.safeParse(p);
+			const text = parsed.success
+				? await fanout(parsed.data.to, { op: "message", text: parsed.data.text, report: parsed.data.report },
+					ctx.agent.kind === "main" && ctx.sessionManager.getSessionId() === state.sessionId)
+				: `error: invalid message/report: ${parsed.error.message}`;
+			return { content: [{ type: "text", text }], details: {}, ...(text.startsWith("error:") ? { isError: true } : {}) };
 		},
 	});
 
@@ -803,7 +817,7 @@ export default function peers(pi: ExtensionAPI) {
 	const ACTIONS = ["message", "prompt", "tail", "abort", "compact", "rename", "model", "effort", "subagents", "shutdown"] as const;
 	pi.registerCommand("peers", {
 		description:
-			"Peer sessions: /peers [list|master|release|msg <peer> <text>|report <peer> <DONE|BLOCKED|WAITING|DECISION> <text>|do <peer|all> <action> [text]|set <peer|all> <get|set|clear|list> <key> [json]|route [on|off]|accept|refuse|lock|unlock]",
+			"Peer sessions: /peers [list|master|release|msg <peer> <text>|report <peer> <json-report>|do <peer|all> <action> [text]|set <peer|all> <get|set|clear|list> <key> [json]|route [on|off]|accept|refuse|lock|unlock]",
 		handler: async (args, ctx) => {
 			refresh(ctx);
 			const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
@@ -865,11 +879,13 @@ export default function peers(pi: ExtensionAPI) {
 					publish(pi);
 					return say(`Control from master: ${state.control ? "allowed" : "refused"}`);
 				case "report": {
-					const [to, kind, ...text] = rest;
-					if (!to || !text.length || !["DONE", "BLOCKED", "WAITING", "DECISION"].includes(kind)) {
-						return say("usage: /peers report <peer|all> <DONE|BLOCKED|WAITING|DECISION> <text>");
+					const match = /^report\s+(\S+)\s+([\s\S]+)$/.exec(args.trim());
+					if (!match) return say("usage: /peers report <peer|all> <json-report>");
+					try {
+						return say(await fanout(match[1], { op: "message", report: JSON.parse(match[2]) }));
+					} catch (error) {
+						return say(`error: invalid report JSON: ${(error as Error).message}`);
 					}
-					return say(await fanout(to, { op: "message", text: text.join(" "), report: kind as ReportKind }));
 				}
 				case "msg": {
 					const [to, ...t] = rest;
