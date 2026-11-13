@@ -18,13 +18,14 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as SettingsRegistry from "@oh-my-pi/pi-coding-agent/config/registry";
 import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Notifications, type ReportKind } from "./notifications";
 import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
+import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
@@ -220,7 +221,7 @@ function bindIdentity(sessionId: string): void {
 	teardown();
 	state.sessionId = sessionId;
 	notifications.bind(sessionId);
-	state.id = `p${createHash("sha256").update(sessionId).digest("hex").slice(0, 16)}`;
+	state.id = stablePeerId(sessionId);
 	state.saved = { name: "", restoreMaster: false, routingPolicy: "keep" };
 	state.identityError = "";
 	for (const dir of [ROOT, SESSION_ROOT]) {
@@ -324,7 +325,7 @@ function masterId(): string | undefined {
 	return m.id;
 }
 
-function listPeers(): PeerInfo[] {
+function scanPeers(): PeerInfo[] {
 	let files: string[] = [];
 	try {
 		files = fs.readdirSync(ROOT).filter(f => /^p(?:[0-9a-f]{6}|[0-9a-f]{16})\.json$/.test(f));
@@ -334,7 +335,7 @@ function listPeers(): PeerInfo[] {
 	const out: PeerInfo[] = [];
 	for (const f of files) {
 		const info = readJson<PeerInfo>(path.join(ROOT, f));
-		if (!info || typeof info.pid !== "number" || typeof info.sock !== "string") continue;
+		if (!info || info.id !== f.slice(0, -5) || typeof info.pid !== "number" || typeof info.sock !== "string" || typeof info.name !== "string") continue;
 		if (!alive(info.pid)) {
 			const lock = FileLock.tryAcquire(path.join(ROOT, `${info.id}.lock`));
 			if (!lock.acquired) continue;
@@ -346,21 +347,25 @@ function listPeers(): PeerInfo[] {
 			}
 			continue;
 		}
-		out.push(info);
+		out.push({ ...info, sessionId: typeof info.sessionId === "string" ? info.sessionId : "" });
 	}
 	return out.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
 }
 
-function resolveTargets(spec: string): { peers: PeerInfo[]; error?: string } {
-	const all = listPeers().filter(p => p.id !== state.id);
-	if (spec === "all") return all.length ? { peers: all } : { peers: [], error: "no other peers" };
-	const s = spec.toLowerCase();
-	const exact = all.filter(p => p.id === s || p.name.toLowerCase() === s);
-	if (exact.length === 1) return { peers: exact };
-	const pool = exact.length ? exact : all.filter(p => p.id.startsWith(s) || p.name.toLowerCase().startsWith(s));
-	if (pool.length === 1) return { peers: pool };
-	if (pool.length === 0) return { peers: [], error: `no peer matches "${spec}"` };
-	return { peers: [], error: `"${spec}" is ambiguous: ${pool.map(p => `${p.name} (${p.id})`).join(", ")}` };
+async function listPeers(): Promise<Array<PeerInfo & IdentityStatus>> {
+	return identifyPeers(scanPeers(), async peer => {
+		const lockPath = path.join(ROOT, `${peer.id}.lock`);
+		if (!FileLock.isHeld(lockPath)) return false;
+		const response = peer.id === state.id && peer.instance === state.instance
+			? { ok: true, sessionOwner: state.sessionLock?.acquired === true,
+				info: { id: state.id, pid: process.pid, instance: state.instance, sessionId: state.sessionId, sock: sockPath() } }
+			: await call(peer, { op: "status" }, 1_000);
+		return matchesWriter(peer, response, FileLock.isHeld(lockPath));
+	});
+}
+
+async function resolveTargets(spec: string): Promise<{ peers: PeerInfo[]; error?: string }> {
+	return resolvePeerTargets(spec, await listPeers(), state.id, state.sessionId);
 }
 
 function call(peer: PeerInfo, req: Req, timeoutMs = 10_000): Promise<Record<string, unknown>> {
@@ -496,7 +501,7 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 	}
 	switch (req.op) {
 		case "status":
-			return { ok: true, info: selfInfo(pi) };
+			return { ok: true, info: selfInfo(pi), sessionOwner: state.sessionLock?.acquired === true };
 		case "message": {
 			if (!text) return { ok: false, error: "empty message" };
 			const from = req.from ?? { id: "?", name: "unknown" };
@@ -637,8 +642,9 @@ function teardown(): void {
 	state.sessionLock = undefined;
 }
 
-function fmt(p: PeerInfo, master: string | undefined): string {
-	const flags = [p.id === master ? "★master" : "", p.id === state.id ? "this" : "", p.inbound === "refuse" ? "refuses" : p.control ? "" : "locked"]
+function fmt(p: PeerInfo & Partial<IdentityStatus>, master: string | undefined): string {
+	const flags = [p.id === master ? "★master" : "", p.id === state.id ? "this" : "", p.inbound === "refuse" ? "refuses" : p.control ? "" : "locked",
+		...(p.duplicateNames && p.duplicateSession ? identityFlags(p as PeerInfo & IdentityStatus) : [])]
 		.filter(Boolean)
 		.join(",");
 	const home = os.homedir();
@@ -677,7 +683,7 @@ export default function peers(pi: ExtensionAPI) {
 		publish(pi);
 		if (state.masterLock && masterId() !== state.id) releaseMaster();
 		if (state.saved.restoreMaster && state.server?.listening) claimMaster();
-		const n = listPeers().filter(p => p.id !== state.id).length;
+		const n = scanPeers().filter(p => p.id !== state.id).length;
 		const m = masterId();
 		ctx.ui.setStatus("peers", `peers:${n}${m === state.id ? " ★master" : m ? ` master:${m}` : ""}`);
 	};
@@ -744,7 +750,7 @@ export default function peers(pi: ExtensionAPI) {
 
 	async function fanout(spec: string, req: Omit<Req, "from">): Promise<string> {
 		if (!state.sessionLock?.acquired) return `error: ${state.identityError || "session identity unavailable"}`;
-		const { peers: targets, error } = resolveTargets(spec);
+		const { peers: targets, error } = await resolveTargets(spec);
 		if (error) return `error: ${error}`;
 		let out = req;
 		let note = "";
@@ -776,7 +782,7 @@ export default function peers(pi: ExtensionAPI) {
 		parameters: z.object({}),
 		async execute() {
 			const m = masterId();
-			const text = listPeers().map(p => fmt(p, m)).join("\n") || "(no peers)";
+			const text = (await listPeers()).map(p => fmt(p, m)).join("\n") || "(no peers)";
 			return { content: [{ type: "text", text }], details: { master: m } };
 		},
 	});
@@ -860,7 +866,7 @@ export default function peers(pi: ExtensionAPI) {
 			if (!state.sessionLock?.acquired) return say(state.identityError || "session identity unavailable");
 			switch (sub) {
 				case "list": {
-					return say(listPeers().map(p => fmt(p, m)).join("\n") || "(no peers)");
+					return say((await listPeers()).map(p => fmt(p, m)).join("\n") || "(no peers)");
 				}
 				case "master": {
 					if (rest.length && (rest.length !== 1 || rest[0] !== "--restore")) return say("usage: /peers master [--restore]");
@@ -939,7 +945,7 @@ export default function peers(pi: ExtensionAPI) {
 				}
 				default: {
 					// interactive dashboard
-					const peersNow = listPeers().filter(p => p.id !== state.id);
+					const peersNow = (await listPeers()).filter(p => p.id !== state.id);
 					if (!peersNow.length) return say(`No other peers. This session is ${state.id}.${m === state.id ? " (master)" : ""}`);
 					const rows = new Map(peersNow.map(p => [fmt(p, m), p]));
 					const pickedLabel = await ctx.ui.select(m === state.id ? "Peers (you are master)" : "Peers", [...rows.keys()]);
