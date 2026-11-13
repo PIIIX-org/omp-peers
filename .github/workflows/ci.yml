@@ -18,15 +18,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.13'
       - name: Scan repository for private material
         run: python3 scripts/leak_scan.py
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -55,5 +55,5 @@ jobs:
         run: npm run test:smoke
       - name: Exercise real session jobs without model turns
         run: npm run test:activity-smoke
-      - name: Exercise actual OMP pin reports without provider turns
+      - name: Exercise actual OMP pin and upstream routing with a loopback fake gateway
         run: npm run test:routing-smoke
