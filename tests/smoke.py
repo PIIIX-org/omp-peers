@@ -333,7 +333,7 @@ def main():
             worker.command("/peers accept", "accept")
             master.command(f"/peers do {worker_id} model smoke/second", "ok")
             assert worker.call("get_state")["model"]["id"] == "second"
-            master.command(f"/peers do {worker_id} effort high", "effort=high")
+            master.command(f"/peers do {worker_id} effort high", "-> high")
             master.command(f"/peers do {worker_id} subagents task=smoke/second:high", "task=smoke/second:high")
             master.command(f"/peers set {worker_id} get auth.broker.url", "protected")
             # Persist names through the host API; no user prompts or provider turns.

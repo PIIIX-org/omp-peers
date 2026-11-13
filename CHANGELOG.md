@@ -6,6 +6,7 @@
 - Add hosted CI for TypeScript checks, Python verification, publication leak checks, and isolated plugin smoke coverage.
 - Document the contribution workflow and add a pull request template.
 - Release displaced master locks during claims and periodic refresh without removing a live legacy master's claim; recover without restarting the displaced peer. Cover non-restoring and auto-restoring masters with isolated real-OMP lock probes.
+- Keep session models and effort on default peer dispatch; persist a local `/peers unpin` automatic-routing opt-in and re-pin explicit master overrides. Report old/new selections and routing reasons, fail unavailable requests without dispatch/partial effort changes, and respect operator task pins before peer subagent overrides.
 - Warn on duplicate peer names/logical identities, prove canonical writers through live socket incarnation and lock ownership, and prioritize exact IDs over colliding names. Refuse unresolved duplicate-session broadcasts before delivery; deduplicate proved aliases without deleting live registrations.
 - Add deterministic duplicate-routing regressions and keyless isolated OMP/local-socket duplicate scenarios.
 
