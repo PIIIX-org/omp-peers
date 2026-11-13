@@ -39,11 +39,15 @@ jobs:
         run: npm run typecheck
       - name: Lint extension
         run: npm run lint
+      - name: Check background activity and quiescence regressions
+        run: npm run test:activity
       - name: Compile Python and run quick watcher and scanner tests
         env:
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}/omp-peers-pycache
         run: |
-          python3 -m py_compile tools/watch.py tools/install_watcher.py tests/smoke.py tests/test_watcher.py tests/test_leak_scan.py scripts/leak_scan.py
+          python3 -m py_compile tools/watch.py tools/install_watcher.py tests/smoke.py tests/activity_smoke.py tests/test_watcher.py tests/test_leak_scan.py scripts/leak_scan.py
           npm run test:watcher
       - name: Exercise two real pinned OMP processes without provider calls
         run: npm run test:smoke
+      - name: Exercise real session jobs without model turns
+        run: npm run test:activity-smoke

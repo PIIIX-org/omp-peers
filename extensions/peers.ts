@@ -22,6 +22,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as SettingsRegistry from "@oh-my-pi/pi-coding-agent/config/registry";
+import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
@@ -114,7 +115,7 @@ function routeFor(text: string, tier?: string): { tier: string; reason: string; 
 	return { ...picked, model: cfg.model, effort: cfg.effort };
 }
 
-interface PeerInfo {
+interface PeerInfo extends PeerActivity {
 	id: string;
 	pid: number;
 	instance: string;
@@ -272,6 +273,7 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 			...Object.entries(state.subModels).map(([a, m]) => `${a}=${m}`),
 		].join(" "),
 		busy: ctx ? !ctx.isIdle() : false,
+		...readActivity(ctx),
 		context: usage?.tokens != null ? `${usage.tokens}${usage.percent != null ? ` (${Math.round(usage.percent)}%)` : ""}` : "",
 		sock: sockPath(),
 		startedAt: state.startedAt,
@@ -605,7 +607,7 @@ function fmt(p: PeerInfo, master: string | undefined): string {
 		.join(",");
 	const home = os.homedir();
 	const cwd = p.cwd.startsWith(home) ? `~${p.cwd.slice(home.length)}` : p.cwd;
-	return `${p.id}  ${p.name}  ${p.busy ? "busy" : "idle"}  ${p.model || "-"}${p.effort ? `:${p.effort}` : ""}${p.subagents ? `  sub:${p.subagents}` : ""}  ctx:${p.context || "-"}  ${cwd}${flags ? `  [${flags}]` : ""}`;
+	return `${p.id}  ${p.name}  ${p.busy ? "busy" : "idle"}  ${formatActivity(p)}  ${p.model || "-"}${p.effort ? `:${p.effort}` : ""}${p.subagents ? `  sub:${p.subagents}` : ""}  ctx:${p.context || "-"}  ${cwd}${flags ? `  [${flags}]` : ""}`;
 }
 
 function summarize(res: Record<string, unknown>): string {
@@ -645,6 +647,7 @@ export default function peers(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_e, ctx) => {
 		if (ctx.mode === "print" || ctx.mode === "json" || !bind(ctx)) return;
+		await initializeActivityHost();
 		refresh(ctx);
 		if (state.timer) ctx.clearTimer(state.timer as never);
 		state.timer = ctx.setInterval(() => refresh(state.ctx ?? ctx), 5_000);
@@ -701,7 +704,7 @@ export default function peers(pi: ExtensionAPI) {
 		name: "peers_list",
 		label: "List Peers",
 		description:
-			"List the other omp sessions running on this machine (id, name, busy/idle, model, cwd) and which one is the master.",
+			"List the other omp sessions running on this machine (id, name, busy/idle, background job/subagent counts, settled state, model, cwd) and which one is the master. Unknown activity is not zero; settled is not task completion.",
 		parameters: z.object({}),
 		async execute() {
 			const m = masterId();
