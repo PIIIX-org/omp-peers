@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 PIIIX-org contributors
-import * as z from "@oh-my-pi/omptype/zod";
+import { zod as z } from "@oh-my-pi/pi-coding-agent";
 
 const segmenter = new Intl.Segmenter("und", { granularity: "word" });
 
