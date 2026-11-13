@@ -26,6 +26,7 @@
 - Cover report routing, exact turn/destination correlation, late receipts, digest cadence and v1 state compatibility with isolated offline regressions.
 - Cancel watcher status/delivery RPCs on termination, wake polling immediately, and preserve unacknowledged events for retry instead of draining the digest during shutdown.
 - Coordinate the LaunchAgent exit deadline with the installer's managed-PID lock wait; refuse unrelated manual lock holders immediately. Cover stalled status/acknowledgement cancellation and private-home managed upgrade/uninstall without real launchd services or provider calls.
+- Preserve observed busy-to-idle transitions through peer departure and watcher restart, coalescing delayed lifecycle metadata without treating replacement initial-idle state as a new yield.
 
 ## 0.1.0
 

@@ -343,7 +343,7 @@ class Watcher:
             if not set(previous).intersection(processes):
                 # A replacement process establishes its own baseline. Its initial
                 # idle state cannot finish the previous process's abandoned turn.
-                record.update(busy=busy, active_since=now if busy else 0, edges=[], edge_turns={})
+                record.update(busy=busy, active_since=now if busy else 0)
                 self.dirty = True
             if previous != processes or "processes" not in record:
                 record["processes"] = processes
@@ -355,7 +355,7 @@ class Watcher:
                 # Consume master lifecycle metadata without reflecting watcher-
                 # triggered master turns back into the notification queue.
                 values = {"busy": busy, "active_since": record.get("active_since", 0) if busy else 0,
-                          "edges": [], "edge_turns": {}, "was_master": is_master}
+                          "edges": [], "edge_turns": {}, "edge_peers": {}, "was_master": is_master}
                 if any(record.get(key) != value for key, value in values.items()):
                     record.update(values)
                     self.dirty = True
@@ -365,6 +365,11 @@ class Watcher:
                 self.dirty = True
             if not busy and record["busy"]:
                 record.setdefault("edges", []).append([record.get("active_since", 0), now])
+                # Persist only lifecycle metadata, not sockets or private status.
+                record.setdefault("edge_peers", {})[str(now)] = [
+                    {key: p[key] for key in ("pid", "name", "notificationVersion") if key in p}
+                    for p in peers
+                ]
                 turns = {p.get("notificationTurnId") if p.get("notificationVersion") == 1 else None for p in peers}
                 if len(turns) == 1 and all(isinstance(turn, str) and turn for turn in turns):
                     record.setdefault("edge_turns", {})[str(now)] = next(iter(turns))
@@ -372,6 +377,28 @@ class Watcher:
             if record["busy"] != busy:
                 record["busy"] = busy
                 self.dirty = True
+        live_pids = {p["pid"] for peers in sessions.values() for p in peers}
+        for sid, record in self.state["sessions"].items():
+            edges = record.get("edges", [])
+            if not edges:
+                continue
+            peers = sessions.get(sid, [])
+            # A durable edge is evidence of a yield even if its process has left.
+            # Never let an old PID alias consume another live session's log cursor.
+            sources = {}
+            for _, edge in edges:
+                saved = record.get("edge_peers", {}).get(str(edge))
+                if saved is None:
+                    # Version-1 states written before source metadata was added.
+                    saved = [{"pid": int(process.split(":", 1)[0]),
+                              "notificationVersion": 1 if str(edge) in record.get("edge_turns", {}) else None}
+                             for process in record.get("processes", [])]
+                for peer in saved:
+                    if peer["pid"] not in live_pids:
+                        sources[peer["pid"]] = peer
+            if sources:
+                self.lifecycle(sid, list(sources.values()), record, baseline=False,
+                               notify=sid != master_sid and not record.get("was_master", False))
             waiting = []
             for start, edge in record.get("edges", []):
                 if now - edge < 2:
@@ -380,14 +407,16 @@ class Watcher:
                 # Give the lifecycle logger time to flush, then coalesce the log
                 # and registry observations into one event for the same turn.
                 turn = record.get("edge_turns", {}).pop(str(edge), None)
+                saved = record.get("edge_peers", {}).pop(str(edge), [])
+                name = (saved or peers or [{}])[0].get("name", sid)
                 if turn or not any(start <= ended <= edge for ended in record.get("log_times", [])):
-                    self.enqueue(sid, peers[0].get("name", sid), "turn/" + turn if turn else "idle/" + str(edge),
+                    self.enqueue(sid, name, "turn/" + turn if turn else "idle/" + str(edge),
                                  "idle_transition", "observed active -> idle", turn)
                     record.setdefault("notified_edges", []).append([start, edge])
                     record["notified_edges"] = record["notified_edges"][-256:]
                 self.dirty = True
             record["edges"] = waiting
-        # Missing registrations do not prove task completion. Retain pending work.
+        # Departure alone never creates an edge.
         self.save()
         return sessions
 
