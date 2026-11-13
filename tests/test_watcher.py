@@ -236,6 +236,47 @@ class WatcherChecks(unittest.TestCase):
             with self.subTest(info=info), patch.object(watch, "peer_rpc", return_value={"ok": True, "info": info}):
                 self.assertIn(expected, self.watcher.describe(event, {"worker-session": [peer]}))
 
+    def test_yield_pending_jobs_then_quiescence_are_distinct_live_labels(self):
+        peer = self.peer()
+        event = {"session": "worker-session", "event": "yield", "name": "worker",
+                 "kind": "agent_end", "detail": "agent loop ended"}
+        snapshots = [
+            ({"busy": False, "hasPendingAsyncWork": True, "isSettled": False,
+              "activity": {"activeJobs": 1, "activeSubagents": 0}}, "NOT task-complete", "jobs=1"),
+            ({"busy": False, "hasPendingAsyncWork": True, "isSettled": False,
+              "activity": {"activeJobs": 0, "activeSubagents": 0}}, "NOT task-complete", "jobs=0"),
+            ({"busy": False, "hasPendingAsyncWork": False, "isSettled": True,
+              "activity": {"activeJobs": 0, "activeSubagents": 0}}, "reports quiescence", "jobs=0"),
+            # Known work overrides contradictory settled flags from another host.
+            ({"busy": False, "hasPendingAsyncWork": False, "isSettled": True,
+              "activity": {"activeJobs": 0, "activeSubagents": 1}}, "NOT task-complete", "active subagents=1"),
+            ({"busy": False, "hasPendingAsyncWork": None, "isSettled": None,
+              "activity": {"activeJobs": None, "activeSubagents": None}}, "UNKNOWN", "jobs=?"),
+            ({"busy": True, "hasPendingAsyncWork": False, "isSettled": True}, "UNKNOWN", "jobs=?"),
+            ({"busy": False, "activity": "old incompatible schema"}, "UNKNOWN", "jobs=?"),
+        ]
+        for info, expected, counts in snapshots:
+            with self.subTest(info=info), patch.object(watch, "peer_rpc", return_value={"ok": True, "info": info}):
+                live = json.loads(self.watcher.describe(event, {"worker-session": [peer]}))["live"]
+                self.assertIn("agent yielded", live)
+                self.assertIn(expected, live)
+                self.assertIn(counts, live)
+                self.assertNotIn("task done", live)
+
+    def test_partial_or_mixed_host_status_does_not_establish_quiescence(self):
+        first = self.peer()
+        second = self.peer("palias")
+        event = {"session": "worker-session", "event": "yield", "name": "worker",
+                 "kind": "idle_transition", "detail": "observed active -> idle"}
+        known = {"busy": False, "isSettled": True, "hasPendingAsyncWork": False,
+                 "activity": {"activeJobs": 0, "activeSubagents": 0}}
+        for replies in (({"info": known}, {"info": {"busy": False}}),
+                        ({"info": known}, ConnectionError("unavailable"))):
+            with self.subTest(replies=replies), patch.object(watch, "peer_rpc", side_effect=replies):
+                live = json.loads(self.watcher.describe(event, {"worker-session": [first, second]}))["live"]
+                self.assertIn("UNKNOWN", live)
+                self.assertIn("jobs=?", live)
+
     def test_runtime_permissions_and_symlink_rejection(self):
         self.watcher.save()
         self.assertEqual(stat.S_IMODE(self.watcher.state_dir.stat().st_mode), 0o700)

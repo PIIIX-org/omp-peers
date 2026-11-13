@@ -296,15 +296,34 @@ class Watcher:
                     states.append(info)
             except (OSError, ValueError, KeyError, ConnectionError):
                 continue
+        yielded = "agent yielded; " if event["kind"] in ("agent_end", "idle_transition") else ""
         if not states:
-            live = "live state unavailable; background/task completion UNKNOWN"
-        elif any(s.get("hasPendingAsyncWork") is True for s in states):
-            live = "background work pending; NOT task-complete"
-        elif len(states) == len(peers) and all(s.get("isSettled") is True and s.get("hasPendingAsyncWork") is False for s in states):
-            live = "session reports settled (no pending wake work); task completion unverified"
+            live = yielded + "live state unavailable; background/task completion UNKNOWN"
         else:
-            live = "live=" + ("active" if any(s.get("busy") for s in states) else "idle")
-            live += "; background/task completion UNKNOWN (peer API does not report quiescence)"
+            activities = [s["activity"] if isinstance(s.get("activity"), dict) else {} for s in states]
+            def count(key):
+                values = [activity.get(key) for activity in activities]
+                if len(states) == len(peers) and all(type(v) is int and v >= 0 for v in values):
+                    # Registrations describe the same logical session, not additive workers.
+                    return str(max(values))
+                return "?"
+
+            counts = "jobs=" + count("activeJobs") + "; active subagents=" + count("activeSubagents")
+            active = any(s.get("busy") is True for s in states)
+            work = any(s.get("hasPendingAsyncWork") is True or any(
+                type(value) is int and value > 0
+                for value in (activity.get("activeJobs"), activity.get("activeSubagents"))
+            ) for s, activity in zip(states, activities))
+            if work:
+                live = "background work pending; NOT task-complete"
+            elif (not active and len(states) == len(peers)
+                  and all(s.get("busy") is False and s.get("isSettled") is True
+                          and s.get("hasPendingAsyncWork") is False for s in states)):
+                live = "session reports quiescence (settled; no pending wake work); task completion unverified"
+            else:
+                live = "live=" + ("active" if active else "idle/unknown")
+                live += "; background/task completion UNKNOWN (quiescence unavailable)"
+            live = yielded + live + "; " + counts
         return json.dumps({**event, "live": live}, ensure_ascii=True)
 
     def deliver(self, sessions):

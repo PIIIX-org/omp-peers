@@ -9,5 +9,5 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["extensions/peers.ts"]
+  "include": ["extensions/peers.ts", "lib/**/*.ts", "tests/*.test.ts"]
 }
