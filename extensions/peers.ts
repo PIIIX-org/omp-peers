@@ -22,6 +22,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as SettingsRegistry from "@oh-my-pi/pi-coding-agent/config/registry";
+import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Notifications, type ReportKind } from "./notifications";
 import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
 
@@ -428,8 +429,9 @@ async function applyRouting(
 		return explicit ? { ok: false, error: "peer busy; explicit routing refused without dispatch; retry when idle" } : kept("automatic routing skipped: peer busy");
 	}
 	if (req.effort && !EFFORTS.includes(req.effort)) return { ok: false, error: `invalid effort "${req.effort}"` };
-	const model = req.model ? ctx.models.resolve(req.model) : undefined;
-	if (req.model && !model) return { ok: false, error: `unavailable model "${req.model}" (unknown or unauthenticated); no dispatch or effort change` };
+	const resolved = req.model ? resolveModelRoleValue(req.model, ctx.models.list(), { settings: pi.pi.settings }) : undefined;
+	const model = resolved?.model;
+	if (req.model && (!model || resolved?.warning)) return { ok: false, error: `unavailable model "${req.model}" (unknown, unauthenticated or invalid selector); no dispatch or effort change` };
 	// Even an unchanged requested model must pass the host credential check before dispatch.
 	if (model && !(await pi.setModel(model))) {
 		return { ok: false, error: `no credentials for model "${req.model}"; no dispatch or effort change` };
@@ -716,12 +718,20 @@ export default function peers(pi: ExtensionAPI) {
 		const { tier, why } = subTierFor(event.agent, event.invocationKind);
 		const cfg = loadTiers()[tier];
 		const spec = manual ?? `${cfg.model}:${cfg.effort}`;
-		const model = ctx.models.resolve(spec);
-		if (!model || !(await ctx.modelRegistry.getApiKey(model))) {
-			return { block: true, reason: `peers routing: unavailable model "${spec}" (unknown or unauthenticated); no substitute spawned` };
+		const resolved = resolveModelRoleValue(spec, ctx.models.list(), { settings: pi.pi.settings });
+		const model = resolved.model;
+		if (!model || resolved.warning) {
+			return { block: true, reason: `peers routing: unavailable model "${spec}" (unknown, unauthenticated or invalid selector); no substitute spawned` };
 		}
-		const effort = EFFORTS.find(e => spec.endsWith(`:${e}`));
-		const next = `${model.provider}/${model.id}${effort ? `:${effort}` : ""}`;
+		try {
+			if (!(await ctx.modelRegistry.getApiKey(model))) {
+				return { block: true, reason: `peers routing: no credentials for "${spec}"; no substitute spawned` };
+			}
+		} catch {
+			return { block: true, reason: `peers routing: authentication failed for "${spec}"; no substitute spawned` };
+		}
+		const effort = resolved.explicitThinkingLevel ? resolved.thinkingLevel : undefined;
+		const next = `${model.provider}/${model.id}${effort !== undefined ? `:${effort}` : ""}`;
 		const note = `model ${event.patterns.join(", ") || "(host default)"} -> ${next}; reason=${manual ? "explicit peer subagent override" : `automatic tier ${tier} (${why})`}`;
 		ctx.ui.notify(`[peers routing] ${note}`, "info");
 		return { model: next, note };

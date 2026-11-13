@@ -135,7 +135,7 @@ To override tiers, create `~/.omp/agent/peers.json`:
 
 Subagent auto-routing defaults to `auto-managed`: it runs while a master exists and the peer allows control. `auto` enables it without a master; `auto-off` disables it. **OMP operator `task.agentModelOverrides` pins win over both manual peer overrides and automatic routing.** To deliberately replace an operator task pin, the operator must edit/clear that setting explicitly (or authorize the master's existing `setting` action); ordinary peer subagent overrides cannot bypass it. If the host cannot expose task-pin settings, the plugin leaves the host selection intact. Otherwise manual peer overrides beat automatic tiering, and automatic routing leaves `seance` alone. Overrides affect future spawns until cleared or process exit. Unavailable plugin-selected models block the spawn instead of falling back; applied replacements include old/new selectors and their routing reason in the host's visible route note.
 
-Supported API evidence: the pinned 18.18.1 package declares `ExtensionContext.model`, `ctx.models.current()/resolve()`, `ExtensionAPI.setModel(): Promise<boolean>` and `setThinkingLevel()`, but no top-level pin-provenance field. Its public `AgentSession.setModel(model, role?, {selector?, thinkingLevel?, persist?})` and `setModelTemporary()` are setters, not evidence that an existing selection is unpinned. The settings registry exposes `task.agentModelOverrides`, and `before_subagent_spawn` exposes original `patterns` plus a visible result `note` and `block/reason`. The plugin uses those supported surfaces rather than inventing host pin metadata.
+Supported API evidence: the pinned 18.18.1 package declares `ExtensionContext.model`, `ctx.models.current()/list()`, `ExtensionAPI.setModel(): Promise<boolean>` and `setThinkingLevel()`, but no top-level pin-provenance field. Its public `AgentSession.setModel(model, role?, {selector?, thinkingLevel?, persist?})` and `setModelTemporary()` are setters, not evidence that an existing selection is unpinned. The public `config/model-resolver` function `resolveModelRoleValue()` returns the selected model, role effort and selector warnings; the plugin rejects warnings rather than accepting a malformed-selector fallback. The settings registry exposes `task.agentModelOverrides`, and `before_subagent_spawn` exposes original `patterns` plus a visible result `note` and `block/reason`. The plugin uses these supported APIs rather than inventing host pin metadata.
 
 ### Runtime settings
 
@@ -201,9 +201,13 @@ python3 tests/smoke.py
 ```sh
 npm run test:activity
 npm run test:activity-smoke
+npm run test:routing
+npm run test:routing-smoke
 ```
 
 Activity regressions cover job completion/cancellation, delivery gaps, streaming versus parked agents and unavailable capabilities. The activity smoke registers real session-owned jobs in a disposable OMP process and checks both socket status and registry refresh. It acknowledges a completion before delivery to avoid a model wake; it does not connect to a provider.
+
+The routing regression loads the extension with deterministic host callbacks in a disposable home and exercises its real Unix socket, authorization, prompt dispatch, pins, unavailable credentials and subagent hook. The routing smoke uses real OMP processes for visible old/new reports, pin policy, unavailable prompt rejection and resume persistence. It sends no successful user prompt to the actual host, so neither scenario needs a provider turn.
 
 
 The smoke links the plugin into a temporary home and runs real OMP RPC processes with a keyless local-only model configuration. It exercises control gates, model switching, saved-session restarts, crash recovery, master contention/restore opt-out, legacy-overwrite lock recovery with and without auto-restore, and watcher cleanup. It uses no real provider credentials or model turns and removes its temporary state on exit.

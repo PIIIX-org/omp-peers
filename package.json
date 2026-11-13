@@ -14,11 +14,13 @@
   "files": ["extensions", "lib", "tools", "docs", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "lint": "eslint extensions/*.ts lib/activity.ts tests/activity.test.ts",
+    "lint": "eslint extensions/*.ts lib/activity.ts tests/*.test.ts",
     "test:watcher": "python3 -m unittest discover -s tests -p 'test_*.py'",
     "test:smoke": "python3 tests/smoke.py",
     "test:activity": "bun test tests/activity.test.ts",
     "test:activity-smoke": "python3 tests/activity_smoke.py",
+    "test:routing": "python3 -m unittest discover -s tests -p 'test_routing.py'",
+    "test:routing-smoke": "python3 tests/routing_smoke.py",
     "scan": "python3 scripts/leak_scan.py"
   },
   "peerDependencies": {
