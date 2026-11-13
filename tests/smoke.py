@@ -124,6 +124,94 @@ def wait_for(predicate, seconds=15):
     raise AssertionError("Timed out waiting for plugin state")
 
 
+def report_smoke(sender, worker_socket, registry):
+    """Real OMP command dispatch to a local acknowledgement-only peer: no model turns."""
+    identity = "p3333333333333333"
+    endpoint = registry / (identity + ".sock")
+    metadata = registry / (identity + ".json")
+    requests = []
+    failures = []
+    stop = threading.Event()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(endpoint))
+    listener.listen()
+    listener.settimeout(0.1)
+
+    def receive():
+        while not stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except socket.timeout:
+                continue
+            try:
+                with connection:
+                    connection.settimeout(5)
+                    buffer = b""
+                    while b"\n" not in buffer:
+                        chunk = connection.recv(65536)
+                        if not chunk:
+                            raise AssertionError("Report connection closed before request")
+                        buffer += chunk
+                    requests.append(json.loads(buffer.split(b"\n")[0]))
+                    connection.sendall(json.dumps({
+                        "ok": True, "peerId": identity, "sessionId": "report-smoke",
+                    }).encode() + b"\n")
+            except Exception as error:
+                failures.append(str(error))
+
+    thread = threading.Thread(target=receive)
+    metadata.write_text(json.dumps({
+        "id": identity, "sessionId": "report-smoke", "pid": os.getpid(),
+        "sock": str(endpoint), "name": "report-smoke", "startedAt": "start",
+        "updatedAt": "now", "busy": False,
+    }))
+    thread.start()
+    try:
+        reports = [
+            {"kind": "DONE", "unit": "Consumer validation",
+             "evidence": {"description": "Offline checks passed", "references": ["https://example.test/proof"]}},
+            {"kind": "BLOCKED", "unit": "Consumer validation",
+             "blocker": "Approval is missing", "nextAction": "Request the approval"},
+            {"kind": "WAITING", "unit": "修复完成测试通过",
+             "background": "unknown", "nextAction": "Check background state"},
+            {"kind": "DECISION", "unit": "Consumer validation", "question": "Which option should proceed?"},
+        ]
+        for report in reports:
+            sender.command(f"/peers report {identity} " + json.dumps(report, ensure_ascii=False), "ok")
+        assert [request["report"] for request in requests] == reports, requests
+        assert all("text" not in request and request["from"]["id"] for request in requests), requests
+        invalid = [
+            {"kind": "DONE", "unit": "Missing evidence"},
+            {"kind": "BLOCKED", "unit": "Missing blocker"},
+            {"kind": "WAITING", "unit": "Missing background", "nextAction": "Check background state"},
+            {"kind": "DECISION", "unit": "SpaceStrippedHumanText", "question": "Which option should proceed?"},
+            {"kind": "DECISION", "unit": "   ", "question": "Which option should proceed?"},
+        ]
+        for report in invalid:
+            sender.command(f"/peers report {identity} " + json.dumps(report), "error:")
+            # Direct wire input cannot bypass the same validation or start a provider turn.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(5)
+                connection.connect(str(worker_socket))
+                connection.sendall(json.dumps({"op": "message", "report": report}).encode() + b"\n")
+                reply = b""
+                while b"\n" not in reply:
+                    chunk = connection.recv(65536)
+                    assert chunk, "Receiver closed without an error acknowledgement"
+                    reply += chunk
+                assert json.loads(reply.split(b"\n")[0])["ok"] is False
+        sender.command(f"/peers report {identity} DONE old marker syntax", "error:")
+        assert len(requests) == 4 and not failures, (requests, failures)
+        print("PASS structured reports: real OMP JSON command, four kinds, Unicode, invalid socket bypass rejected without provider turns")
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+        listener.close()
+        metadata.unlink(missing_ok=True)
+        endpoint.unlink(missing_ok=True)
+        assert not thread.is_alive(), "Report smoke socket thread did not stop"
+
+
 class LegacyPeer:
     """Trusted same-user legacy writer; messages terminate locally, never at a model."""
 
@@ -331,6 +419,8 @@ def main():
             worker.command("/peers refuse", "refuse")
             master.command(f"/peers do {worker_id} status", "refuses inbound")
             worker.command("/peers accept", "accept")
+            report_smoke(master, registry / (worker_id + ".sock"), registry)
+            assert not any(frame.get("type") == "agent_start" for peer in peers for frame in peer.frames)
             master.command(f"/peers do {worker_id} model smoke/second", "ok")
             assert worker.call("get_state")["model"]["id"] == "second"
             master.command(f"/peers do {worker_id} effort high", "-> high")
