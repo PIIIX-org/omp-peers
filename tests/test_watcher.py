@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import select
 import socket
 import stat
 import subprocess
@@ -34,6 +35,81 @@ def state_ready(path):
         return value if value.get("version") == 1 else None
     except (OSError, ValueError):
         return None
+
+
+@contextlib.contextmanager
+def stalled_watcher(home, runtime, operation="status"):
+    """Run only synthetic peers and a watcher in a disposable private home."""
+    registry = home / ".omp/run/peers"
+    registry.mkdir(parents=True)
+    endpoint = str(home / "delayed.sock")
+    peer = {"id": "pmaster", "pid": os.getppid(), "sessionId": "master",
+            "sock": endpoint, "name": "master", "busy": False}
+    (registry / "pmaster.json").write_text(json.dumps(peer))
+    (registry / "master.json").write_text(json.dumps({"id": peer["id"], "pid": peer["pid"]}))
+    if operation == "status":
+        (registry / "pworker.json").write_text(json.dumps(
+            {**peer, "id": "pworker", "pid": os.getpid(), "sessionId": "worker", "name": "worker"}))
+    watcher = watch.Watcher(home, runtime)
+    watcher.load()
+    for index in range(20):
+        watcher.enqueue("worker", "worker", "turn-" + str(index), "agent_end", "agent loop ended")
+    for event in watcher.state["outbox"]:
+        event["queued_at"] = 0
+    watcher.save()
+    requested, release = threading.Event(), threading.Event()
+    captured, failures = [], []
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(endpoint)
+        server.listen(20)
+        server.settimeout(5)
+
+        def respond_late():
+            try:
+                with server.accept()[0] as conn:
+                    conn.settimeout(5)
+                    with conn.makefile("rb") as source:
+                        captured.append(json.loads(source.readline()))
+                    requested.set()
+                    if not release.wait(10):
+                        raise TimeoutError("test did not release delayed response")
+                    try:
+                        conn.sendall(b'{"ok":true,"info":{"busy":false}}\n')
+                    except OSError:
+                        pass  # Cancellation closes the client before this late acknowledgement.
+            except Exception as error:
+                failures.append(error)
+                requested.set()
+
+        reader = threading.Thread(target=respond_late)
+        reader.start()
+        script = runtime / "watch.py"
+        if not script.exists():
+            script = REPO / "tools/watch.py"
+        process = subprocess.Popen(
+            [sys.executable, str(script), "--home", str(home), "--state-dir", str(runtime),
+             "--interval", "60", "--digest-interval", "0.001"],
+            env={"HOME": str(home), "PATH": os.environ["PATH"]},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            if not requested.wait(5) or failures:
+                raise AssertionError("synthetic peer did not receive the expected RPC")
+            if captured[0]["op"] != operation:
+                raise AssertionError("unexpected synthetic RPC")
+            yield process, release, captured
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.communicate(timeout=watch.RPC_TIMEOUT + 1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+            release.set()
+            reader.join(timeout=5)
+            if reader.is_alive() or failures:
+                raise AssertionError("synthetic peer did not shut down cleanly")
 
 
 class WatcherChecks(unittest.TestCase):
@@ -334,7 +410,7 @@ class WatcherChecks(unittest.TestCase):
         original = self.watcher.state["outbox"][0]["event"]
         calls = []
 
-        def rpc(peer, request):
+        def rpc(peer, request, **_kwargs):
             calls.append((peer["id"], request))
             if peer["id"] == "pmaster1":
                 raise ConnectionError("private error text")
@@ -359,6 +435,28 @@ class WatcherChecks(unittest.TestCase):
             self.watcher.deliver({})
             rpc.assert_not_called()
         self.assertEqual(len(self.watcher.state["outbox"]), 1)
+
+    def test_stop_during_status_keeps_batch_without_starting_more_work(self):
+        self.master()
+        first = self.peer()
+        second = self.peer("palias")
+        for index in range(20):
+            self.watcher.enqueue("worker-session", "worker", str(index), "agent_end", "agent loop ended")
+        self.watcher.save()
+        before = state_ready(self.watcher.state_file)
+
+        def stop_after_status(_peer, request, **_kwargs):
+            self.assertEqual(request["op"], "status")
+            self.watcher.stop()
+            return {"ok": True, "info": {"busy": False}}
+
+        with patch.object(watch, "peer_rpc", side_effect=stop_after_status) as rpc:
+            self.watcher.deliver({"worker-session": [first, second]})
+            self.assertEqual(rpc.call_count, 1)
+            self.watcher.deliver({"worker-session": [first, second]})
+            self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(self.watcher.state, before)
+        self.assertEqual(state_ready(self.watcher.state_file), before)
 
     def test_live_state_does_not_invent_quiescence(self):
         peer = self.peer()
@@ -678,6 +776,26 @@ class WatcherChecks(unittest.TestCase):
 
 
 class SocketChecks(unittest.TestCase):
+    def test_rpc_rejects_late_acknowledgement_after_cancellation_or_total_deadline(self):
+        stop = threading.Event()
+        with patch.object(watch.socket, "socket") as create:
+            conn = create.return_value.__enter__.return_value
+
+            def late_ack(_size):
+                stop.set()
+                return b'{"ok":true}\n'
+
+            conn.recv.side_effect = late_ack
+            with self.assertRaises(ConnectionError):
+                watch.peer_rpc({"sock": "synthetic.sock"}, {"op": "message"}, stop=stop.is_set)
+        with patch.object(watch.socket, "socket") as create:
+            conn = create.return_value.__enter__.return_value
+            conn.recv.side_effect = [b'{"ok":', b'true}\n']
+            with patch.object(watch.time, "monotonic", side_effect=[0, 0, 0, 0, 1, 2]):
+                with self.assertRaises(TimeoutError):
+                    watch.peer_rpc({"sock": "synthetic.sock"}, {"op": "status"})
+            self.assertEqual(conn.recv.call_count, 2)
+
     def test_real_local_rpc_frames(self):
         with tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
             path = str(Path(root) / "peer.sock")
@@ -705,6 +823,25 @@ class SocketChecks(unittest.TestCase):
 
 
 class ProcessChecks(unittest.TestCase):
+    def test_sigterm_cancels_stalled_rpc_preserving_twenty_events(self):
+        for operation in ("status", "message"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
+                home = Path(root)
+                runtime = home / "runtime"
+                with stalled_watcher(home, runtime, operation) as (process, release, captured):
+                    before = state_ready(runtime / "completions.json")
+                    process.terminate()
+                    report, errors = process.communicate(timeout=watch.RPC_TIMEOUT + 1)
+                    self.assertEqual(process.returncode, 0, (report, errors))
+                    self.assertIn("WATCHER_STOPPED", report)
+                    self.assertNotIn("WATCHER_DELIVERED", report)
+                    self.assertEqual(len(captured), 1)
+                    self.assertEqual(len(before["outbox"]), 20)
+                    self.assertEqual(state_ready(runtime / "completions.json"), before)
+                    with watch.private_open(runtime / "completion.lock") as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    release.set()  # A later successful acknowledgement must not retire this batch.
+
     def test_departed_idle_notification_survives_process_restart_without_duplicate(self):
         with tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
             home = Path(root)
@@ -836,6 +973,71 @@ class ProcessChecks(unittest.TestCase):
 
 
 class InstallerChecks(unittest.TestCase):
+    def test_legacy_managed_deadline_controls_wait_and_preserves_outbox(self):
+        for action in ("upgrade", "uninstall"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
+                home = Path(root)
+                runtime = home / "runtime"
+                label = "org.example.watcher"
+                with patch.object(install_watcher, "launchctl") as ctl:
+                    ctl.return_value = subprocess.CompletedProcess([], 0, stdout="")
+                    install_watcher.install(home, runtime, label, Path(sys.executable))
+                watcher = watch.Watcher(home, runtime)
+                watcher.load()
+                watcher.enqueue("worker", "worker", "persisted-turn", "agent_end", "agent loop ended")
+                watcher.save()
+                before = state_ready(runtime / "completions.json")
+                (runtime / "completion.lock").write_text(str(os.getpid()))
+                elapsed, stopped = [0.0], []
+
+                def fake_launchctl(*arguments, **_kwargs):
+                    if arguments[0] == "print":
+                        return subprocess.CompletedProcess(arguments, 0, stdout="pid = " + str(os.getpid()) + "\nexit timeout = 12\n")
+                    if arguments[0] == "bootout":
+                        stopped.append(True)
+                    return subprocess.CompletedProcess(arguments, 0, stdout="")
+
+                def held_until_launchd_exit(_lock, _operation):
+                    if elapsed[0] < 12:
+                        raise BlockingIOError()
+
+                def advance_clock(seconds):
+                    elapsed[0] += seconds
+
+                with patch.object(install_watcher, "launchctl", side_effect=fake_launchctl), \
+                        patch.object(install_watcher.fcntl, "flock", side_effect=held_until_launchd_exit), \
+                        patch.object(install_watcher.time, "monotonic", side_effect=lambda: elapsed[0]), \
+                        patch.object(install_watcher.time, "sleep", side_effect=advance_clock):
+                    if action == "upgrade":
+                        install_watcher.install(home, runtime, label, Path(sys.executable))
+                    else:
+                        install_watcher.uninstall(home, runtime, label)
+                self.assertEqual(stopped, [True])
+                self.assertGreaterEqual(elapsed[0], 12)
+                self.assertLess(elapsed[0], 13)
+                self.assertEqual(state_ready(runtime / "completions.json"), before)
+
+    def test_invalid_managed_exit_deadline_refuses_before_bootout(self):
+        for action in ("upgrade", "uninstall"):
+            for deadline in ("", "exit timeout = invalid", "exit timeout = 0", "exit timeout = -1"):
+                with self.subTest(action=action, deadline=deadline), tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
+                    home = Path(root)
+                    runtime = home / "runtime"
+                    label = "org.example.watcher"
+                    with patch.object(install_watcher, "launchctl") as ctl:
+                        ctl.return_value = subprocess.CompletedProcess([], 0, stdout="")
+                        install_watcher.install(home, runtime, label, Path(sys.executable))
+                    status = subprocess.CompletedProcess([], 0, stdout="pid = " + str(os.getpid()) + "\n" + deadline + "\n")
+                    with patch.object(install_watcher, "launchctl", return_value=status) as ctl:
+                        with self.assertRaisesRegex(RuntimeError, "bounded managed exit deadline"):
+                            if action == "upgrade":
+                                install_watcher.install(home, runtime, label, Path(sys.executable))
+                            else:
+                                install_watcher.uninstall(home, runtime, label)
+                        ctl.assert_called_once_with("print", "gui/" + str(os.getuid()) + "/" + label, check=False)
+                    self.assertTrue((runtime / "watch.py").exists())
+                    self.assertTrue((runtime / "install.json").exists())
+
     def test_label_validation_and_plist_escaping(self):
         for label in ("org.example.peer-watcher", "local.OMP_peers.worker2"):
             self.assertEqual(install_watcher.valid_label(label), label)
@@ -852,6 +1054,8 @@ class InstallerChecks(unittest.TestCase):
         self.assertIs(document["KeepAlive"], True)
         self.assertEqual(document["Umask"], 0o077)
         self.assertEqual(document["ProgramArguments"][-2:], ["--digest-interval", "42.5"])
+        self.assertEqual(document["ExitTimeOut"], watch.MANAGED_EXIT_TIMEOUT)
+        self.assertLess(document["ExitTimeOut"], 10)
 
     def test_install_uninstall_keeps_state_and_purge_removes_known_files(self):
         with tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
@@ -860,6 +1064,7 @@ class InstallerChecks(unittest.TestCase):
             label = "org.example.watcher"
             with patch.object(install_watcher, "launchctl") as ctl:
                 ctl.return_value.returncode = 0
+                ctl.return_value.stdout = ""
                 install_watcher.install(home, runtime, label, Path(sys.executable))
                 ctl.assert_called_with("bootstrap", "gui/" + str(os.getuid()), str(home / "Library/LaunchAgents" / (label + ".plist")))
                 watch.atomic_json(runtime / "completions.json", {"retained": True})
@@ -870,46 +1075,98 @@ class InstallerChecks(unittest.TestCase):
                 install_watcher.uninstall(home, runtime, label, purge=True)
                 self.assertFalse(runtime.exists())
 
-    def test_managed_upgrade_and_uninstall_wait_for_kernel_lock_release(self):
+    def test_managed_upgrade_and_uninstall_cancel_stalled_status_in_private_home(self):
+        for action in ("upgrade", "uninstall"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
+                home = Path(root)
+                runtime = home / "runtime"
+                label = "org.example.watcher"
+                plist = home / "Library/LaunchAgents" / (label + ".plist")
+                with patch.object(install_watcher, "launchctl") as ctl:
+                    ctl.return_value = subprocess.CompletedProcess([], 0, stdout="")
+                    install_watcher.install(home, runtime, label, Path(sys.executable))
+                with stalled_watcher(home, runtime) as (process, release, captured):
+                    before = state_ready(runtime / "completions.json")
+                    calls = []
+
+                    def fake_launchctl(*arguments, **_kwargs):
+                        calls.append(arguments[0])
+                        if arguments[0] == "print":
+                            return subprocess.CompletedProcess(arguments, 0, stdout="service = {\n\tpid = " + str(process.pid)
+                                                               + "\n\texit timeout = 5\n}\n")
+                        if arguments[0] == "bootout":
+                            process.terminate()
+                        if arguments[0] == "bootstrap":
+                            with watch.private_open(runtime / "completion.lock") as lock:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        return subprocess.CompletedProcess(arguments, 0, stdout="")
+
+                    with patch.object(install_watcher, "launchctl", side_effect=fake_launchctl):
+                        if action == "upgrade":
+                            install_watcher.install(home, runtime, label, Path(sys.executable))
+                            self.assertTrue(plist.exists())
+                            self.assertTrue((runtime / "watch.py").exists())
+                            self.assertEqual(calls, ["print", "bootout", "bootstrap"])
+                        else:
+                            install_watcher.uninstall(home, runtime, label)
+                            self.assertFalse(plist.exists())
+                            self.assertFalse((runtime / "watch.py").exists())
+                            self.assertFalse((runtime / "install.json").exists())
+                            self.assertEqual(calls, ["print", "bootout"])
+                    report, errors = process.communicate(timeout=watch.RPC_TIMEOUT + 1)
+                    self.assertEqual(process.returncode, 0, (report, errors))
+                    self.assertIn("WATCHER_STOPPED", report)
+                    self.assertNotIn("WATCHER_DELIVERED", report)
+                    self.assertEqual([request["op"] for request in captured], ["status"])
+                    self.assertEqual(state_ready(runtime / "completions.json"), before)
+                    release.set()
+                    if action == "upgrade":
+                        document = plistlib.loads(plist.read_bytes())
+                        self.assertEqual(document["ExitTimeOut"], watch.MANAGED_EXIT_TIMEOUT)
+                        replacement = subprocess.Popen(
+                            document["ProgramArguments"], env={"HOME": root, "PATH": os.environ["PATH"]},
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        )
+                        try:
+                            self.assertTrue(select.select([replacement.stdout], [], [], 5)[0], "replacement did not become ready")
+                            self.assertIn("WATCHER_READY", replacement.stdout.readline())
+                            self.assertIsNone(replacement.poll())
+                        finally:
+                            replacement.terminate()
+                            try:
+                                report, errors = replacement.communicate(timeout=watch.RPC_TIMEOUT + 1)
+                            except subprocess.TimeoutExpired:
+                                replacement.kill()
+                                report, errors = replacement.communicate(timeout=5)
+                        self.assertEqual(replacement.returncode, 0, (report, errors))
+                        self.assertIn("WATCHER_STOPPED", report)
+                        self.assertNotIn("WATCHER_DELIVERED", report)
+                        self.assertEqual(state_ready(runtime / "completions.json")["outbox"], before["outbox"])
+
+    def test_managed_manifest_does_not_wait_for_unrelated_manual_watcher(self):
         for action in ("upgrade", "uninstall"):
             with self.subTest(action=action), tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
                 home = Path(root)
                 runtime = home / "runtime"
                 label = "org.example.watcher"
                 with patch.object(install_watcher, "launchctl") as ctl:
-                    ctl.return_value.returncode = 0
+                    ctl.return_value = subprocess.CompletedProcess([], 0, stdout="")
                     install_watcher.install(home, runtime, label, Path(sys.executable))
-                child = subprocess.Popen(
-                    [sys.executable, "-c",
-                     "import fcntl,sys,time; f=open(sys.argv[1],'a+'); "
-                     "fcntl.flock(f,fcntl.LOCK_EX); print('LOCKED',flush=True); "
-                     "sys.stdin.readline(); time.sleep(0.1); f.close()",
-                     str(runtime / "completion.lock")],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                )
-                try:
-                    self.assertEqual(child.stdout.readline().strip(), "LOCKED")
-
-                    def stop_before_exit(*arguments, **_kwargs):
-                        if arguments[0] == "bootout":
-                            child.stdin.write("stop\n")
-                            child.stdin.flush()
-                        return subprocess.CompletedProcess(arguments, 0)
-
-                    with patch.object(install_watcher, "launchctl", side_effect=stop_before_exit):
-                        if action == "upgrade":
-                            install_watcher.install(home, runtime, label, Path(sys.executable))
-                            self.assertTrue((runtime / "watch.py").exists())
-                        else:
-                            install_watcher.uninstall(home, runtime, label, purge=True)
-                            self.assertFalse(runtime.exists())
-                    self.assertEqual(child.wait(timeout=5), 0)
-                finally:
-                    if child.poll() is None:
-                        child.terminate()
-                        child.wait(timeout=5)
-                    child.stdin.close()
-                    child.stdout.close()
+                with watch.private_open(runtime / "completion.lock") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    lock.write(str(os.getpid()))
+                    lock.flush()
+                    status = subprocess.CompletedProcess([], 0, stdout="pid = " + str(os.getpid() + 1) + "\nexit timeout = 5\n")
+                    with patch.object(install_watcher, "launchctl", return_value=status) as ctl, patch.object(install_watcher.time, "sleep") as sleep:
+                        with self.assertRaisesRegex(RuntimeError, "still running"):
+                            if action == "upgrade":
+                                install_watcher.install(home, runtime, label, Path(sys.executable))
+                            else:
+                                install_watcher.uninstall(home, runtime, label)
+                        sleep.assert_not_called()
+                        ctl.assert_called_once_with("print", "gui/" + str(os.getuid()) + "/" + label, check=False)
+                self.assertTrue((runtime / "watch.py").exists())
+                self.assertTrue((runtime / "install.json").exists())
 
     def test_installer_refuses_unmanaged_or_running_watcher(self):
         with tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
