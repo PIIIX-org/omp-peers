@@ -6,6 +6,7 @@
 
 - Replace kind-only markers with strict DONE/BLOCKED/WAITING/DECISION objects, per-kind required human fields, explicit WAITING background state and separate DONE evidence references.
 - Validate tool, JSON command and inbound socket reports before delivery; render readable labeled lines without reconstructing compressed prose. Preserve multilingual segmentation, attribution, ordinary messages and metadata-only receipt correlation.
+- Preserve unknown fields and explicit nulls through the host tool-validation pipeline before strict send/report validation; regress the exported host validator plus registered handler without delivery, wake, rate-budget or receipt effects.
 - Add deterministic consumer coverage and an isolated keyless OMP/local-socket report scenario.
 
 

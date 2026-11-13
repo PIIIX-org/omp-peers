@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import * as z from "@oh-my-pi/omptype/zod";
+import { validateAgentToolArguments } from "@oh-my-pi/pi-agent-core";
 import peers from "../extensions/peers";
 import { renderReport, type Report } from "../lib/reports";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -18,6 +19,7 @@ const tools = new Map<string, ToolDefinition>();
 const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
 const notices: string[] = [];
 const inbound: unknown[] = [];
+let wakes = 0;
 let sessionId = "routing-worker";
 const ctx = {
 	agent: { kind: "main" }, mode: "rpc", cwd: os.homedir(),
@@ -36,7 +38,10 @@ const api = {
 	registerCommand(name: string, command: { handler: (args: string, context: ExtensionContext) => Promise<void> }) {
 		commands.set(name, command.handler);
 	},
-	sendMessage(message: unknown) { inbound.push(message); },
+	sendMessage(message: unknown, options?: { triggerTurn?: boolean }) {
+		inbound.push(message);
+		if (options?.triggerTurn) wakes++;
+	},
 } as unknown as ExtensionAPI;
 
 async function emit(name: string, context = ctx): Promise<void> {
@@ -107,9 +112,23 @@ async function wire(socket: string, request: unknown): Promise<Record<string, un
 	});
 	return result.promise;
 }
+async function invokeSend(input: Record<string, unknown>, context = ctx) {
+	const definition = tools.get("peers_send")!;
+	// Adapt only the context-bearing execute signature; use the real registered
+	// schema and exported host validator, in the same order as agent dispatch.
+	const tool = {
+		name: definition.name,
+		label: definition.label,
+		description: definition.description,
+		parameters: definition.parameters,
+		execute: (id: string, args: unknown) => definition.execute(id, args, undefined, undefined, context),
+	};
+	const args = validateAgentToolArguments(tool, { type: "toolCall", id: "send", name: tool.name, arguments: input });
+	assert.deepEqual(args, input, "host validation must preserve nulls and unknown report fields");
+	return tool.execute("send", args);
+}
 async function send(to: string, text: string, report?: string, context = ctx): Promise<void> {
-	const tool = tools.get("peers_send")!;
-	const result = await tool.execute("send", { to, ...(report ? { report: reportFor(report, text) } : { text }) }, undefined, undefined, context);
+	const result = await invokeSend({ to, ...(report ? { report: reportFor(report, text) } : { text }) }, context);
 	assert(result.content.length > 0);
 }
 const master = "p1111111111111111", other = "p2222222222222222";
@@ -143,15 +162,42 @@ try {
 		{ report: { ...reportFor("WAITING", "Waiting unit"), background: "done" } },
 		{ report: { kind: "DONE", unit: "Completed unit", evidence: { references: ["https://example.test/proof"] } } },
 		{ report: { ...reportFor("DONE", "Completed unit"), question: "Ignored field?" } },
+		...["DONE", "BLOCKED", "WAITING", "DECISION"].map(kind => ({
+			report: { ...reportFor(kind, "Selected branch unit"), [kind === "DECISION" ? "blocker" : "question"]: "Wrong branch field" },
+		})),
+		{ report: { ...reportFor("WAITING", "Waiting unit"), question: null } },
+		{ report: { ...reportFor("WAITING", "Waiting unit"), kind: " WAITING " } },
+		{ report: { kind: "DONE", unit: "Completed unit", evidence: { description: "Readable evidence body", references: null } } },
+		{ report: { kind: "DONE", unit: "Completed unit", evidence: { description: "Readable evidence body", ignored: null } } },
+		{ report: { kind: "DONE", unit: "Completed unit", evidence: { description: "Readable evidence body", question: "Wrong nested field" } } },
+		{ report: { kind: "DONE", unit: "Completed unit", evidence: { description: "CompressedEvidenceDescription" } } },
+		{ report: JSON.stringify(reportFor("WAITING", "Waiting unit")) },
+		{ report: ["WAITING"] },
+		{ report: false },
+		{ report: null, text: "Must not become an ordinary message" },
+		{ report: "null", text: "Must not become an ordinary message" },
+		{ report: reportFor("DONE", "Completed unit"), text: null },
 		{ report: reportFor("DONE", "Completed unit"), text: "Inconsistent free text" },
 		{ report: null }, { report: {} }, { text: " \t " },
 	];
-	const delivered = inbound.length, outbound = received.length, noticeCount = notices.length;
+	await emit("agent_start");
+	const delivered = inbound.length, outbound = received.length, noticeCount = notices.length, wakeCount = wakes;
+	const beforeInvalid = journal();
 	for (const payload of invalid) {
-		const result = await tools.get("peers_send")!.execute("invalid", { to: master, ...payload }, undefined, undefined, ctx);
-		assert(result.isError, JSON.stringify(result));
-		assert(JSON.stringify(result.content).includes("error:"));
+		for (const to of [master, worker.id]) {
+			const result = await invokeSend({ to, ...payload });
+			assert(result.isError, JSON.stringify(result));
+			assert(JSON.stringify(result.content).includes("error:"));
+		}
 		assert.equal((await wire(worker.sock, { op: "message", ...payload })).ok, false);
+	}
+	for (const payload of [
+		{ to: master, text: "Ordinary message", ignored: null },
+		{ to: master, report: reportFor("DONE", "Completed unit"), ignored: "Unknown root field" },
+		{ to: 123, text: "Do not coerce destination" },
+		{ to: master, text: 123 },
+	]) {
+		assert((await invokeSend(payload)).isError, JSON.stringify(payload));
 	}
 	for (let attempt = 0; attempt < 25; attempt++) {
 		assert.equal((await wire(worker.sock, { op: "message", report: { kind: "DONE" } })).ok, false);
@@ -159,6 +205,9 @@ try {
 	assert.equal(inbound.length, delivered);
 	assert.equal(received.length, outbound);
 	assert.equal(notices.length, noticeCount);
+	assert.equal(wakes, wakeCount);
+	assert.deepEqual(journal(), beforeInvalid, "invalid raw tool inputs must not record receipts");
+	await emit("agent_end");
 	assert.equal((await wire(worker.sock, { op: "message", text: "Invalid reports did not consume rate budget" })).ok, true);
 	assert.equal((await wire(worker.sock, { op: "prompt", report: reportFor("DONE", "Completed unit"), text: "Do not run" })).ok, false);
 	assert.equal((await wire(worker.sock, { op: "message", text: "ordinary_unstructured_message", from: { id: master, name: "Master" } })).ok, true);

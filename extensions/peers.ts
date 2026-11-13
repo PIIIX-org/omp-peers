@@ -25,7 +25,7 @@ import type * as SettingsRegistry from "@oh-my-pi/pi-coding-agent/config/registr
 import { formatModelStringWithRouting, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Notifications } from "./notifications";
 import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
-import { readMessage, sendParameters, type Report } from "../lib/reports";
+import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
@@ -803,15 +803,15 @@ export default function peers(pi: ExtensionAPI) {
 		},
 	});
 
-	// The published host's Static<S> currently erases Zod parameter inference.
-	// Derive handler inputs directly from each validated schema instead.
+	// Host schema repair must not erase invalid report fields before our strict
+	// validator sees them. The ingress schema preserves them; execute validates.
 	pi.registerTool({
 		name: "peers_send",
 		label: "Message Peer",
 		description:
 			"Send an agent-attributed message to a peer or 'all'. Supply either ordinary text or a structured report (kind plus required human-readable fields). Reports deliver immediately; only acknowledged main-session reports suppress exact same-turn watcher notices. Idle recipients may start a turn.",
-		parameters: sendParameters,
-		async execute(_id, p: typeof sendParameters.infer, _signal, _onUpdate, ctx) {
+		parameters: sendIngressParameters,
+		async execute(_id, p: unknown, _signal, _onUpdate, ctx) {
 			const parsed = sendParameters.safeParse(p);
 			const text = parsed.success
 				? await fanout(parsed.data.to, { op: "message", text: parsed.data.text, report: parsed.data.report },

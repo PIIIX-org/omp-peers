@@ -103,6 +103,9 @@ References: tests/notifications.ts
 
 Other kinds render `KIND`, `Unit: …`, then `Blocker: …` and `Next action: …`; `Background: pending|none|unknown` and `Next action: …`; or `Question: …`, respectively, on separate lines. References are comma-separated on a single optional line. Invalid tool, command or inbound socket reports fail before delivery/rate consumption; no reconstruction or partial delivery is attempted.
 
+The registered tool uses a permissive object ingress before strict handler validation, with the full typed send/report shape retained in its schema for discovery. This prevents OMP's schema-repair pass from discarding unknown report fields or optional nulls before validation. Explicit nulls (including `report: null` with `text`, or `evidence.references: null`) are rejected, not treated as omitted values.
+The host can still apply schema-independent argument normalization before extension handlers. This is not a byte-for-byte validation boundary for original model output.
+
 The local message RPC carries `{ "op": "message", "report": { ... }, "from": { ... } }` without `text`. Same-user trust, refusal, rate limits, attribution and master controls are unchanged. Receipt journals store only kind and session/turn/destination metadata, never report fields. Child-agent reports still deliver but cannot suppress their parent's turn notice. Upgrade both ends: the old `report: "DONE"` marker API and old command syntax are rejected, not interpreted as missing structured fields. Old receivers reject report-only messages as empty; new structured reports are not silently downgraded. Explicitly send ordinary `text` if a legacy peer must receive a message (without report suppression).
 
 

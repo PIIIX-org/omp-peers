@@ -36,6 +36,19 @@ export const sendParameters = z.object({
 	report: reportSchema.optional().describe("Structured report; mutually exclusive with text. Human fields need readable Unicode words."),
 }).strict();
 
+// Host validation repairs closed schemas before execute (including optional nulls
+// and selected-union extras). Accept raw objects first so those values reach our
+// strict runtime validator intact; retain the documented shape for tool discovery.
+// Ordering matters: even nullable optional properties are removed by the host.
+export const sendIngressParameters = {
+	type: "object",
+	anyOf: [
+		{ type: "object", additionalProperties: true },
+		sendParameters.toJsonSchema({ io: "input" }),
+	],
+	description: "Supply the documented to plus text OR report shape. The handler strictly validates all fields; nulls and unknown fields are errors, not omitted values.",
+};
+
 export function renderReport(report: Report): string {
 	const lines = [report.kind, `Unit: ${report.unit}`];
 	switch (report.kind) {
