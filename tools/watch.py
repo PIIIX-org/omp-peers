@@ -99,7 +99,7 @@ def peer_rpc(peer, request):
 
 
 class Watcher:
-    def __init__(self, home, state_dir, interval=1):
+    def __init__(self, home, state_dir, interval=1, digest_interval=300):
         self.home = Path(home).expanduser().absolute()
         self.registry = self.home / ".omp/run/peers"
         self.log_dir = self.home / ".omp/logs"
@@ -107,14 +107,17 @@ class Watcher:
         self.state_file = self.state_dir / "completions.json"
         self.state = None  # Load only after acquiring the singleton lock.
         self.interval = interval
+        self.digest_interval = digest_interval
         self.next_send = 0
         self.stopping = False
         self.last_error = None
         self.dirty = False
+        self.restored = False
 
     def load(self):
         with private_open(self.state_file) as source:
             text = source.read()
+        self.restored = bool(text)
         if text:
             value = json.loads(text)
             if (not isinstance(value, dict) or value.get("version") != 1
@@ -163,15 +166,78 @@ class Watcher:
             return peer
         return None
 
-    def enqueue(self, sid, name, key, kind, detail):
+    def enqueue(self, sid, name, key, kind, detail, turn=None):
         event_id = hashlib.sha256((sid + "/" + key).encode()).hexdigest()[:20]
         if event_id in self.state["seen"]:
             return
         self.state["seen"].append(event_id)
         self.state["seen"] = self.state["seen"][-8192:]
         self.state["outbox"].append({"event": event_id, "session": sid,
-                                     "name": str(name)[:160], "kind": kind, "detail": detail})
+                                     "name": str(name)[:160], "kind": kind, "detail": detail,
+                                     "queued_at": time.time(), **({"turn": turn} if turn else {})})
         self.dirty = True
+
+    def notifications(self, sessions, baseline=False):
+        """Read the plugin's metadata journal, never session/transcript files."""
+        master = self.master()
+        master_sid = master.get("sessionId") if master else None
+        for path in sorted((self.registry / "notifications").glob("*.jsonl")):
+            try:
+                info = path.stat()
+                cursor = self.state["cursors"].get(str(path))
+                position = info.st_size if cursor is None and baseline and not self.restored else 0
+                if cursor and cursor[0] == info.st_ino and cursor[1] <= info.st_size:
+                    position = cursor[1]
+                with path.open("rb") as source:
+                    source.seek(position)
+                    for _ in range(2000):
+                        start = source.tell()
+                        line = source.readline(16384)
+                        if not line:
+                            break
+                        if not line.endswith(b"\n"):
+                            source.seek(start)
+                            break
+                        try:
+                            item = json.loads(line)
+                            sid, turn = item.get("sessionId"), item.get("turnId")
+                            stamp = item.get("timestamp")
+                            if (item.get("version") != 1 or not isinstance(sid, str) or not sid
+                                    or not isinstance(turn, str) or not turn or len(turn) > 128
+                                    or not isinstance(stamp, (int, float)) or isinstance(stamp, bool)
+                                    or not math.isfinite(stamp) or stamp < self.state["since"]):
+                                continue
+                        except (ValueError, AttributeError):
+                            continue
+                        record = self.state["sessions"].setdefault(sid, {"busy": False, "active_since": 0})
+                        if item.get("type") == "report":
+                            destination = item.get("destinationSessionId")
+                            identity = item.get("destinationId")
+                            if (item.get("report") not in ("DONE", "BLOCKED", "WAITING", "DECISION")
+                                    or not isinstance(destination, str) or not destination
+                                    or not isinstance(identity, str) or not identity):
+                                continue
+                            reports = record.setdefault("reports", {})
+                            destinations = reports.setdefault(turn, [])
+                            receipt = [destination, identity]
+                            if receipt not in destinations:
+                                destinations.append(receipt)
+                            while len(reports) > 256:
+                                del reports[next(iter(reports))]
+                        elif item.get("type") == "end":
+                            record.setdefault("log_times", []).append(stamp)
+                            record["log_times"] = record["log_times"][-256:]
+                            if sid != master_sid and not record.get("was_master", False):
+                                peers = sessions.get(sid, [])
+                                name = peers[0].get("name", sid) if peers else item.get("name", sid)
+                                self.enqueue(sid, name, "turn/" + turn, "agent_end", "agent loop ended", turn)
+                        self.dirty = True
+                    new_cursor = [info.st_ino, source.tell()]
+                if cursor != new_cursor:
+                    self.state["cursors"][str(path)] = new_cursor
+                    self.dirty = True
+            except OSError as error:
+                self.report_error("notification metadata unavailable: " + type(error).__name__)
 
     def lifecycle(self, sid, peers, record, baseline=False, notify=True):
         for pid in sorted({peer["pid"] for peer in peers}):
@@ -230,6 +296,7 @@ class Watcher:
         master = self.master()
         master_sid = master.get("sessionId") if master else None
         now = time.time()
+        self.notifications(sessions, baseline=baseline)
         for sid, peers in sessions.items():
             busy = any(p.get("busy") is True for p in peers)
             record = self.state["sessions"].get(sid)
@@ -242,19 +309,20 @@ class Watcher:
             if not set(previous).intersection(processes):
                 # A replacement process establishes its own baseline. Its initial
                 # idle state cannot finish the previous process's abandoned turn.
-                record.update(busy=busy, active_since=now if busy else 0, edges=[])
+                record.update(busy=busy, active_since=now if busy else 0, edges=[], edge_turns={})
                 self.dirty = True
             if previous != processes or "processes" not in record:
                 record["processes"] = processes
                 self.dirty = True
             is_master = sid == master_sid
-            self.lifecycle(sid, peers, record, baseline=baseline,
+            legacy = [peer for peer in peers if peer.get("notificationVersion") != 1]
+            self.lifecycle(sid, legacy, record, baseline=baseline,
                            notify=not is_master and not record.get("was_master", False))
             if is_master or record.get("was_master", False):
                 # Consume master lifecycle metadata without reflecting watcher-
                 # triggered master turns back into the notification queue.
                 values = {"busy": busy, "active_since": record.get("active_since", 0) if busy else 0,
-                          "edges": [], "was_master": is_master}
+                          "edges": [], "edge_turns": {}, "was_master": is_master}
                 if any(record.get(key) != value for key, value in values.items()):
                     record.update(values)
                     self.dirty = True
@@ -264,6 +332,9 @@ class Watcher:
                 self.dirty = True
             if not busy and record["busy"]:
                 record.setdefault("edges", []).append([record.get("active_since", 0), now])
+                turns = {p.get("notificationTurnId") if p.get("notificationVersion") == 1 else None for p in peers}
+                if len(turns) == 1 and all(isinstance(turn, str) and turn for turn in turns):
+                    record.setdefault("edge_turns", {})[str(now)] = next(iter(turns))
                 self.dirty = True
             if record["busy"] != busy:
                 record["busy"] = busy
@@ -275,9 +346,10 @@ class Watcher:
                     continue
                 # Give the lifecycle logger time to flush, then coalesce the log
                 # and registry observations into one event for the same turn.
-                if not any(start <= ended <= edge for ended in record.get("log_times", [])):
-                    self.enqueue(sid, peers[0].get("name", sid), "idle/" + str(edge),
-                                 "idle_transition", "observed active -> idle")
+                turn = record.get("edge_turns", {}).pop(str(edge), None)
+                if turn or not any(start <= ended <= edge for ended in record.get("log_times", [])):
+                    self.enqueue(sid, peers[0].get("name", sid), "turn/" + turn if turn else "idle/" + str(edge),
+                                 "idle_transition", "observed active -> idle", turn)
                     record.setdefault("notified_edges", []).append([start, edge])
                     record["notified_edges"] = record["notified_edges"][-256:]
                 self.dirty = True
@@ -305,7 +377,9 @@ class Watcher:
         else:
             live = "live=" + ("active" if any(s.get("busy") for s in states) else "idle")
             live += "; background/task completion UNKNOWN (peer API does not report quiescence)"
-        return json.dumps({**event, "live": live}, ensure_ascii=True)
+        return (f"- {json.dumps(event['name'], ensure_ascii=True)}: {event['detail']} "
+                f"[{event['kind']}; session={event['session']}; event={event['event']}"
+                + (f"; turn={event['turn']}" if event.get("turn") else "") + f"] {live}")
 
     def deliver(self, sessions):
         if not self.state["outbox"] or time.monotonic() < self.next_send:
@@ -314,15 +388,28 @@ class Watcher:
         if not master:
             return
         outbox = self.state["outbox"]
-        filtered = [e for e in outbox if e["session"] != master.get("sessionId")]
+        filtered = []
+        for event in outbox:
+            if event["session"] == master.get("sessionId"):
+                continue
+            reports = self.state["sessions"].get(event["session"], {}).get("reports", {})
+            if event.get("turn") and [master.get("sessionId"), master.get("id")] in reports.get(event["turn"], []):
+                continue  # This exact recipient already accepted an explicit report for this turn.
+            filtered.append(event)
         if len(filtered) != len(outbox):
             self.state["outbox"] = outbox = filtered
             self.dirty = True
             self.save()
-        batch = outbox[:20]
-        if not batch:
+        if not outbox:
             return
-        text = "PEER_COMPLETION_WATCHER\n" + "\n".join(self.describe(e, sessions) for e in batch)
+        now = time.time()
+        immediate = any(e["kind"] == "test" for e in outbox)
+        due = min(e.get("queued_at", 0) + self.digest_interval for e in outbox)
+        if not immediate and now < max(due, self.state.get("next_digest_at", 0)):
+            return
+        batch = outbox[:20]
+        text = "PEER_COMPLETION_WATCHER\nIdle/turn-ended digest (" + str(len(batch)) + " transitions):\n"
+        text += "\n".join(self.describe(e, sessions) for e in batch)
         text += ("\nMetadata notification only. No parked project is authorized to resume. "
                  "Deduplicate by event ID; turn ended/idle is not task done. Background work may remain.")
         self.next_send = time.monotonic() + 3.2  # Below the peer's 20 messages/minute limit.
@@ -333,6 +420,7 @@ class Watcher:
             return
         ids = {e["event"] for e in batch}
         self.state["outbox"] = [e for e in outbox if e["event"] not in ids]
+        self.state["next_digest_at"] = time.time() + self.digest_interval
         self.dirty = True
         self.save()
         self.last_error = None
@@ -378,14 +466,18 @@ def main():
     parser.add_argument("--home", type=Path, default=Path.home(), help="OS home containing .omp/run/peers and .omp/logs")
     parser.add_argument("--state-dir", type=Path, help="private runtime directory (default: HOME/.omp-peer-watch)")
     parser.add_argument("--interval", type=float, default=1)
+    parser.add_argument("--digest-interval", type=float, default=300,
+                        help="seconds between unreported transition digests (default: 300)")
     parser.add_argument("--notify-test", help="deduplication key for an operator test; may start a master model turn")
     args = parser.parse_args()
     if not math.isfinite(args.interval) or args.interval <= 0:
         parser.error("--interval must be finite and positive")
+    if not math.isfinite(args.digest_interval) or args.digest_interval <= 0:
+        parser.error("--digest-interval must be finite and positive")
     home = args.home.expanduser().absolute()
     state_dir = (args.state_dir or home / ".omp-peer-watch").expanduser().absolute()
     try:
-        Watcher(home, state_dir, args.interval).run(args.notify_test)
+        Watcher(home, state_dir, args.interval, args.digest_interval).run(args.notify_test)
     except (OSError, ValueError) as error:
         raise SystemExit("Watcher startup failed: " + type(error).__name__) from None
 

@@ -22,11 +22,13 @@ import { createHash, randomBytes } from "node:crypto";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as SettingsRegistry from "@oh-my-pi/pi-coding-agent/config/registry";
+import { Notifications, type ReportKind } from "./notifications";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
 const SESSION_ROOT = path.join(os.homedir(), ".omp", "agent", "peer-sessions");
 const MASTER_LOCK = path.join(ROOT, "master.lock");
+const notifications = new Notifications(ROOT);
 const CONTROL_OPS = new Set(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown"]);
 // Settings the master may never touch remotely (credentials, trust/approval/sandbox, transports).
 const SETTING_DENY = /^(auth|secrets|collab|share|mcp|providers)\.|approval|token|apikey|api_key|password|credential|trust|sandbox|extension/i;
@@ -125,6 +127,8 @@ interface PeerInfo {
 	effort: string;
 	subagents: string;
 	busy: boolean;
+	notificationVersion?: 1;
+	notificationTurnId?: string;
 	context: string;
 	sock: string;
 	startedAt: string;
@@ -142,6 +146,7 @@ interface Req {
 	key?: string;
 	value?: unknown;
 	n?: number;
+	report?: ReportKind;
 }
 
 // Child agents share the main session's server; only one process may publish a logical session.
@@ -207,6 +212,7 @@ function bindIdentity(sessionId: string): void {
 	if (state.sessionId === sessionId) return;
 	teardown();
 	state.sessionId = sessionId;
+	notifications.bind(sessionId);
 	state.id = `p${createHash("sha256").update(sessionId).digest("hex").slice(0, 16)}`;
 	state.saved = { name: "", restoreMaster: false };
 	state.identityError = "";
@@ -272,6 +278,8 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 			...Object.entries(state.subModels).map(([a, m]) => `${a}=${m}`),
 		].join(" "),
 		busy: ctx ? !ctx.isIdle() : false,
+		notificationVersion: notifications.available ? 1 : undefined,
+		notificationTurnId: notifications.turnId(),
 		context: usage?.tokens != null ? `${usage.tokens}${usage.percent != null ? ` (${Math.round(usage.percent)}%)` : ""}` : "",
 		sock: sockPath(),
 		startedAt: state.startedAt,
@@ -472,7 +480,7 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 				{ deliverAs: "aside", triggerTurn: true },
 			);
 			ctx.ui.notify(`Message from ${from.name} (${from.id})`, "info");
-			return { ok: true };
+			return { ok: true, peerId: state.id, sessionId: state.sessionId };
 		}
 		case "prompt": {
 			if (!text) return { ok: false, error: "empty prompt" };
@@ -653,8 +661,14 @@ export default function peers(pi: ExtensionAPI) {
 		if (ctx.agent.kind === "main" && state.server) refresh(ctx);
 	};
 	pi.on("session_switch", refreshAfterEvent);
-	pi.on("agent_start", refreshAfterEvent);
-	pi.on("agent_end", refreshAfterEvent);
+	pi.on("agent_start", async (_event, ctx) => {
+		if (ctx.agent.kind === "main" && state.server && bind(ctx)) notifications.start();
+		await refreshAfterEvent(_event, ctx);
+	});
+	pi.on("agent_end", async (_event, ctx) => {
+		if (ctx.agent.kind === "main" && state.server && bind(ctx)) notifications.end(selfInfo(pi).name);
+		await refreshAfterEvent(_event, ctx);
+	});
 	pi.on("turn_end", refreshAfterEvent);
 	// Track the session's current task tier from the prompt it is about to work on (the master's explicit tier wins).
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -690,8 +704,16 @@ export default function peers(pi: ExtensionAPI) {
 			out = { ...req, model: r.model, effort: r.effort, tier: r.tier };
 			note = `[route: ${r.tier} — ${r.reason}${r.model ? `, ${r.model}/${r.effort}` : ""}]\n`;
 		}
+		const turn = notifications.current();
+		const reportMaster = req.report ? masterId() : undefined;
 		const lines = await Promise.all(
-			targets.map(async t => `${t.name} (${t.id}): ${summarize(await call(t, { ...out, from: senderInfo() }))}`),
+			targets.map(async t => {
+				const response = await call(t, { ...out, from: senderInfo() });
+				if (req.op === "message" && req.report && reportMaster === t.id && masterId() === t.id) {
+					notifications.reported(turn, req.report, t, response);
+				}
+				return `${t.name} (${t.id}): ${summarize(response)}`;
+			}),
 		);
 		return note + lines.join("\n");
 	}
@@ -715,15 +737,17 @@ export default function peers(pi: ExtensionAPI) {
 	const sendParameters = z.object({
 		to: z.string().describe("Stable peer id, name (or unique prefix), or 'all'"),
 		text: z.string().describe("Message body"),
+		report: z.enum(["DONE", "BLOCKED", "WAITING", "DECISION"]).optional().describe("Explicit report kind; deliver immediately and avoid a redundant same-turn watcher notice to this recipient"),
 	});
 	pi.registerTool({
 		name: "peers_send",
 		label: "Message Peer",
 		description:
-			"Send a text message to another omp session (by id or name, or 'all'). It arrives as a peer message at the receiver's next step boundary, or starts a turn if it is idle. Use for hand-offs, findings, and questions; never to run commands.",
+			"Send a text message to another omp session (by id or name, or 'all'). It arrives as a peer message at the receiver's next step boundary, or starts a turn if it is idle. Use for hand-offs, findings, and questions; never to run commands. Set report for an explicit DONE/BLOCKED/WAITING/DECISION report; ordinary messages do not suppress watcher notices.",
 		parameters: sendParameters,
-		async execute(_id, p: typeof sendParameters.infer) {
-			const text = await fanout(p.to, { op: "message", text: p.text });
+		async execute(_id, p: typeof sendParameters.infer, _signal, _onUpdate, ctx) {
+			const report = ctx.agent.kind === "main" && ctx.sessionManager.getSessionId() === state.sessionId ? p.report : undefined;
+			const text = await fanout(p.to, { op: "message", text: p.text, report });
 			return { content: [{ type: "text", text }], details: {} };
 		},
 	});
@@ -774,7 +798,7 @@ export default function peers(pi: ExtensionAPI) {
 	const ACTIONS = ["message", "prompt", "tail", "abort", "compact", "rename", "model", "effort", "subagents", "shutdown"] as const;
 	pi.registerCommand("peers", {
 		description:
-			"Peer sessions: /peers [list|master|release|msg <peer> <text>|do <peer|all> <action> [text]|set <peer|all> <get|set|clear|list> <key> [json]|route [on|off]|accept|refuse|lock|unlock]",
+			"Peer sessions: /peers [list|master|release|msg <peer> <text>|report <peer> <DONE|BLOCKED|WAITING|DECISION> <text>|do <peer|all> <action> [text]|set <peer|all> <get|set|clear|list> <key> [json]|route [on|off]|accept|refuse|lock|unlock]",
 		handler: async (args, ctx) => {
 			refresh(ctx);
 			const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
@@ -835,6 +859,13 @@ export default function peers(pi: ExtensionAPI) {
 					state.control = sub === "unlock";
 					publish(pi);
 					return say(`Control from master: ${state.control ? "allowed" : "refused"}`);
+				case "report": {
+					const [to, kind, ...text] = rest;
+					if (!to || !text.length || !["DONE", "BLOCKED", "WAITING", "DECISION"].includes(kind)) {
+						return say("usage: /peers report <peer|all> <DONE|BLOCKED|WAITING|DECISION> <text>");
+					}
+					return say(await fanout(to, { op: "message", text: text.join(" "), report: kind as ReportKind }));
+				}
 				case "msg": {
 					const [to, ...t] = rest;
 					if (!to || !t.length) return say("usage: /peers msg <peer|all> <text>");

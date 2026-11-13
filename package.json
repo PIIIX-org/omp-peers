@@ -14,7 +14,7 @@
   "files": ["extensions", "tools", "docs", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "lint": "eslint extensions/peers.ts",
+    "lint": "eslint extensions/*.ts",
     "test:watcher": "python3 -m unittest discover -s tests -p 'test_*.py'",
     "test:smoke": "python3 tests/smoke.py",
     "scan": "python3 scripts/leak_scan.py"

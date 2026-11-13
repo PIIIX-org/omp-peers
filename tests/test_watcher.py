@@ -51,7 +51,7 @@ class WatcherChecks(unittest.TestCase):
         clock = patch.object(watch.time, "time", side_effect=lambda: self.now)
         clock.start()
         self.addCleanup(clock.stop)
-        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher = watch.Watcher(self.home, self.home / "watcher", digest_interval=0)
         self.watcher.load()
 
     def peer(self, identity="pworker", sid="worker-session", busy=False, **extra):
@@ -236,6 +236,226 @@ class WatcherChecks(unittest.TestCase):
             with self.subTest(info=info), patch.object(watch, "peer_rpc", return_value={"ok": True, "info": info}):
                 self.assertIn(expected, self.watcher.describe(event, {"worker-session": [peer]}))
 
+    def notification(self, kind="end", sid="worker-session", turn="turn-one", **extra):
+        directory = self.registry / "notifications"
+        directory.mkdir(exist_ok=True)
+        path = directory / "worker.jsonl"
+        item = {"version": 1, "sessionId": sid, "turnId": turn,
+                "timestamp": self.now, "type": kind, **extra}
+        with path.open("a") as target:
+            target.write(json.dumps(item) + "\n")
+        return path
+
+    def test_report_suppresses_only_exact_turn_session_and_current_destination(self):
+        self.master()
+        self.peer(notificationVersion=1)
+        self.watcher.observe(baseline=True)
+        for report in ("DONE", "BLOCKED", "WAITING", "DECISION"):
+            with self.subTest(report=report):
+                self.now += 1
+                self.notification("report", turn=report, report=report,
+                                  destinationSessionId="master-session", destinationId="pmaster")
+                self.notification(turn=report)
+                self.watcher.observe()
+                with patch.object(watch, "peer_rpc") as rpc:
+                    self.watcher.deliver({})
+                rpc.assert_not_called()
+                self.assertEqual(self.watcher.state["outbox"], [])
+        for index, (sid, destination, identity, prior) in enumerate((
+                ("worker-session", "master-session", "pmaster", True),
+                ("unrelated-session", "master-session", "pmaster", False),
+                ("worker-session", "another-session", "pother", False),
+                ("worker-session", "master-session", "poldmaster", False))):
+            with self.subTest(receipt=(sid, destination, identity, prior)):
+                self.now += 1
+                turn = "unreported-" + str(index)
+                self.notification("report", sid=sid, turn="prior-turn" if prior else turn, report="DONE",
+                                  destinationSessionId=destination, destinationId=identity)
+                self.notification(turn=turn)
+                self.watcher.observe()
+                self.watcher.next_send = 0
+                with patch.object(watch, "peer_rpc", return_value={"ok": True}) as rpc:
+                    self.watcher.deliver({})
+                self.assertEqual(rpc.call_count, 1)
+                self.assertEqual(self.watcher.state["outbox"], [])
+
+    def test_wrong_destination_and_prior_turn_do_not_suppress(self):
+        self.master()
+        self.peer(notificationVersion=1)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.notification("report", turn="previous", report="DONE",
+                          destinationSessionId="master-session", destinationId="pmaster")
+        self.notification("report", turn="current", report="WAITING",
+                          destinationSessionId="other-session", destinationId="pother")
+        self.notification(turn="current")
+        self.watcher.observe()
+        with patch.object(watch, "peer_rpc", return_value={"ok": True}) as rpc:
+            self.watcher.deliver({})
+        self.assertEqual(rpc.call_count, 1)
+        self.assertIn("turn=current", rpc.call_args.args[1]["text"])
+
+    def test_report_to_previous_master_does_not_suppress_new_master_digest(self):
+        self.master("pold", "old-master")
+        self.peer(notificationVersion=1)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.notification("report", report="DECISION",
+                          destinationSessionId="old-master", destinationId="pold")
+        self.notification()
+        self.watcher.observe()
+        self.master("pnew", "new-master")
+        with patch.object(watch, "peer_rpc", return_value={"ok": True}) as rpc:
+            self.watcher.deliver({})
+        self.assertEqual(rpc.call_args.args[0]["id"], "pnew")
+        self.assertIn("turn=turn-one", rpc.call_args.args[1]["text"])
+
+    def test_journal_registry_and_host_log_coalesce_by_exact_turn(self):
+        self.peer(busy=True, notificationVersion=1, notificationTurnId="turn-one")
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.notification()
+        self.lifecycle()
+        self.peer(busy=False, notificationVersion=1, notificationTurnId="turn-one")
+        self.watcher.observe()
+        self.tick(3)
+        self.assertEqual(len(self.watcher.state["outbox"]), 1)
+        self.assertEqual(self.watcher.state["outbox"][0]["turn"], "turn-one")
+        self.notification()
+        self.watcher.observe()
+        self.assertEqual(len(self.watcher.state["outbox"]), 1)
+
+    def test_late_report_and_pending_turn_survive_restart(self):
+        self.master()
+        self.peer(notificationVersion=1)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.notification()
+        self.watcher.observe()
+        self.assertEqual(len(self.watcher.state["outbox"]), 1)
+        self.notification("report", report="BLOCKED",
+                          destinationSessionId="master-session", destinationId="pmaster")
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        with patch.object(watch, "peer_rpc") as rpc:
+            self.watcher.deliver({})
+        rpc.assert_not_called()
+        self.assertEqual(self.watcher.state["outbox"], [])
+
+    def test_digest_batches_and_persists_cadence_retry_and_event_ids(self):
+        self.master()
+        self.watcher.digest_interval = 60
+        self.watcher.enqueue("one", "First worker", "one", "agent_end", "agent loop ended")
+        self.now += 30
+        self.watcher.enqueue("two", "Second worker", "two", "idle_transition", "observed active -> idle")
+        self.watcher.save()
+        with patch.object(watch, "peer_rpc") as rpc:
+            self.watcher.deliver({})
+        rpc.assert_not_called()
+        self.watcher = watch.Watcher(self.home, self.home / "watcher", digest_interval=60)
+        self.watcher.load()
+        ids = [e["event"] for e in self.watcher.state["outbox"]]
+        self.now += 30
+        with patch.object(watch, "peer_rpc", side_effect=ConnectionError):
+            self.watcher.deliver({})
+        self.assertEqual([e["event"] for e in self.watcher.state["outbox"]], ids)
+        self.watcher.next_send = 0
+        with patch.object(watch, "peer_rpc", return_value={"ok": True}) as rpc:
+            self.watcher.deliver({})
+        self.assertEqual(rpc.call_count, 1)
+        text = rpc.call_args.args[1]["text"]
+        self.assertIn("digest (2 transitions)", text)
+        self.assertIn("First worker", text)
+        self.assertIn("Second worker", text)
+        self.assertTrue(all(identity in text for identity in ids))
+        self.assertEqual(self.watcher.state["outbox"], [])
+        self.assertEqual(state_ready(self.watcher.state_file)["next_digest_at"], self.now + 60)
+
+    def test_legacy_v1_outbox_remains_deliverable_without_turn_metadata(self):
+        self.master()
+        pending = {"event": "legacy-event", "session": "worker-session", "name": "worker",
+                   "kind": "agent_end", "detail": "agent loop ended"}
+        state = {"version": 1, "since": self.now - 100, "sessions": {},
+                 "cursors": {}, "seen": ["legacy-event"], "outbox": [pending]}
+        watch.atomic_json(self.watcher.state_file, state)
+        self.watcher.load()
+        self.assertEqual(self.watcher.state["outbox"], [pending])
+        with patch.object(watch, "peer_rpc", side_effect=ConnectionError):
+            self.watcher.deliver({})
+        self.assertEqual(state_ready(self.watcher.state_file)["outbox"], [pending])
+        self.watcher.next_send = 0
+        with patch.object(watch, "peer_rpc", return_value={"ok": True}) as rpc:
+            self.watcher.deliver({})
+        self.assertIn("legacy-event", rpc.call_args.args[1]["text"])
+        self.assertEqual(state_ready(self.watcher.state_file)["outbox"], [])
+
+    def test_metadata_partial_line_and_invalid_report_cannot_hide_notice(self):
+        self.master()
+        self.peer(notificationVersion=1)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        path = self.notification("report", report="ordinary-message",
+                                 destinationSessionId="master-session", destinationId="pmaster")
+        self.notification()
+        raw = path.read_bytes()
+        path.write_bytes(raw[:-1])
+        self.watcher.observe()
+        self.assertEqual(self.watcher.state["outbox"], [])
+        with path.open("ab") as target:
+            target.write(b"\n")
+        self.watcher.observe()
+        with patch.object(watch, "peer_rpc", return_value={"ok": True}) as rpc:
+            self.watcher.deliver({})
+        self.assertEqual(rpc.call_count, 1)
+
+    def test_registry_fallback_cannot_borrow_a_prior_turn_receipt(self):
+        self.master()
+        self.peer(busy=True, notificationVersion=1, notificationTurnId="current")
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.notification("report", turn="prior", report="DONE",
+                          destinationSessionId="master-session", destinationId="pmaster")
+        self.peer(busy=False, notificationVersion=1, notificationTurnId="current")
+        self.watcher.observe()
+        self.tick(3)
+        self.assertEqual([event["turn"] for event in self.watcher.state["outbox"]], ["current"])
+        with patch.object(watch, "peer_rpc", return_value={"ok": True}) as rpc:
+            self.watcher.deliver({})
+        self.assertEqual(rpc.call_count, 1)
+
+    def test_restart_reads_new_journal_created_while_watcher_was_stopped(self):
+        self.peer(notificationVersion=1)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.notification()
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.assertEqual([event["turn"] for event in self.watcher.state["outbox"]], ["turn-one"])
+
+    def test_backlog_waits_a_full_cadence_between_persisted_batches(self):
+        self.master()
+        self.watcher.digest_interval = 30
+        for index in range(21):
+            self.watcher.enqueue("worker", "worker", str(index), "agent_end", "agent loop ended")
+        self.now += 30
+        with patch.object(watch, "peer_rpc", return_value={"ok": True}) as rpc:
+            self.watcher.deliver({})
+        self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(len(self.watcher.state["outbox"]), 1)
+        self.watcher = watch.Watcher(self.home, self.home / "watcher", digest_interval=30)
+        self.watcher.load()
+        self.now += 29
+        with patch.object(watch, "peer_rpc") as rpc:
+            self.watcher.deliver({})
+        rpc.assert_not_called()
+        self.now += 1
+        with patch.object(watch, "peer_rpc", return_value={"ok": True}) as rpc:
+            self.watcher.deliver({})
+        self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(self.watcher.state["outbox"], [])
+
     def test_runtime_permissions_and_symlink_rejection(self):
         self.watcher.save()
         self.assertEqual(stat.S_IMODE(self.watcher.state_dir.stat().st_mode), 0o700)
@@ -277,6 +497,18 @@ class SocketChecks(unittest.TestCase):
 
 
 class ProcessChecks(unittest.TestCase):
+    def test_digest_interval_rejects_nonpositive_and_nonfinite_values(self):
+        for value in ("0", "-1", "nan", "inf"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
+                result = subprocess.run(
+                    [sys.executable, str(REPO / "tools/watch.py"), "--home", root,
+                     "--digest-interval", value],
+                    env={"HOME": root, "PATH": os.environ["PATH"]},
+                    capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--digest-interval must be finite and positive", result.stderr)
+                self.assertFalse((Path(root) / ".omp-peer-watch").exists())
+
     def test_persistent_start_without_omp_singleton_and_shutdown(self):
         with tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
             home = Path(root)
@@ -314,13 +546,14 @@ class InstallerChecks(unittest.TestCase):
                 install_watcher.valid_label(label)
         home = Path("/portable home & team")
         data = install_watcher.render_plist(REPO / "tools/launchd/peer-watcher.plist.in", home,
-                                           home / "runtime", Path("/python location/bin/python3"), "org.example.watcher")
+                                           home / "runtime", Path("/python location/bin/python3"), "org.example.watcher", 42.5)
         document = plistlib.loads(data)
         self.assertEqual(document["ProgramArguments"][3], str(home))
         self.assertEqual(document["Label"], "org.example.watcher")
         self.assertIs(document["RunAtLoad"], True)
         self.assertIs(document["KeepAlive"], True)
         self.assertEqual(document["Umask"], 0o077)
+        self.assertEqual(document["ProgramArguments"][-2:], ["--digest-interval", "42.5"])
 
     def test_install_uninstall_keeps_state_and_purge_removes_known_files(self):
         with tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:

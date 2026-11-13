@@ -58,7 +58,7 @@ The extension stores names and restore preferences under `~/.omp/agent/peer-sess
 ### Tools
 
 - `peers_list`: list sessions, models, effort, busy/idle state, context usage, and the master.
-- `peers_send`: deliver an agent-attributed message to a peer or `all`.
+- `peers_send`: deliver an agent-attributed message to a peer or `all`. Set optional `report: "DONE" | "BLOCKED" | "WAITING" | "DECISION"` for an explicit report. The body takes the ordinary route immediately; a successful same-turn delivery to the current master can suppress a redundant watcher notice. Use `/peers report <peer|all> <kind> <text>` from the command interface.
 - `peers_control`: master-only prompt, abort, compact, model, effort, subagents, setting, rename, tail, or shutdown. `status` does not require master ownership.
 
 A message to an idle peer can start a model turn and consume its provider quota. A master's `prompt` starts or queues user work. `abort`, `compact`, and `shutdown` affect running sessions; review your target before sending them. Status and tail inspect local state without asking a model.
@@ -145,9 +145,9 @@ Run from this checkout with Python 3.9 or newer:
 python3 tools/watch.py
 ```
 
-The watcher keeps running without OMP or a master. It queues metadata-only turn-ended notifications and sends batches to the current master through the local message RPC. **Delivery can start a model turn in the master and consume provider quota.** A turn-ended or idle event does not prove task completion; current peers do not report background-work quiescence.
+The watcher keeps running without OMP or a master. It queues metadata-only turn-ended transitions and sends a readable digest to the current master through the local message RPC, at most once per five minutes by default (`--digest-interval 300`). Explicit reports keep their immediate ordinary delivery route. **Delivery can start a model turn in the master and consume provider quota.** A turn-ended or idle event does not prove task completion; current peers do not report background-work quiescence.
 
-The watcher deduplicates by stable session and event IDs, keeps an outbox across restarts, and excludes the current master's events to prevent feedback. Initial idle peers, replacement-process initial idle states and departures do not count as completions. It reads peer registry and selected lifecycle-log metadata, never session transcripts. State lives under `$HOME/.omp-peer-watch` with a `0700` directory and `0600` files; state and logs still contain private session metadata. Only one watcher may use a runtime directory.
+The watcher deduplicates by stable session and event IDs, keeps a version-1-compatible outbox across restarts, and excludes the current master's events to prevent feedback. It suppresses an empty notice only after an acknowledged explicit report for the same logical session, agent-loop turn and current master destination. Initial idle peers, replacement-process initial idle states and departures do not count as completions. It reads peer registry, plugin notification metadata and selected legacy lifecycle-log metadata, never session transcripts. State lives under `$HOME/.omp-peer-watch` with a `0700` directory and `0600` files; state and logs still contain private session metadata. Only one watcher may use a runtime directory.
 
 For macOS startup independent of OMP:
 
@@ -155,7 +155,7 @@ For macOS startup independent of OMP:
 python3 tools/install_watcher.py install
 ```
 
-The installer renders a portable LaunchAgent template with `RunAtLoad` and `KeepAlive`. It accepts `--label`, `--state-dir` and `--python`; it refuses to overwrite an unmanaged watcher. Use `python3 tools/install_watcher.py uninstall` to stop and remove the default installation, or add `--purge` to remove its known state/log files. [Installation, migration, privacy and completion semantics](docs/watcher.md) cover custom labels and runtime directories, Linux foreground use, delivery limitations, and offline checks.
+The installer renders a portable LaunchAgent template with `RunAtLoad` and `KeepAlive`. It accepts `--label`, `--state-dir`, `--python` and `--digest-interval`; it refuses to overwrite an unmanaged watcher. Use `python3 tools/install_watcher.py uninstall` to stop and remove the default installation, or add `--purge` to remove its known state/log files. [Installation, migration, privacy and completion semantics](docs/watcher.md) cover custom labels and runtime directories, Linux foreground use, delivery limitations, and offline checks.
 
 ## Contributing
 

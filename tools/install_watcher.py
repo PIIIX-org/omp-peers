@@ -5,6 +5,7 @@
 import argparse
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -26,7 +27,7 @@ def valid_label(value):
     return value
 
 
-def render_plist(template, home, state_dir, python, label):
+def render_plist(template, home, state_dir, python, label, digest_interval=300):
     replacements = {"__LABEL__": valid_label(label), "__PYTHON__": str(python),
                     "__WATCHER__": str(state_dir / "watch.py"), "__HOME__": str(home),
                     "__STATE_DIR__": str(state_dir), "__STDOUT__": str(state_dir / "watcher.stdout.log"),
@@ -42,6 +43,7 @@ def render_plist(template, home, state_dir, python, label):
             return {key: replace(item) for key, item in value.items()}
         return value
 
+    document["ProgramArguments"].extend(["--digest-interval", str(digest_interval)])
     return plistlib.dumps(replace(document), sort_keys=False)
 
 
@@ -85,7 +87,7 @@ def acquire_runtime_lock(lock, wait_for_exit=False):
             time.sleep(0.05)
 
 
-def install(home, state_dir, label, python):
+def install(home, state_dir, label, python, digest_interval=300):
     state_dir = private_directory(state_dir)
     agents = home / "Library/LaunchAgents"
     agents.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -108,7 +110,7 @@ def install(home, state_dir, label, python):
     with private_open(state_dir / "completion.lock") as lock:
         acquire_runtime_lock(lock, wait_for_exit)
         source = Path(__file__).resolve().parent
-        rendered = render_plist(source / "launchd/peer-watcher.plist.in", home, state_dir, python, label)
+        rendered = render_plist(source / "launchd/peer-watcher.plist.in", home, state_dir, python, label, digest_interval)
         for name in ("watcher.stdout.log", "watcher.stderr.log"):
             with private_open(state_dir / name):
                 pass
@@ -155,8 +157,11 @@ def main():
     parser.add_argument("--label", type=valid_label, default=DEFAULT_LABEL)
     parser.add_argument("--state-dir", type=Path, help="default: HOME/.omp-peer-watch")
     parser.add_argument("--python", type=Path, default=Path(sys.executable), help="absolute Python 3 interpreter for launchd")
+    parser.add_argument("--digest-interval", type=float, default=300, help="seconds between idle digests (default: 300)")
     parser.add_argument("--purge", action="store_true", help="uninstall: also remove known state/log files")
     args = parser.parse_args()
+    if not math.isfinite(args.digest_interval) or args.digest_interval <= 0:
+        parser.error("--digest-interval must be finite and positive")
     if sys.platform != "darwin":
         parser.error("launchd installation requires macOS; run tools/watch.py in the foreground on Linux")
     if args.purge and args.action != "uninstall":
@@ -168,7 +173,7 @@ def main():
         parser.error("--python must identify an executable Python 3 interpreter")
     try:
         if args.action == "install":
-            install(home, state_dir, args.label, python)
+            install(home, state_dir, args.label, python, args.digest_interval)
         else:
             uninstall(home, state_dir, args.label, args.purge)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
