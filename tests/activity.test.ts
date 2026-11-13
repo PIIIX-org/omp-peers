@@ -192,6 +192,18 @@ describe("peer activity metadata", () => {
 		expect(read().activity.unknownReasons).toContain("advisor_review_state_unavailable");
 	});
 
+	test.each(["throws", "null entry"])("advisor probe %s preserves known counts and unknown settlement", failure => {
+		const { session, read } = fixture();
+		Object.assign(session, { getAdvisorStatusOverview: () => {
+			if (failure === "throws") throw new Error("unavailable host probe");
+			return { configured: true, advisors: [null] };
+		} });
+		const state = read();
+		expect(state.activity).toMatchObject({ activeJobs: 0, activeSubagents: 0 });
+		expect(state.isSettled).toBeNull();
+		expect(state.activity.unknownReasons).toEqual(["advisor_review_state_unavailable"]);
+	});
+
 	test("unsupported services, null job snapshots and missing wake probes remain unknown", () => {
 		const { ctx, host, session, read } = fixture();
 		const unavailable = readActivity(ctx, undefined);

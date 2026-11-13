@@ -107,11 +107,16 @@ export function readActivity(ctx: ExtensionContext | undefined, services = host)
 			}
 			blocked ||= live.isStreaming || live.hasAdmittedSubmission || live.queuedMessageCount > 0
 				|| live.hasPendingAsyncWork() || live.ircWakesPending || live.hasPostPromptWork;
-			const advisors = live.getAdvisorStatusOverview?.();
-			if (!advisors || !Array.isArray(advisors.advisors)
-				|| advisors.advisors.some(advisor => !Number.isFinite(advisor.backlog) || advisor.backlog < 0)) {
+			try {
+				const advisors = live.getAdvisorStatusOverview?.();
+				if (!advisors || !Array.isArray(advisors.advisors)
+					|| advisors.advisors.some(advisor => !advisor || typeof advisor !== "object"
+						|| !Number.isFinite(advisor.backlog) || advisor.backlog < 0)) {
+					unknown.push("advisor_review_state_unavailable");
+				} else blocked ||= advisors.advisors.some(advisor => advisor.backlog > 0);
+			} catch {
 				unknown.push("advisor_review_state_unavailable");
-			} else blocked ||= advisors.advisors.some(advisor => advisor.backlog > 0);
+			}
 		}
 
 		// Mode owners do not expose their scheduled-turn probe. Prove autonomous
