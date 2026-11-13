@@ -166,6 +166,11 @@ test("pinned routing through the extension, socket, tools and host callbacks", a
 		assert.equal(formatModelStringWithRouting(roundTrip.model), "openrouter/z-ai/glm-4.7@cerebras");
 		assert.equal(roundTrip.thinkingLevel, "high");
 		assert.match(sub?.note ?? "", /@cerebras:high/);
+		result = await rpc({ op: "model", text: routedSelector });
+		assert.match(String(result.routed), /offline\/second -> openrouter\/z-ai\/glm-4\.7@cerebras/);
+		assert.equal(worker().model, "openrouter/z-ai/glm-4.7@cerebras");
+		result = await rpc({ op: "model", text: "offline/second" });
+		assert.match(String(result.routed), /openrouter\/z-ai\/glm-4\.7@cerebras -> offline\/second/);
 		await rpc({ op: "subagents", text: "task=nonexistent/model" });
 		sub = await spawn(); assert.equal(sub?.block, true); assert.match(sub?.reason ?? "", /unavailable model/);
 		await rpc({ op: "subagents", text: "task=offline/second" }); credentials = false;

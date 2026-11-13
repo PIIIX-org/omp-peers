@@ -284,7 +284,7 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 		name: pi.getSessionName() || state.saved.name || path.basename(ctx?.cwd ?? process.cwd()),
 		cwd: ctx?.cwd ?? process.cwd(),
 		sessionId: ctx?.sessionManager.getSessionId() ?? "",
-		model: model?.id ? `${model.provider ?? ""}/${model.id}` : "",
+		model: model ? formatModelStringWithRouting(model) : "",
 		effort: String(pi.getThinkingLevel() ?? ""),
 		subagents: [
 			`auto=${state.subAuto}${autoActive() ? "(active)" : ""} tier=${state.tier}`,
@@ -423,7 +423,7 @@ async function applyRouting(
 ): Promise<{ ok: true; routed: string } | { ok: false; error: string }> {
 	const current = () => {
 		const model = ctx.models.current();
-		return model ? `${model.provider}/${model.id}` : "(none)";
+		return model ? formatModelStringWithRouting(model) : "(none)";
 	};
 	const oldModel = current();
 	const oldEffort = pi.getThinkingLevel();

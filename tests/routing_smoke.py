@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (c) 2026 PIIIX-org contributors
-"""Real OMP/socket pin reports and failure atomicity, without successful prompt turns.
-
-Successful prompts are exercised by the consumer regression; this actual host proof
-uses model/effort controls and rejected prompts so no provider request is possible.
-"""
+"""Real OMP/socket routing proof; model turns terminate at a loopback fake gateway."""
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 import socket
@@ -13,11 +10,38 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 
 from smoke import OMP, Peer, REPO, wait_for
 
 sys.path.insert(0, str(REPO / "tools"))
 from watch import peer_rpc
+
+
+class FakeGateway(BaseHTTPRequestHandler):
+    """Capture the real transport's upstream restriction, without external calls."""
+
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.requests.append((self.path, body))
+        common = {"id": "offline-proof", "object": "chat.completion.chunk",
+                  "created": 1, "model": body["model"]}
+        chunks = [
+            {**common, "choices": [{"index": 0, "delta": {
+                "role": "assistant", "content": "Offline proof."}, "finish_reason": None}]},
+            {**common, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        ]
+        payload = "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
+        payload = (payload + "data: [DONE]\n\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
 
 def main():
@@ -28,6 +52,11 @@ def main():
         home = Path(root)
         agent = home / ".omp/agent"
         agent.mkdir(parents=True)
+        gateway = HTTPServer(("127.0.0.1", 0), FakeGateway)
+        gateway.requests = []
+        serving = threading.Thread(target=gateway.serve_forever,
+                                   kwargs={"poll_interval": 0.05}, daemon=True)
+        serving.start()
         (agent / "config.yml").write_text(
             "autoResume: false\nsetupVersion: 2\nstartup:\n  setupWizard: false\n"
             "  checkUpdate: false\nrecap:\n  enabled: false\nproviders:\n  cacheWarming: off\n"
@@ -37,6 +66,9 @@ def main():
             "    api: openai-completions\n    auth: none\n    models:\n"
             "      - id: first\n        reasoning: true\n"
             "      - id: second\n        reasoning: true\n"
+            f"  openrouter:\n    baseUrl: http://127.0.0.1:{gateway.server_port}/v1\n"
+            "    api: openai-completions\n    auth: none\n    models:\n"
+            "      - id: offline-route\n        reasoning: true\n"
         )
         env = {"HOME": root, "PATH": os.environ["PATH"], "TERM": "dumb",
                "PI_CODING_AGENT_DIR": str(agent), "TMPDIR": root,
@@ -88,6 +120,30 @@ def main():
             after = status()
             assert (after["model"], after["effort"], after["routingPolicy"]) == (
                 changed["model"], changed["effort"], changed["routingPolicy"]), after
+            previous = changed["model"]
+            for index, upstream in enumerate(("cerebras", "sambanova"), 1):
+                selected = f"openrouter/offline-route@{upstream}"
+                transition = f"{previous} -> {selected}"
+                start = len(worker.frames)
+                master.command(f"/peers do {receiver['id']} model {selected}", transition)
+                wait_for(lambda: any(f.get("method") == "notify" and transition in json.dumps(f)
+                                     for f in worker.frames[start:]))
+                messages = worker.call("get_messages")["messages"]
+                assert any(m.get("customType") == "peer-routing" and m.get("display") is True
+                           and transition in str(m.get("content")) for m in messages), messages
+                assert status()["model"] == selected, status()
+                start = len(worker.frames)
+                worker.call("prompt", message="Reply using the offline fake gateway.")
+                wait_for(lambda: any(f.get("type") == "agent_end" for f in worker.frames[start:]))
+                assert len(gateway.requests) == index, gateway.requests
+                route, request = gateway.requests[-1]
+                assert route == "/v1/chat/completions", route
+                assert request["model"] == "offline-route", request
+                assert request.get("provider", {}).get("only") == [upstream], request
+                assert status()["model"] == selected, status()
+                print(f"PASS sender + receiver visible {transition}; status.model={selected}; "
+                      f"loopback request provider.only=[{upstream}]")
+                previous = selected
             # Local opt-in survives an actual host resume; explicit controls re-pin above.
             worker.command("/peers unpin", "policy: auto")
             session_file = worker.call("get_state")["sessionFile"]
@@ -100,12 +156,18 @@ def main():
             assert status()["routingPolicy"] == "auto"
             worker.command("/peers pin", "policy: keep")
             assert status()["routingPolicy"] == "keep"
-            assert not any(f.get("type") in ("agent_start", "extension_error") for peer in peers for f in peer.frames)
-            print("PASS actual OMP visible old/new routing, pin policy, unavailable failure and resume; no provider turns")
+            assert not any(f.get("type") == "extension_error" for peer in peers for f in peer.frames)
+            assert not any(f.get("type") == "agent_start" for f in master.frames)
+            assert sum(f.get("type") == "agent_start" for f in peers[1].frames) == 2
+            print("PASS actual OMP pin, unavailable failure, upstream-only reports/status/transport and resume; no external provider calls")
         finally:
             for peer in reversed(peers):
                 if not peer.proc.stdin.closed:
                     peer.close()
+            gateway.shutdown()
+            serving.join(timeout=5)
+            gateway.server_close()
+            assert not serving.is_alive(), "fake gateway thread survived cleanup"
         assert not list(registry.glob("p*.json")), "disposable registrations survived shutdown"
     print("PASS disposable OMP processes, homes and runtime state removed")
 
