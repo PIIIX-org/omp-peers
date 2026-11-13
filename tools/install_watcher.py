@@ -75,18 +75,27 @@ def launchctl(*arguments, check=True):
     return subprocess.run(["launchctl", *arguments], check=check, capture_output=True, text=True)
 
 
-def stop_managed(service):
+def stop_managed(service, lock):
     status = launchctl("print", service, check=False)
     match = re.search(r"^\s*pid = ([1-9][0-9]*)\s*$", status.stdout or "", re.MULTILINE)
+    timeout = re.search(r"^\s*exit timeout = ([1-9][0-9]*)\s*$", status.stdout or "", re.MULTILINE)
+    if match and not timeout:
+        raise RuntimeError("could not determine a bounded managed exit deadline; leaving the agent running")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.seek(0)
+        if not match or lock.read().strip() != match[1]:
+            raise RuntimeError("a watcher is still running; stop it before changing installation") from None
     result = launchctl("bootout", service, check=False)
     if result.returncode and launchctl("print", service, check=False).returncode == 0:
         raise RuntimeError("could not stop the installed launch agent")
-    return int(match[1]) if result.returncode == 0 and match else None
+    return (int(match[1]), int(timeout[1])) if result.returncode == 0 and match else (None, 0)
 
 
-def acquire_runtime_lock(lock, managed_pid=None):
-    # launchctl may return before exit; wait only for the process it managed.
-    deadline = time.monotonic() + MANAGED_EXIT_TIMEOUT + 1
+def acquire_runtime_lock(lock, managed_pid=None, exit_timeout=0):
+    # launchctl may return before exit; wait only for its captured PID/deadline.
+    deadline = time.monotonic() + exit_timeout + 1
     while True:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -111,10 +120,10 @@ def install(home, state_dir, label, python, digest_interval=300):
         raise ValueError("refusing to overwrite an unmanaged watcher or launch agent")
     domain = "gui/" + str(os.getuid())
     service = domain + "/" + label
-    managed_pid = stop_managed(service) if manifest is not None else None
     # Do not replace files used by a manually launched or operational watcher.
     with private_open(state_dir / "completion.lock") as lock:
-        acquire_runtime_lock(lock, managed_pid)
+        managed_pid, exit_timeout = stop_managed(service, lock) if manifest is not None else (None, 0)
+        acquire_runtime_lock(lock, managed_pid, exit_timeout)
         source = Path(__file__).resolve().parent
         rendered = render_plist(source / "launchd/peer-watcher.plist.in", home, state_dir, python, label, digest_interval)
         for name in ("watcher.stdout.log", "watcher.stderr.log"):
@@ -138,9 +147,9 @@ def uninstall(home, state_dir, label, purge=False):
     if manifest_for(state_dir, label, plist) is None:
         raise ValueError("refusing to remove an unmanaged watcher")
     service = "gui/" + str(os.getuid()) + "/" + label
-    managed_pid = stop_managed(service)
     with private_open(state_dir / "completion.lock") as lock:
-        acquire_runtime_lock(lock, managed_pid)
+        managed_pid, exit_timeout = stop_managed(service, lock)
+        acquire_runtime_lock(lock, managed_pid, exit_timeout)
         for path in (plist, state_dir / "watch.py", state_dir / "install.json"):
             path.unlink(missing_ok=True)
         if purge:

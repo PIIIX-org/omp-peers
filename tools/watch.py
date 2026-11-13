@@ -19,13 +19,11 @@ import socket
 import stat
 import sys
 import tempfile
-import threading
 import time
 
 RPC_TIMEOUT = 2
 # Allow one bounded RPC plus time to persist state before launchd escalates.
 MANAGED_EXIT_TIMEOUT = RPC_TIMEOUT + 3
-
 
 
 def read_json(path):
@@ -88,7 +86,7 @@ def peer_rpc(peer, request, *, stop=None):
     deadline = time.monotonic() + RPC_TIMEOUT
 
     def remaining():
-        if stop is not None and stop.is_set():
+        if stop is not None and stop():
             raise ConnectionError("watcher stopping")
         seconds = deadline - time.monotonic()
         if seconds <= 0:
@@ -132,7 +130,6 @@ class Watcher:
         self.digest_interval = digest_interval
         self.next_send = 0
         self.stopping = False
-        self.stop_event = threading.Event()
         self.last_error = None
         self.dirty = False
         self.restored = False
@@ -401,7 +398,7 @@ class Watcher:
             if self.stopping:
                 break
             try:
-                info = peer_rpc(peer, {"op": "status"}, stop=self.stop_event).get("info")
+                info = peer_rpc(peer, {"op": "status"}, stop=self.is_stopping).get("info")
                 if isinstance(info, dict):
                     states.append(info)
             except (OSError, ValueError, KeyError, ConnectionError):
@@ -479,7 +476,7 @@ class Watcher:
         self.next_send = time.monotonic() + 3.2  # Below the peer's 20 messages/minute limit.
         try:
             peer_rpc(master, {"op": "message", "from": {"id": "completion-watcher", "name": "Completion watcher"},
-                             "text": text}, stop=self.stop_event)
+                             "text": text}, stop=self.is_stopping)
         except (OSError, ValueError, ConnectionError) as error:
             if not self.stopping:
                 self.report_error("notification pending retry: " + type(error).__name__)
@@ -500,7 +497,9 @@ class Watcher:
 
     def stop(self, *_):
         self.stopping = True
-        self.stop_event.set()
+
+    def is_stopping(self):
+        return self.stopping
 
     def run(self, test_message=None):
         with private_open(self.state_dir / "completion.lock") as lock:
@@ -526,7 +525,13 @@ class Watcher:
                     self.deliver(sessions)
                 except (OSError, ValueError, KeyError, TypeError, ConnectionError) as error:
                     self.report_error("watch loop recovered: " + type(error).__name__)
-                self.stop_event.wait(self.interval)
+                # Keep signal handling lock-free and bound wakeup even for long intervals.
+                wake_at = time.monotonic() + self.interval
+                while not self.stopping:
+                    remaining = wake_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.05, remaining))
             self.save()
             print("WATCHER_STOPPED", flush=True)
 

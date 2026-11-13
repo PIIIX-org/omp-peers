@@ -23,6 +23,8 @@
 - Batch unreported idle/turn-ended transitions into configurable five-minute digests, preserving the version-1 durable outbox and retry identities.
 - Add optional explicit report kinds to `peers_send` and `/peers report`. Acknowledged delivery to the current master suppresses only that session/turn's redundant watcher notice; reports keep their immediate delivery route. Use metadata-only journals, not transcript reads or message-word heuristics.
 - Cover report routing, exact turn/destination correlation, late receipts, digest cadence and v1 state compatibility with isolated offline regressions.
+- Cancel watcher status/delivery RPCs on termination, wake polling immediately, and preserve unacknowledged events for retry instead of draining the digest during shutdown.
+- Coordinate the LaunchAgent exit deadline with the installer's managed-PID lock wait; refuse unrelated manual lock holders immediately. Cover stalled status/acknowledgement cancellation and private-home managed upgrade/uninstall without real launchd services or provider calls.
 
 ## 0.1.0
 
