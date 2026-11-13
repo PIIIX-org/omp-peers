@@ -63,15 +63,15 @@ The watcher persists event IDs, journal/log cursors, report receipts and the out
 
 ### Explicit reports
 
-Send an important report with its optional kind:
+Send an important report as a structured object, instead of ordinary free-form `text`:
 
 ```text
-peers_send({to: "<master-peer-id>", text: "Acceptance checks passed.", report: "DONE"})
+peers_send({to: "<master-peer-id>", report: {kind: "DONE", unit: "Acceptance checks", evidence: {description: "Consumer checks passed", references: ["tests/notifications.ts"]}}})
 ```
 
-The allowed kinds are `DONE`, `BLOCKED`, `WAITING`, and `DECISION`. The interactive equivalent is `/peers report <peer|all> <kind> <text>`. This is a delivery marker, not a structured-report framework; text stays free-form. Existing `peers_send` calls and `/peers msg` keep their behavior.
+The kinds are `DONE`, `BLOCKED`, `WAITING`, and `DECISION`, each with required human-readable fields. The interactive equivalent is `/peers report <peer|all> <json-report>`. See the [schema, rendering and deliberate readability limits](../README.md#structured-reports). The old string marker and `<kind> <text>` command syntax are rejected; upgrade both peers for structured reports. Ordinary `peers_send` text calls and `/peers msg` keep their behavior.
 
-The sender delivers the body through the ordinary peer message RPC immediately. It records a receipt only if the destination is the current master both before the send and after a successful acknowledgement, and the receiver acknowledges the same peer ID and logical session ID as the selected destination. Failed, refused, timed-out, legacy, or mismatched acknowledgements cannot authorize suppression. An ordinary message, a report to another peer, and a child-agent or out-of-turn report cannot authorize suppression either. The receiver's normal refusal/rate limits still apply, and the sender sees failures through the ordinary send result.
+The sender delivers structured data through the peer message RPC immediately; the receiver validates it before rendering an agent-attributed message. It records a metadata-only receipt (kind, not report fields) only if the destination is the current master both before the send and after a successful acknowledgement, and the receiver acknowledges the same peer ID and logical session ID as the selected destination. Failed, refused, timed-out, legacy, or mismatched acknowledgements cannot authorize suppression. An ordinary message, a report to another peer, and a child-agent or out-of-turn report cannot authorize suppression either. The receiver's normal refusal/rate limits still apply, and the sender sees failures through the ordinary send result.
 
 At digest delivery, the watcher removes only redundant end/idle notices with a receipt for the exact sender session, logical turn and current master destination. It does not remove or delay the report itself. A receipt from a prior turn or a report to a previous master cannot hide a notice for the new destination. Multiple important reports in one turn all take the ordinary route. A late acknowledgement retains the identity of the sending turn, even if another turn starts before it arrives.
 

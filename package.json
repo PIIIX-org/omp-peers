@@ -18,6 +18,7 @@
     "test:watcher": "python3 -m unittest discover -s tests -p 'test_*.py'",
     "test:smoke": "python3 tests/smoke.py",
     "test:activity": "bun test tests/activity.test.ts",
+    "test:reports": "bun test tests/reports.test.ts",
     "test:identity": "bun test tests/identity.test.ts",
     "test:activity-smoke": "python3 tests/activity_smoke.py",
     "test:routing": "python3 -m unittest discover -s tests -p 'test_routing.py'",
