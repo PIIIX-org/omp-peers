@@ -19,7 +19,13 @@ import socket
 import stat
 import sys
 import tempfile
+import threading
 import time
+
+RPC_TIMEOUT = 2
+# Allow one bounded RPC plus time to persist state before launchd escalates.
+MANAGED_EXIT_TIMEOUT = RPC_TIMEOUT + 3
+
 
 
 def read_json(path):
@@ -77,20 +83,36 @@ def alive(pid):
         return False
 
 
-def peer_rpc(peer, request):
-    """Use peers_send's newline-delimited local Unix-socket protocol."""
+def peer_rpc(peer, request, *, stop=None):
+    """Use peers_send's local protocol with a total deadline and cancellable reads."""
+    deadline = time.monotonic() + RPC_TIMEOUT
+
+    def remaining():
+        if stop is not None and stop.is_set():
+            raise ConnectionError("watcher stopping")
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("peer acknowledgement timed out")
+        return seconds
+
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-        conn.settimeout(2)
+        conn.settimeout(remaining())
         conn.connect(peer["sock"])
+        conn.settimeout(remaining())
         conn.sendall(json.dumps(request).encode() + b"\n")
         data = bytearray()
         while b"\n" not in data:
-            chunk = conn.recv(65536)
+            conn.settimeout(min(0.05, remaining()) if stop is not None else remaining())
+            try:
+                chunk = conn.recv(65536)
+            except socket.timeout:
+                continue
             if not chunk:
                 raise ConnectionError("peer closed before acknowledgement")
             data.extend(chunk)
             if len(data) > 256 * 1024:
                 raise ConnectionError("peer response too large")
+        remaining()  # A late acknowledgement cannot commit a cancelled delivery.
         response = json.loads(data.split(b"\n", 1)[0])
         if not isinstance(response, dict) or response.get("ok") is not True:
             # Peer error text can contain private content. Do not copy it into logs.
@@ -110,6 +132,7 @@ class Watcher:
         self.digest_interval = digest_interval
         self.next_send = 0
         self.stopping = False
+        self.stop_event = threading.Event()
         self.last_error = None
         self.dirty = False
         self.restored = False
@@ -375,8 +398,10 @@ class Watcher:
         peers = sessions.get(event["session"], [])
         states = []
         for peer in peers:
+            if self.stopping:
+                break
             try:
-                info = peer_rpc(peer, {"op": "status"}).get("info")
+                info = peer_rpc(peer, {"op": "status"}, stop=self.stop_event).get("info")
                 if isinstance(info, dict):
                     states.append(info)
             except (OSError, ValueError, KeyError, ConnectionError):
@@ -414,7 +439,7 @@ class Watcher:
                 + (f"; turn={event['turn']}" if event.get("turn") else "") + f"] {live}")
 
     def deliver(self, sessions):
-        if not self.state["outbox"] or time.monotonic() < self.next_send:
+        if self.stopping or not self.state["outbox"] or time.monotonic() < self.next_send:
             return
         master = self.master()  # Re-resolve the current owner on every attempt.
         if not master:
@@ -441,14 +466,23 @@ class Watcher:
             return
         batch = outbox[:20]
         text = "PEER_COMPLETION_WATCHER\nIdle/turn-ended digest (" + str(len(batch)) + " transitions):\n"
-        text += "\n".join(self.describe(e, sessions) for e in batch)
+        descriptions = []
+        for event in batch:
+            if self.stopping:
+                return
+            descriptions.append(self.describe(event, sessions))
+        text += "\n".join(descriptions)
         text += ("\nMetadata notification only. No parked project is authorized to resume. "
                  "Deduplicate by event ID; turn ended/idle is not task done. Background work may remain.")
+        if self.stopping:
+            return
         self.next_send = time.monotonic() + 3.2  # Below the peer's 20 messages/minute limit.
         try:
-            peer_rpc(master, {"op": "message", "from": {"id": "completion-watcher", "name": "Completion watcher"}, "text": text})
+            peer_rpc(master, {"op": "message", "from": {"id": "completion-watcher", "name": "Completion watcher"},
+                             "text": text}, stop=self.stop_event)
         except (OSError, ValueError, ConnectionError) as error:
-            self.report_error("notification pending retry: " + type(error).__name__)
+            if not self.stopping:
+                self.report_error("notification pending retry: " + type(error).__name__)
             return
         ids = {e["event"] for e in batch}
         self.state["outbox"] = [e for e in outbox if e["event"] not in ids]
@@ -464,6 +498,10 @@ class Watcher:
             print("WATCHER_WARNING " + text, file=sys.stderr, flush=True)
             self.last_error = text
 
+    def stop(self, *_):
+        self.stopping = True
+        self.stop_event.set()
+
     def run(self, test_message=None):
         with private_open(self.state_dir / "completion.lock") as lock:
             try:
@@ -476,7 +514,7 @@ class Watcher:
             lock.flush()
             self.load()
             for sig in (signal.SIGTERM, signal.SIGINT):
-                signal.signal(sig, lambda *_: setattr(self, "stopping", True))
+                signal.signal(sig, self.stop)
             sessions = self.observe(baseline=True)
             if test_message:
                 self.enqueue("", "WATCHER_TEST", test_message, "test", "operator notification test")
@@ -488,7 +526,7 @@ class Watcher:
                     self.deliver(sessions)
                 except (OSError, ValueError, KeyError, TypeError, ConnectionError) as error:
                     self.report_error("watch loop recovered: " + type(error).__name__)
-                time.sleep(self.interval)
+                self.stop_event.wait(self.interval)
             self.save()
             print("WATCHER_STOPPED", flush=True)
 
