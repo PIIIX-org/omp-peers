@@ -50,6 +50,9 @@ describe("structured reports", () => {
 			expect(reportSchema.safeParse({ ...reports[3], unit }).success).toBe(true);
 		}
 		expect(readMessage({ report: { ...reports[3], unit: "  Two  words  " } }).text).toContain("Unit: Two  words");
+		for (const unit of ["Lint, passed", "Build: successful", "Build / deploy", "Ready — proceed"]) {
+			expect(reportSchema.safeParse({ ...reports[3], unit }).success).toBe(true);
+		}
 		for (const references of [[], [""], ["space stripped"], ["line\nbreak"], ["format\u200bcharacter"], ["x".repeat(513)], Array(9).fill("ref")]) {
 			expect(reportSchema.safeParse({ ...reports[0], evidence: { description: "Readable evidence description", references } }).success).toBe(false);
 		}

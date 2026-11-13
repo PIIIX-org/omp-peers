@@ -12,7 +12,7 @@ function readable(text: string): boolean {
 		if (!index) return false;
 		const previous = words[index - 1];
 		const gap = text.slice(previous.index + previous.segment.length, word.index);
-		return gap === "" || /^\s+$/u.test(gap);
+		return gap === "" || /\s/u.test(gap);
 	});
 }
 

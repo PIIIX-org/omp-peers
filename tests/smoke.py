@@ -94,6 +94,7 @@ class Peer:
         assert not any(f.get("type") in ("agent_start", "extension_error")
                        for f in self.frames[start:]), self.frames[start:]
         print(f"PASS {text}: {expected}")
+        return notices
 
     def close(self):
         if self.proc.poll() is None:
@@ -211,6 +212,151 @@ def report_smoke(sender, worker_socket, registry):
         assert not thread.is_alive(), "Report smoke socket thread did not stop"
 
 
+class LegacyPeer:
+    """Trusted same-user legacy writer; messages terminate locally, never at a model."""
+
+    def __init__(self, registry, template, peer_id, session_id, name):
+        self.row = {**template, "id": peer_id, "sessionId": session_id, "name": name,
+                    "pid": os.getpid(), "instance": "legacy-fixture",
+                    "sock": str(registry / (peer_id + ".sock"))}
+        self.path = registry / (peer_id + ".json")
+        self.requests = []
+        self.stop = threading.Event()
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(self.row["sock"])
+        os.chmod(self.row["sock"], 0o600)
+        self.server.listen()
+        self.server.settimeout(0.1)
+        self.path.write_text(json.dumps(self.row))
+        self.path.chmod(0o600)
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.server.accept()
+            except socket.timeout:
+                continue
+            with conn:
+                conn.settimeout(2)
+                data = b""
+                while b"\n" not in data:
+                    part = conn.recv(65536)
+                    if not part:
+                        break
+                    data += part
+                if not data:
+                    continue
+                request = json.loads(data.split(b"\n", 1)[0])
+                self.requests.append(request)
+                response = {"ok": True}
+                if request["op"] == "status":
+                    response["info"] = self.row
+                conn.sendall((json.dumps(response) + "\n").encode())
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=5)
+        self.server.close()
+        assert not self.thread.is_alive(), "legacy fixture did not stop"
+        self.path.unlink(missing_ok=True)
+        Path(self.row["sock"]).unlink(missing_ok=True)
+
+
+def duplicate_identity_scenario(master, worker, registry, master_id, worker_id, row, env, root, peers):
+    """Real OMP command consumers plus local-only legacy socket delivery."""
+    fixtures = []
+    worker_start = len(worker.frames)
+    try:
+        template = row(worker_id)
+        duplicate = LegacyPeer(registry, template, "p000001", "distinct-legacy", "smoke-worker")
+        fixtures.append(duplicate)
+        roster = master.command("/peers list", "duplicate-name:")
+        roster_text = json.dumps(roster)
+        assert worker_id in roster_text and duplicate.row["id"] in roster_text
+        assert "canonical" in roster_text
+        ambiguous = master.command("/peers msg smoke-worker never-delivered", "ambiguous")
+        assert worker_id in json.dumps(ambiguous) and duplicate.row["id"] in json.dumps(ambiguous)
+        assert not duplicate.requests, "ambiguous name delivered to legacy peer"
+        master.command("/peers msg p000001 explicit-only", "ok")
+        assert [req["text"] for req in duplicate.requests] == ["explicit-only"]
+        master.command(f"/peers do {worker_id} status", "smoke-worker")
+
+        # Another peer's name may literally equal an explicit target ID.
+        duplicate.row["name"] = worker_id
+        duplicate.path.write_text(json.dumps(duplicate.row))
+        master.command(f"/peers do {worker_id} status", "smoke-worker")
+        assert len(duplicate.requests) == 1, "literal name stole exact ID delivery"
+
+        # The stable live writer, not the alias's row order/name, is canonical.
+        duplicate.row.update(sessionId=template["sessionId"], name="smoke-worker",
+                             startedAt="1900-01-01T00:00:00.000Z")
+        duplicate.path.write_text(json.dumps(duplicate.row))
+        roster = master.command("/peers list", "duplicate-session:")
+        assert f"canonical:{worker_id}" in json.dumps(roster)
+        assert duplicate.path.exists(), "listing deleted a live alias"
+        broadcast = master.command("/peers do all status", "smoke-worker")
+        assert json.dumps(broadcast).count(f"smoke-worker ({worker_id}):") == 1
+        assert "p000001):" not in json.dumps(broadcast)
+        assert len(duplicate.requests) == 1, "broadcast also delivered to canonical writer's alias"
+
+        # A restart cannot promote an old live alias to canonical ownership.
+        old_instance = row(worker_id)["instance"]
+        old_pid = worker.proc.pid
+        session_file = worker.call("get_state")["sessionFile"]
+        assert not any(frame.get("type") in ("agent_start", "extension_error")
+                       for frame in worker.frames[worker_start:])
+        worker.close()
+        worker = Peer(env, root, resume=session_file)
+        peers.append(worker)
+        worker.call("get_state")
+        worker_start = 0
+        wait_for(lambda: row(worker_id) and row(worker_id)["pid"] == worker.proc.pid)
+        assert row(worker_id)["instance"] != old_instance
+        roster = master.command("/peers list", f"canonical:{worker_id}")
+        assert duplicate.path.exists()
+        master.command("/peers do all status", "smoke-worker")
+        assert len(duplicate.requests) == 1
+        stale = registry / "p000003.json"
+        stale_socket = registry / "p000003.sock"
+        stale.write_text(json.dumps({**template, "id": "p000003", "pid": old_pid,
+                                     "sock": str(stale_socket)}))
+        stale_socket.touch()
+        master.command("/peers list", worker_id)
+        assert not stale.exists() and not stale_socket.exists()
+        assert duplicate.path.exists(), "stale cleanup removed a live alias"
+
+        # Two live legacy writers with no stable lock owner require an explicit choice.
+        duplicate.row.update(sessionId="unproved", name="Legacy A")
+        duplicate.path.write_text(json.dumps(duplicate.row))
+        second = LegacyPeer(registry, template, "p000002", "unproved", "Legacy B")
+        fixtures.append(second)
+        roster = master.command("/peers list", "canonical:unknown")
+        assert "p000001" in json.dumps(roster) and "p000002" in json.dumps(roster)
+        blocked = master.command("/peers do all status", "broadcast not sent")
+        assert "p000001" in json.dumps(blocked) and "p000002" in json.dumps(blocked)
+        assert len(duplicate.requests) == 1 and not second.requests
+        master.command("/peers msg p000002 exact-legacy-choice", "ok")
+        assert [req["text"] for req in second.requests] == ["exact-legacy-choice"]
+
+        # Sender aliases must not reintroduce the sender into an ordinary broadcast.
+        duplicate.row.update(sessionId=row(master_id)["sessionId"], name="Sender alias")
+        duplicate.path.write_text(json.dumps(duplicate.row))
+        second.row.update(sessionId="other", name="Other")
+        second.path.write_text(json.dumps(second.row))
+        master.command("/peers do all status", "smoke-worker")
+        assert len(duplicate.requests) == 1
+        assert [req["op"] for req in second.requests] == ["message", "status"]
+        assert not any(frame.get("type") in ("agent_start", "extension_error")
+                       for frame in worker.frames[worker_start:])
+        print("PASS duplicate roster, proven writer, ambiguity, exact IDs and safe broadcasts; local socket messages only")
+        return worker
+    finally:
+        for fixture in reversed(fixtures):
+            fixture.close()
+
+
 def main():
     if not OMP:
         raise SystemExit("Install OMP before running this smoke test.")
@@ -291,6 +437,9 @@ def main():
                     return json.loads((registry / (peer_id + ".json")).read_text())
                 except (OSError, ValueError):
                     return None
+
+            worker = duplicate_identity_scenario(master, worker, registry, master_id, worker_id, row,
+                                                 env, root, peers)
 
             def legacy_displacement():
                 worker.command("/master-lock-smoke", "master-lock:busy")
