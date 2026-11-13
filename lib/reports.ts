@@ -21,7 +21,7 @@ const human = z.string().trim().min(1).max(240)
 	.refine(readable, "Use at least two readable Unicode words; do not strip spaces or use an identifier/URL as a human description");
 const reference = z.string().min(1).max(512).regex(/^[^\s\p{Cc}\p{Cf}]+$/u, "Use a nonempty whitespace-free reference");
 
-export const reportSchema = z.discriminatedUnion("kind", [
+export const reportSchema = z.union([
 	z.object({ kind: z.literal("DONE"), unit: human,
 		evidence: z.object({ description: human, references: z.array(reference).min(1).max(8).optional() }).strict() }).strict(),
 	z.object({ kind: z.literal("BLOCKED"), unit: human, blocker: human, nextAction: human }).strict(),

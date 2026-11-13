@@ -29,7 +29,7 @@
 - Add a configurable macOS LaunchAgent template and install/uninstall tooling that preserves state by default and refuses unmanaged installations.
 - Add offline watcher/installer tests and adapt the keyless integration smoke for persistent startup, silent idle/departure handling, and shutdown.
 - Batch unreported idle/turn-ended transitions into configurable five-minute digests, preserving the version-1 durable outbox and retry identities.
-- Add optional explicit report kinds to `peers_send` and `/peers report`. Acknowledged delivery to the current master suppresses only that session/turn's redundant watcher notice; reports keep their immediate delivery route. Use metadata-only journals, not transcript reads or message-word heuristics.
+- Correlate explicit reports from `peers_send` and `/peers report` with acknowledged delivery to the current master, suppressing only that session/turn's redundant watcher notice; reports keep their immediate delivery route. Use metadata-only journals, not transcript reads or message-word heuristics.
 - Cover report routing, exact turn/destination correlation, late receipts, digest cadence and v1 state compatibility with isolated offline regressions.
 - Cancel watcher status/delivery RPCs on termination, wake polling immediately, and preserve unacknowledged events for retry instead of draining the digest during shutdown.
 - Coordinate the LaunchAgent exit deadline with the installer's managed-PID lock wait; refuse unrelated manual lock holders immediately. Cover stalled status/acknowledgement cancellation and private-home managed upgrade/uninstall without real launchd services or provider calls.
