@@ -21,6 +21,10 @@ import sys
 import tempfile
 import time
 
+RPC_TIMEOUT = 2
+# Allow one bounded RPC plus time to persist state before launchd escalates.
+MANAGED_EXIT_TIMEOUT = RPC_TIMEOUT + 3
+
 
 def read_json(path):
     try:
@@ -77,20 +81,36 @@ def alive(pid):
         return False
 
 
-def peer_rpc(peer, request):
-    """Use peers_send's newline-delimited local Unix-socket protocol."""
+def peer_rpc(peer, request, *, stop=None):
+    """Use peers_send's local protocol with a total deadline and cancellable reads."""
+    deadline = time.monotonic() + RPC_TIMEOUT
+
+    def remaining():
+        if stop is not None and stop():
+            raise ConnectionError("watcher stopping")
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("peer acknowledgement timed out")
+        return seconds
+
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-        conn.settimeout(2)
+        conn.settimeout(remaining())
         conn.connect(peer["sock"])
+        conn.settimeout(remaining())
         conn.sendall(json.dumps(request).encode() + b"\n")
         data = bytearray()
         while b"\n" not in data:
-            chunk = conn.recv(65536)
+            conn.settimeout(min(0.05, remaining()) if stop is not None else remaining())
+            try:
+                chunk = conn.recv(65536)
+            except socket.timeout:
+                continue
             if not chunk:
                 raise ConnectionError("peer closed before acknowledgement")
             data.extend(chunk)
             if len(data) > 256 * 1024:
                 raise ConnectionError("peer response too large")
+        remaining()  # A late acknowledgement cannot commit a cancelled delivery.
         response = json.loads(data.split(b"\n", 1)[0])
         if not isinstance(response, dict) or response.get("ok") is not True:
             # Peer error text can contain private content. Do not copy it into logs.
@@ -323,7 +343,7 @@ class Watcher:
             if not set(previous).intersection(processes):
                 # A replacement process establishes its own baseline. Its initial
                 # idle state cannot finish the previous process's abandoned turn.
-                record.update(busy=busy, active_since=now if busy else 0, edges=[], edge_turns={})
+                record.update(busy=busy, active_since=now if busy else 0)
                 self.dirty = True
             if previous != processes or "processes" not in record:
                 record["processes"] = processes
@@ -335,7 +355,7 @@ class Watcher:
                 # Consume master lifecycle metadata without reflecting watcher-
                 # triggered master turns back into the notification queue.
                 values = {"busy": busy, "active_since": record.get("active_since", 0) if busy else 0,
-                          "edges": [], "edge_turns": {}, "was_master": is_master}
+                          "edges": [], "edge_turns": {}, "edge_peers": {}, "was_master": is_master}
                 if any(record.get(key) != value for key, value in values.items()):
                     record.update(values)
                     self.dirty = True
@@ -345,6 +365,11 @@ class Watcher:
                 self.dirty = True
             if not busy and record["busy"]:
                 record.setdefault("edges", []).append([record.get("active_since", 0), now])
+                # Persist only lifecycle metadata, not sockets or private status.
+                record.setdefault("edge_peers", {})[str(now)] = [
+                    {key: p[key] for key in ("pid", "name", "notificationVersion") if key in p}
+                    for p in peers
+                ]
                 turns = {p.get("notificationTurnId") if p.get("notificationVersion") == 1 else None for p in peers}
                 if len(turns) == 1 and all(isinstance(turn, str) and turn for turn in turns):
                     record.setdefault("edge_turns", {})[str(now)] = next(iter(turns))
@@ -352,6 +377,28 @@ class Watcher:
             if record["busy"] != busy:
                 record["busy"] = busy
                 self.dirty = True
+        live_pids = {p["pid"] for peers in sessions.values() for p in peers}
+        for sid, record in self.state["sessions"].items():
+            edges = record.get("edges", [])
+            if not edges:
+                continue
+            peers = sessions.get(sid, [])
+            # A durable edge is evidence of a yield even if its process has left.
+            # Never let an old PID alias consume another live session's log cursor.
+            sources = {}
+            for _, edge in edges:
+                saved = record.get("edge_peers", {}).get(str(edge))
+                if saved is None:
+                    # Version-1 states written before source metadata was added.
+                    saved = [{"pid": int(process.split(":", 1)[0]),
+                              "notificationVersion": 1 if str(edge) in record.get("edge_turns", {}) else None}
+                             for process in record.get("processes", [])]
+                for peer in saved:
+                    if peer["pid"] not in live_pids:
+                        sources[peer["pid"]] = peer
+            if sources:
+                self.lifecycle(sid, list(sources.values()), record, baseline=False,
+                               notify=sid != master_sid and not record.get("was_master", False))
             waiting = []
             for start, edge in record.get("edges", []):
                 if now - edge < 2:
@@ -360,14 +407,16 @@ class Watcher:
                 # Give the lifecycle logger time to flush, then coalesce the log
                 # and registry observations into one event for the same turn.
                 turn = record.get("edge_turns", {}).pop(str(edge), None)
+                saved = record.get("edge_peers", {}).pop(str(edge), [])
+                name = (saved or peers or [{}])[0].get("name", sid)
                 if turn or not any(start <= ended <= edge for ended in record.get("log_times", [])):
-                    self.enqueue(sid, peers[0].get("name", sid), "turn/" + turn if turn else "idle/" + str(edge),
+                    self.enqueue(sid, name, "turn/" + turn if turn else "idle/" + str(edge),
                                  "idle_transition", "observed active -> idle", turn)
                     record.setdefault("notified_edges", []).append([start, edge])
                     record["notified_edges"] = record["notified_edges"][-256:]
                 self.dirty = True
             record["edges"] = waiting
-        # Missing registrations do not prove task completion. Retain pending work.
+        # Departure alone never creates an edge.
         self.save()
         return sessions
 
@@ -375,8 +424,10 @@ class Watcher:
         peers = sessions.get(event["session"], [])
         states = []
         for peer in peers:
+            if self.stopping:
+                break
             try:
-                info = peer_rpc(peer, {"op": "status"}).get("info")
+                info = peer_rpc(peer, {"op": "status"}, stop=self.is_stopping).get("info")
                 if isinstance(info, dict):
                     states.append(info)
             except (OSError, ValueError, KeyError, ConnectionError):
@@ -414,7 +465,7 @@ class Watcher:
                 + (f"; turn={event['turn']}" if event.get("turn") else "") + f"] {live}")
 
     def deliver(self, sessions):
-        if not self.state["outbox"] or time.monotonic() < self.next_send:
+        if self.stopping or not self.state["outbox"] or time.monotonic() < self.next_send:
             return
         master = self.master()  # Re-resolve the current owner on every attempt.
         if not master:
@@ -441,14 +492,23 @@ class Watcher:
             return
         batch = outbox[:20]
         text = "PEER_COMPLETION_WATCHER\nIdle/turn-ended digest (" + str(len(batch)) + " transitions):\n"
-        text += "\n".join(self.describe(e, sessions) for e in batch)
+        descriptions = []
+        for event in batch:
+            if self.stopping:
+                return
+            descriptions.append(self.describe(event, sessions))
+        text += "\n".join(descriptions)
         text += ("\nMetadata notification only. No parked project is authorized to resume. "
                  "Deduplicate by event ID; turn ended/idle is not task done. Background work may remain.")
+        if self.stopping:
+            return
         self.next_send = time.monotonic() + 3.2  # Below the peer's 20 messages/minute limit.
         try:
-            peer_rpc(master, {"op": "message", "from": {"id": "completion-watcher", "name": "Completion watcher"}, "text": text})
+            peer_rpc(master, {"op": "message", "from": {"id": "completion-watcher", "name": "Completion watcher"},
+                             "text": text}, stop=self.is_stopping)
         except (OSError, ValueError, ConnectionError) as error:
-            self.report_error("notification pending retry: " + type(error).__name__)
+            if not self.stopping:
+                self.report_error("notification pending retry: " + type(error).__name__)
             return
         ids = {e["event"] for e in batch}
         self.state["outbox"] = [e for e in outbox if e["event"] not in ids]
@@ -464,6 +524,12 @@ class Watcher:
             print("WATCHER_WARNING " + text, file=sys.stderr, flush=True)
             self.last_error = text
 
+    def stop(self, *_):
+        self.stopping = True
+
+    def is_stopping(self):
+        return self.stopping
+
     def run(self, test_message=None):
         with private_open(self.state_dir / "completion.lock") as lock:
             try:
@@ -476,7 +542,7 @@ class Watcher:
             lock.flush()
             self.load()
             for sig in (signal.SIGTERM, signal.SIGINT):
-                signal.signal(sig, lambda *_: setattr(self, "stopping", True))
+                signal.signal(sig, self.stop)
             sessions = self.observe(baseline=True)
             if test_message:
                 self.enqueue("", "WATCHER_TEST", test_message, "test", "operator notification test")
@@ -488,7 +554,13 @@ class Watcher:
                     self.deliver(sessions)
                 except (OSError, ValueError, KeyError, TypeError, ConnectionError) as error:
                     self.report_error("watch loop recovered: " + type(error).__name__)
-                time.sleep(self.interval)
+                # Keep signal handling lock-free and bound wakeup even for long intervals.
+                wake_at = time.monotonic() + self.interval
+                while not self.stopping:
+                    remaining = wake_at - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.05, remaining))
             self.save()
             print("WATCHER_STOPPED", flush=True)
 

@@ -17,6 +17,8 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <string>__EXIT_TIMEOUT__</string>
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>Umask</key>
