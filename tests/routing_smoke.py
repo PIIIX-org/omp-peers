@@ -8,6 +8,7 @@ uses model/effort controls and rejected prompts so no provider request is possib
 """
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -74,9 +75,15 @@ def main():
             messages = worker.call("get_messages")["messages"]
             assert any(m.get("customType") == "peer-routing" and m.get("display") is True
                        and "smoke/first -> smoke/second" in str(m.get("content")) for m in messages), messages
-            response = peer_rpc(receiver, {"op": "prompt", "from": {"id": sender["id"]},
-                                          "text": "Must never dispatch", "tier": "heavy", "overridePin": True,
-                                          "model": "nonexistent/model", "effort": "max"})
+            # Notification RPC intentionally rejects negative acknowledgements; inspect this failure directly.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(2)
+                connection.connect(receiver["sock"])
+                connection.sendall(json.dumps({"op": "prompt", "from": {"id": sender["id"]},
+                                               "text": "Must never dispatch", "tier": "heavy", "overridePin": True,
+                                               "model": "nonexistent/model", "effort": "max"}).encode() + b"\n")
+                with connection.makefile("rb") as source:
+                    response = json.loads(source.readline())
             assert response["ok"] is False and "unavailable model" in response["error"], response
             after = status()
             assert (after["model"], after["effort"], after["routingPolicy"]) == (

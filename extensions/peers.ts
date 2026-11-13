@@ -275,7 +275,7 @@ function writeJson(file: string, value: unknown): void {
 function selfInfo(pi: ExtensionAPI): PeerInfo {
 	const ctx = state.ctx;
 	const usage = ctx?.getContextUsage?.() as { tokens?: number; percent?: number } | undefined;
-	const model = ctx?.model as { provider?: string; id?: string } | undefined;
+	const model = ctx?.models.current();
 	return {
 		id: state.id,
 		instance: state.instance,
