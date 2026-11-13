@@ -200,7 +200,7 @@ npm run test:activity-smoke
 Activity regressions cover job completion/cancellation, delivery gaps, streaming versus parked agents and unavailable capabilities. The activity smoke registers real session-owned jobs in a disposable OMP process and checks both socket status and registry refresh. It acknowledges a completion before delivery to avoid a model wake; it does not connect to a provider.
 
 
-The smoke links the plugin into a temporary home and runs real OMP RPC processes with a keyless local-only model configuration. It exercises control gates, model switching, saved-session restarts, crash recovery, master contention/restore opt-out, and watcher cleanup. It uses no real provider credentials or model turns and removes its temporary state on exit.
+The smoke links the plugin into a temporary home and runs real OMP RPC processes with a keyless local-only model configuration. It exercises control gates, model switching, saved-session restarts, crash recovery, master contention/restore opt-out, legacy-overwrite lock recovery with and without auto-restore, and watcher cleanup. It uses no real provider credentials or model turns and removes its temporary state on exit.
 
 ## License
 

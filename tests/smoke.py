@@ -17,6 +17,24 @@ import time
 REPO = Path(__file__).resolve().parents[1]
 OMP = shutil.which("omp")
 
+# Only probes the native lock in the disposable HOME; never edits the master claim.
+MASTER_LOCK_FIXTURE = r'''
+import { FileLock } from "@oh-my-pi/pi-natives";
+import * as os from "node:os";
+import * as path from "node:path";
+export default function fixture(pi) {
+    pi.registerCommand("master-lock-smoke", {
+        description: "Disposable master lock probe",
+        handler: async (_args, ctx) => {
+            const lock = FileLock.tryAcquire(path.join(os.homedir(), ".omp/run/peers/master.lock"));
+            const acquired = lock.acquired;
+            if (acquired) lock.release();
+            ctx.ui.notify(acquired ? "master-lock:available" : "master-lock:busy", "info");
+        }
+    });
+}
+'''
+
 
 class Peer:
     def __init__(self, env, cwd, resume=None):
@@ -114,6 +132,9 @@ def main():
         home = Path(root)
         agent = home / ".omp" / "agent"
         agent.mkdir(parents=True)
+        extensions = agent / "extensions"
+        extensions.mkdir()
+        (extensions / "master-lock-smoke.ts").write_text(MASTER_LOCK_FIXTURE)
         (agent / "config.yml").write_text(
             "autoResume: false\nsetupVersion: 2\nstartup:\n  setupWizard: false\n"
             "  checkUpdate: false\nrecap:\n  enabled: false\n"
@@ -170,7 +191,6 @@ def main():
             master.command(f"/peers set {worker_id} get auth.broker.url", "protected")
             # Persist names through the host API; no user prompts or provider turns.
             master.call("set_session_name", name="smoke-master")
-            master.command("/peers master --restore", "Restore on resume enabled")
             worker.command("/peers master", "master already held")
             master_file = master.call("get_state")["sessionFile"]
             worker_file = worker.call("get_state")["sessionFile"]
@@ -180,6 +200,39 @@ def main():
                     return json.loads((registry / (peer_id + ".json")).read_text())
                 except (OSError, ValueError):
                     return None
+
+            def legacy_displacement():
+                worker.command("/master-lock-smoke", "master-lock:busy")
+                claim_path = registry / "master.json"
+                legacy_claim = json.dumps({"id": worker_id, "pid": worker.proc.pid}) + "\n"
+                claim_path.write_text(legacy_claim)
+                # Observe two timer publications without issuing any command to
+                # the displaced master, so its first refresh has finished.
+                for _ in range(2):
+                    updated = row(master_id)["updatedAt"]
+                    wait_for(lambda: row(master_id)["updatedAt"] != updated)
+                assert claim_path.read_text() == legacy_claim
+                worker.command("/master-lock-smoke", "master-lock:available")
+                assert claim_path.read_text() == legacy_claim
+                master.command(f"/peers do {worker_id} rename forbidden", "Not the master")
+                assert claim_path.read_text() == legacy_claim
+                assert master.proc.poll() is None and worker.proc.poll() is None
+                return claim_path
+
+            # Plain claims must shed stale locks on the timer even without restore.
+            legacy_displacement().unlink()
+            worker.command("/peers master", "now the master")
+            master.command("/peers master", "master already held")
+            worker.command("/peers release", "released")
+            print("PASS legacy overwrite: timer releases non-restoring master's lock; live owner preserved; another upgraded peer reclaims")
+
+            master.command("/peers master --restore", "Restore on resume enabled")
+            legacy_displacement().unlink()
+            wait_for(lambda: row("master") and row("master")["id"] == master_id)
+            assert row("master")["pid"] == master.proc.pid
+            worker.command("/master-lock-smoke", "master-lock:busy")
+            worker.command("/peers master", "master already held")
+            print("PASS legacy release: displaced master auto-restores on timer without restart or manual release")
 
             first_instance = row(master_id)["instance"]
             master.close()

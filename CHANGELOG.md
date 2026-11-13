@@ -5,7 +5,7 @@
 - Require branch-based pull requests, independent review as wafa, passing CI, and merge commits before updating `main`.
 - Add hosted CI for TypeScript checks, Python verification, publication leak checks, and isolated plugin smoke coverage.
 - Document the contribution workflow and add a pull request template.
-- Release displaced master locks during claims and periodic refresh without removing a live legacy master's claim; recover without restarting the displaced peer.
+- Release displaced master locks during claims and periodic refresh without removing a live legacy master's claim; recover without restarting the displaced peer. Cover non-restoring and auto-restoring masters with isolated real-OMP lock probes.
 
 ### Background activity status
 
