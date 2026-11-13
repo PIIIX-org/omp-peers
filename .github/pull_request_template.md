@@ -12,4 +12,4 @@ Describe compatibility, security, or operational risks and how to undo the chang
 
 ## Independent review and merge
 
-Record the Claude Opus 5.5 reviewer verdict, wafa review URL, and exact reviewed head. Resolve blocking findings and all conversations; obtain fresh approval after new pushes. Require green `ci` before a merge commit. No direct main push, squash/rebase merge, force push, or protection bypass.
+Record the independent reviewer subagent's verdict, actual owner-configured reviewer model, wafa review URL, and exact reviewed head. Resolve blocking findings and all conversations; obtain fresh approval after new pushes. Require green `ci` before a merge commit. No direct main push, squash/rebase merge, force push, or protection bypass.
