@@ -12,7 +12,7 @@ The PR template asks for a summary, verification evidence, and risks. Describe t
 
 Run the commands in `.github/workflows/ci.yml` before proposing a merge. Run the leak scanner before every push. Never commit provider tokens, auth files, transcripts, watcher state/logs, real session IDs, personal paths, private hostnames, or non-loopback IPs. Use synthetic fixtures and generic home-relative paths.
 
-Every PR must receive an independent review from a `reviewer` subagent running Claude Opus 5.5. The reviewer examines the exact PR head, reports a verdict with evidence-backed findings, and submits a GitHub review through the authorized **wafa-khairi-1020** account. Use `APPROVE` or `REQUEST_CHANGES`; a standalone issue comment is not approval. Keep review credentials outside the repository and never switch the machine-global GitHub identity to publish a review.
+Every PR must receive an independent review from a `reviewer` subagent on the owner-configured reviewer model. State the actual model in the review. The reviewer examines the exact PR head, reports a verdict with evidence-backed findings, and submits a GitHub review through the authorized **wafa-khairi-1020** account. Use `APPROVE` or `REQUEST_CHANGES`; a standalone issue comment is not approval. Keep review credentials outside the repository and never switch the machine-global GitHub identity to publish a review.
 
 Taha-Mahmoodi authors changes. Wafa reviews independently. The account separation enforces review identity; the reviewer must also be independent of the implementation. Address blocking findings, resolve review conversations, then obtain a fresh approval for the final head after any pushes. Do not approve or merge unexamined code.
 
