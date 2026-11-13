@@ -7,9 +7,11 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "bun:test";
+import { getBundledModel } from "@oh-my-pi/pi-catalog";
 import * as z from "@oh-my-pi/omptype/zod";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgTaskAgentModelOverrides } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { formatModelStringWithRouting, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import peers from "../extensions/peers";
 
@@ -23,6 +25,7 @@ test("pinned routing through the extension, socket, tools and host callbacks", a
 	const notices: string[] = [], prompts: string[] = [], visible: Array<{ content: string; display: boolean }> = [];
 	let sessionId = "routing-worker", busy = false, effort = "high", switches = 0, effortChanges = 0;
 	const first = { provider: "offline", id: "first", identity: { class: "unknown" } }, second = { provider: "offline", id: "second", identity: { class: "unknown" } };
+	const routed = getBundledModel("openrouter", "z-ai/glm-4.7");
 	let selected = first;
 	const resolve = (spec: string) => {
 		const base = spec.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "");
@@ -33,7 +36,7 @@ test("pinned routing through the extension, socket, tools and host callbacks", a
 		agent: { kind: "main" }, mode: "rpc", cwd: os.homedir(),
 		sessionManager: { getSessionId: () => sessionId },
 		get model() { return selected; },
-		models: { current: () => selected, resolve, list: () => [first, second] },
+		models: { current: () => selected, resolve, list: () => [first, second, routed] },
 		modelRegistry: { getApiKey: async () => credentials ? "offline-test" : undefined },
 		isIdle: () => !busy,
 		ui: { setStatus() {}, notify(text: string) { notices.push(text); } },
@@ -154,6 +157,15 @@ test("pinned routing through the extension, socket, tools and host callbacks", a
 		assert.match(sub?.note ?? "", /offline\/first:high -> offline\/second:low.*explicit peer subagent override/);
 		await rpc({ op: "subagents", text: "task=@default" });
 		sub = await spawn(); assert.equal(sub?.model, "offline/second:high");
+		const routedSelector = "openrouter/z-ai/glm-4.7@cerebras:high";
+		await rpc({ op: "subagents", text: `task=${routedSelector}` });
+		sub = await spawn();
+		assert.equal(sub?.model, routedSelector);
+		const roundTrip = resolveModelRoleValue(sub?.model, ctx.models.list(), { settings });
+		assert.ok(roundTrip.model);
+		assert.equal(formatModelStringWithRouting(roundTrip.model), "openrouter/z-ai/glm-4.7@cerebras");
+		assert.equal(roundTrip.thinkingLevel, "high");
+		assert.match(sub?.note ?? "", /@cerebras:high/);
 		await rpc({ op: "subagents", text: "task=nonexistent/model" });
 		sub = await spawn(); assert.equal(sub?.block, true); assert.match(sub?.reason ?? "", /unavailable model/);
 		await rpc({ op: "subagents", text: "task=offline/second" }); credentials = false;

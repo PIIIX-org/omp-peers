@@ -22,7 +22,7 @@ import { randomBytes } from "node:crypto";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as SettingsRegistry from "@oh-my-pi/pi-coding-agent/config/registry";
-import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { formatModelStringWithRouting, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Notifications, type ReportKind } from "./notifications";
 import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
 import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
@@ -737,7 +737,7 @@ export default function peers(pi: ExtensionAPI) {
 			return { block: true, reason: `peers routing: authentication failed for "${spec}"; no substitute spawned` };
 		}
 		const effort = resolved.explicitThinkingLevel ? resolved.thinkingLevel : undefined;
-		const next = `${model.provider}/${model.id}${effort !== undefined ? `:${effort}` : ""}`;
+		const next = `${formatModelStringWithRouting(model)}${effort !== undefined ? `:${effort}` : ""}`;
 		const note = `model ${event.patterns.join(", ") || "(host default)"} -> ${next}; reason=${manual ? "explicit peer subagent override" : `automatic tier ${tier} (${why})`}`;
 		ctx.ui.notify(`[peers routing] ${note}`, "info");
 		return { model: next, note };
