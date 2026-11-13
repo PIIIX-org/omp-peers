@@ -93,6 +93,99 @@ class WatcherChecks(unittest.TestCase):
         self.tick()
         self.assertEqual(self.watcher.state["outbox"], [])
 
+    def test_busy_departure_without_an_idle_observation_does_not_notify(self):
+        self.peer(busy=True)
+        self.watcher.observe(baseline=True)
+        (self.registry / "pworker.json").unlink()
+        self.tick(3)
+        self.assertEqual(self.watcher.state["outbox"], [])
+
+    def test_departed_idle_edge_survives_restart_and_flushes_once(self):
+        self.peer(busy=True)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.peer(busy=False)
+        self.watcher.observe()
+        (self.registry / "pworker.json").unlink()
+        self.tick(0.5)
+        self.assertEqual(self.watcher.state["outbox"], [])
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.tick(1.5)
+        events = list(self.watcher.state["outbox"])
+        self.assertEqual([event["kind"] for event in events], ["idle_transition"])
+        self.assertEqual(events[0]["name"], "worker")
+        self.assertIn("agent yielded; live state unavailable; background/task completion UNKNOWN",
+                      self.watcher.describe(events[0], {}))
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.tick(3)
+        self.assertEqual(self.watcher.state["outbox"], events)
+
+    def test_departed_legacy_log_coalesces_after_restart_and_initial_idle_replacement(self):
+        old = self.peer(busy=True)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        ended = self.now
+        self.peer(busy=False)
+        self.watcher.observe()
+        (self.registry / "pworker.json").unlink()
+        self.tick(0.5)
+        # The old process's log flushes after deregistration, while the watcher is stopped.
+        self.lifecycle(stamp=datetime.datetime.fromtimestamp(ended, datetime.timezone.utc).isoformat())
+        self.peer(pid=old["pid"] + 10, startedAt="replacement-process")
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.tick(2)
+        self.assertEqual([e["kind"] for e in self.watcher.state["outbox"]], ["agent_end"])
+        self.tick(3)
+        self.assertEqual(len(self.watcher.state["outbox"]), 1)
+
+    def test_departed_exact_turn_coalesces_journal_registry_and_host_log_after_restart(self):
+        old = self.peer(busy=True, notificationVersion=1, notificationTurnId="departed-turn")
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        ended = self.now
+        self.peer(notificationVersion=1, notificationTurnId="departed-turn")
+        self.watcher.observe()
+        (self.registry / "pworker.json").unlink()
+        self.tick(0.5)
+        self.notification(turn="departed-turn", timestamp=ended, name="worker")
+        self.lifecycle(stamp=datetime.datetime.fromtimestamp(ended, datetime.timezone.utc).isoformat())
+        # This new process has no turn: its initial idle state is not another yield.
+        self.peer(pid=old["pid"] + 10, startedAt="replacement-process", notificationVersion=1)
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.tick(2)
+        events = list(self.watcher.state["outbox"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["turn"], "departed-turn")
+        self.assertEqual(events[0]["kind"], "agent_end")
+        self.notification(turn="departed-turn", timestamp=ended)
+        self.tick(3)
+        self.assertEqual(self.watcher.state["outbox"], events)
+
+    def test_old_v1_pending_edge_uses_saved_process_identity_after_departure(self):
+        self.peer(busy=True)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.peer()
+        self.watcher.observe()
+        del self.watcher.state["sessions"]["worker-session"]["edge_peers"]
+        self.watcher.dirty = True
+        self.watcher.save()
+        (self.registry / "pworker.json").unlink()
+        self.lifecycle()
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.now += 3
+        self.watcher.observe(baseline=True)
+        self.assertEqual([e["kind"] for e in self.watcher.state["outbox"]], ["agent_end"])
+
     def test_stale_alias_of_previous_session_does_not_consume_current_logs(self):
         old = self.peer("pold", "previous-session", busy=True)
         self.watcher.observe(baseline=True)
