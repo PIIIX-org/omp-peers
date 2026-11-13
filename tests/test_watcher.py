@@ -93,6 +93,138 @@ class WatcherChecks(unittest.TestCase):
         self.tick()
         self.assertEqual(self.watcher.state["outbox"], [])
 
+    def test_busy_departure_without_an_idle_observation_does_not_notify(self):
+        self.peer(busy=True)
+        self.watcher.observe(baseline=True)
+        (self.registry / "pworker.json").unlink()
+        self.tick(3)
+        self.assertEqual(self.watcher.state["outbox"], [])
+
+    def test_departed_idle_edge_survives_restart_and_flushes_once(self):
+        self.peer(busy=True)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.peer(busy=False)
+        self.watcher.observe()
+        (self.registry / "pworker.json").unlink()
+        self.tick(0.5)
+        self.assertEqual(self.watcher.state["outbox"], [])
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.tick(1.5)
+        events = list(self.watcher.state["outbox"])
+        self.assertEqual([event["kind"] for event in events], ["idle_transition"])
+        self.assertEqual(events[0]["name"], "worker")
+        self.assertIn("agent yielded; live state unavailable; background/task completion UNKNOWN",
+                      self.watcher.describe(events[0], {}))
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.tick(3)
+        self.assertEqual(self.watcher.state["outbox"], events)
+
+    def test_departed_legacy_log_coalesces_after_restart_and_initial_idle_replacement(self):
+        old = self.peer(busy=True)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        ended = self.now
+        self.peer(busy=False)
+        self.watcher.observe()
+        (self.registry / "pworker.json").unlink()
+        self.tick(0.5)
+        # The old process's log flushes after deregistration, while the watcher is stopped.
+        self.lifecycle(stamp=datetime.datetime.fromtimestamp(ended, datetime.timezone.utc).isoformat())
+        self.peer(pid=old["pid"] + 10, startedAt="replacement-process")
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.tick(2)
+        self.assertEqual([e["kind"] for e in self.watcher.state["outbox"]], ["agent_end"])
+        self.tick(3)
+        self.assertEqual(len(self.watcher.state["outbox"]), 1)
+
+    def test_departed_exact_turn_coalesces_journal_registry_and_host_log_after_restart(self):
+        old = self.peer(busy=True, notificationVersion=1, notificationTurnId="departed-turn")
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        ended = self.now
+        self.peer(notificationVersion=1, notificationTurnId="departed-turn")
+        self.watcher.observe()
+        (self.registry / "pworker.json").unlink()
+        self.tick(0.5)
+        self.notification(turn="departed-turn", timestamp=ended, name="worker")
+        self.lifecycle(stamp=datetime.datetime.fromtimestamp(ended, datetime.timezone.utc).isoformat())
+        # This new process has no turn: its initial idle state is not another yield.
+        self.peer(pid=old["pid"] + 10, startedAt="replacement-process", notificationVersion=1)
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.tick(2)
+        events = list(self.watcher.state["outbox"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["turn"], "departed-turn")
+        self.assertEqual(events[0]["kind"], "agent_end")
+        self.notification(turn="departed-turn", timestamp=ended)
+        self.tick(3)
+        self.assertEqual(self.watcher.state["outbox"], events)
+
+    def test_old_v1_pending_edge_uses_saved_process_identity_after_departure(self):
+        self.peer(busy=True)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.peer()
+        self.watcher.observe()
+        del self.watcher.state["sessions"]["worker-session"]["edge_peers"]
+        self.watcher.dirty = True
+        self.watcher.save()
+        (self.registry / "pworker.json").unlink()
+        self.lifecycle()
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.now += 3
+        self.watcher.observe(baseline=True)
+        self.assertEqual([e["kind"] for e in self.watcher.state["outbox"]], ["agent_end"])
+
+    def test_departed_turn_fallback_keeps_exact_receipt_and_late_journal_dedup(self):
+        self.master()
+        self.peer(busy=True, notificationVersion=1, notificationTurnId="departed-turn")
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.peer(notificationVersion=1, notificationTurnId="departed-turn")
+        self.watcher.observe()
+        (self.registry / "pworker.json").unlink()
+        self.tick(3)
+        self.assertEqual([e["kind"] for e in self.watcher.state["outbox"]], ["idle_transition"])
+        self.notification("report", turn="departed-turn", report="DONE",
+                          destinationSessionId="master-session", destinationId="pmaster")
+        self.notification(turn="departed-turn")
+        self.watcher = watch.Watcher(self.home, self.home / "watcher")
+        self.watcher.load()
+        self.watcher.observe(baseline=True)
+        self.assertEqual(len(self.watcher.state["outbox"]), 1)
+        with patch.object(watch, "peer_rpc") as rpc:
+            self.watcher.deliver({})
+        rpc.assert_not_called()
+        self.assertEqual(self.watcher.state["outbox"], [])
+
+    def test_departed_pending_pid_alias_does_not_consume_current_session_logs(self):
+        old = self.peer("pold", "previous-session", busy=True)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.peer("pold", "previous-session")
+        self.watcher.observe()
+        self.now += 0.5
+        self.peer("pnew", "current-session", pid=old["pid"])
+        self.processes["current-session"] = old["pid"]
+        self.lifecycle(sid="current-session")
+        sessions = self.watcher.observe()
+        self.assertEqual(set(sessions), {"current-session"})
+        self.tick(2)
+        events = self.watcher.state["outbox"]
+        self.assertEqual([(e["session"], e["kind"]) for e in events],
+                         [("current-session", "agent_end"), ("previous-session", "idle_transition")])
+
     def test_stale_alias_of_previous_session_does_not_consume_current_logs(self):
         old = self.peer("pold", "previous-session", busy=True)
         self.watcher.observe(baseline=True)
@@ -573,6 +705,98 @@ class SocketChecks(unittest.TestCase):
 
 
 class ProcessChecks(unittest.TestCase):
+    def test_departed_idle_notification_survives_process_restart_without_duplicate(self):
+        with tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
+            home = Path(root)
+            registry = home / ".omp/run/peers"
+            registry.mkdir(parents=True)
+            state = home / ".omp-peer-watch/completions.json"
+            env = {"HOME": root, "PATH": os.environ["PATH"]}
+            children = []
+            reports = []
+
+            def spawn(command, **kwargs):
+                child = subprocess.Popen(command, env=env, cwd=root, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True, **kwargs)
+                children.append(child)
+                return child
+
+            def stop(child):
+                if child.poll() is None:
+                    child.terminate()
+                try:
+                    output, errors = child.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    output, errors = child.communicate(timeout=5)
+                children.remove(child)
+                reports.append(output)
+                return child.returncode, errors
+
+            command = [sys.executable, str(REPO / "tools/watch.py"), "--home", root,
+                       "--interval", "0.05", "--digest-interval", "0.1"]
+
+            def record():
+                return (state_ready(state) or {}).get("sessions", {}).get("worker-session", {})
+
+            try:
+                worker = spawn([sys.executable, "-c", "import sys; sys.stdin.readline()"],
+                               stdin=subprocess.PIPE)
+                row = {"id": "pworker", "pid": worker.pid, "sessionId": "worker-session",
+                       "sock": str(home / "worker.sock"), "name": "departed worker",
+                       "busy": True, "startedAt": "synthetic-process", "updatedAt": "1"}
+                watch.atomic_json(registry / "pworker.json", row)
+                watcher = spawn(command)
+                wait_for(lambda: record().get("busy") is True, seconds=5)
+                row.update(busy=False, updatedAt="2")
+                watch.atomic_json(registry / "pworker.json", row)
+                wait_for(lambda: record().get("edges"), seconds=5)
+                (registry / "pworker.json").unlink()
+                stop(worker)
+                self.assertEqual(stop(watcher), (0, ""))
+                self.assertTrue(record()["edges"])
+                self.assertEqual(state_ready(state)["outbox"], [])
+                watcher = spawn(command)
+                pending = wait_for(lambda: (state_ready(state) or {}).get("outbox"), seconds=5)
+                self.assertEqual(len(pending), 1)
+                event = pending[0]["event"]
+
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                    server.bind(str(home / "master.sock"))
+                    server.listen(2)
+                    server.settimeout(5)
+                    master = {"id": "pmaster", "pid": os.getpid(), "sessionId": "master-session",
+                              "sock": str(home / "master.sock"), "busy": False}
+                    watch.atomic_json(registry / "pmaster.json", master)
+                    watch.atomic_json(registry / "master.json", {"id": "pmaster", "pid": os.getpid()})
+                    with server.accept()[0] as conn:
+                        conn.settimeout(5)
+                        with conn.makefile("rb") as source:
+                            request = json.loads(source.readline())
+                        conn.sendall(b'{"ok":true}\n')
+                    self.assertEqual(request["op"], "message")
+                    self.assertIn("digest (1 transitions)", request["text"])
+                    self.assertIn(event, request["text"])
+                    self.assertIn("departed worker", request["text"])
+                    self.assertIn("agent yielded; live state unavailable; background/task completion UNKNOWN",
+                                  request["text"])
+                    wait_for(lambda: state_ready(state).get("next_digest_at"), seconds=5)
+                    self.assertEqual(state_ready(state)["outbox"], [])
+                    self.assertEqual(stop(watcher), (0, ""))
+                    watcher = spawn(command)
+                    lock = home / ".omp-peer-watch/completion.lock"
+                    wait_for(lambda: lock.read_text() == str(watcher.pid), seconds=5)
+                    server.settimeout(0.5)
+                    with self.assertRaises(socket.timeout):
+                        server.accept()
+                    self.assertEqual(stop(watcher), (0, ""))
+                    self.assertEqual(state_ready(state)["seen"], [event])
+                    self.assertEqual(state_ready(state)["outbox"], [])
+                self.assertEqual("".join(reports).count("WATCHER_DELIVERED"), 1)
+            finally:
+                for child in list(children):
+                    stop(child)
+
     def test_digest_interval_rejects_nonpositive_and_nonfinite_values(self):
         for value in ("0", "-1", "nan", "inf"):
             with self.subTest(value=value), tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
