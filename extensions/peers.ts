@@ -191,6 +191,7 @@ function releaseMaster(): void {
 function claimMaster(): string | undefined {
 	if (!state.sessionLock?.acquired) return state.identityError || "session identity unavailable";
 	const current = masterId();
+	if (state.masterLock && current !== state.id) releaseMaster();
 	if (current === state.id && state.masterLock?.acquired) return;
 	if (current) return `master already held by ${current}; ask that session to /peers release`;
 	const lock = FileLock.tryAcquire(MASTER_LOCK);
@@ -647,6 +648,7 @@ export default function peers(pi: ExtensionAPI) {
 		}
 		startServer(pi);
 		publish(pi);
+		if (state.masterLock && masterId() !== state.id) releaseMaster();
 		if (state.saved.restoreMaster && state.server?.listening) claimMaster();
 		const n = listPeers().filter(p => p.id !== state.id).length;
 		const m = masterId();
