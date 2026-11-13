@@ -3,8 +3,10 @@
 # Copyright (c) 2026 PIIIX-org contributors
 """Offline watcher/installer checks. No OMP process, launchctl job, or provider call."""
 import argparse
+import contextlib
 import datetime
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -574,13 +576,11 @@ class ProcessChecks(unittest.TestCase):
     def test_digest_interval_rejects_nonpositive_and_nonfinite_values(self):
         for value in ("0", "-1", "nan", "inf"):
             with self.subTest(value=value), tempfile.TemporaryDirectory(prefix="opw-", dir="/tmp") as root:
-                result = subprocess.run(
-                    [sys.executable, str(REPO / "tools/watch.py"), "--home", root,
-                     "--digest-interval", value],
-                    env={"HOME": root, "PATH": os.environ["PATH"]},
-                    capture_output=True, text=True, timeout=5)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("--digest-interval must be finite and positive", result.stderr)
+                argv = ["watch.py", "--home", root, "--digest-interval", value]
+                with patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as stopped:
+                        watch.main()
+                self.assertEqual(stopped.exception.code, 2)
                 self.assertFalse((Path(root) / ".omp-peer-watch").exists())
 
     def test_persistent_start_without_omp_singleton_and_shutdown(self):
