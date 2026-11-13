@@ -22,6 +22,7 @@ let sessionId = "routing-worker";
 const ctx = {
 	agent: { kind: "main" }, mode: "rpc", cwd: os.homedir(),
 	sessionManager: { getSessionId: () => sessionId },
+	models: { current: () => undefined },
 	isIdle: () => true,
 	ui: { setStatus() {}, notify(text: string) { notices.push(text); } },
 	setInterval() { return undefined; }, clearTimer() {},

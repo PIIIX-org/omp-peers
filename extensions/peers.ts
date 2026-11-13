@@ -22,6 +22,7 @@ import { randomBytes } from "node:crypto";
 import { FileLock } from "@oh-my-pi/pi-natives";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as SettingsRegistry from "@oh-my-pi/pi-coding-agent/config/registry";
+import { formatModelStringWithRouting, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Notifications } from "./notifications";
 import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
 import { readMessage, sendParameters, type Report } from "../lib/reports";
@@ -88,11 +89,12 @@ async function registry(): Promise<typeof SettingsRegistry | undefined> {
 	}
 }
 
-/** True when the operator pinned this agent in task.agentModelOverrides; that always wins. */
-async function operatorPinned(pi: ExtensionAPI, agent: string): Promise<boolean> {
-	const reg = await registry();
-	const value = reg?.lookup("task.agentModelOverrides")?.get(pi.pi.settings);
-	return typeof value === "object" && value !== null && agent in value;
+/** Unknown pin provenance must not permit a peer to replace an operator selection. */
+async function operatorPinned(pi: ExtensionAPI, agent: string): Promise<boolean | undefined> {
+	const setting = (await registry())?.lookup("task.agentModelOverrides");
+	if (!setting) return undefined;
+	const value = setting.get(pi.pi.settings);
+	return typeof value === "object" && value !== null && Object.hasOwn(value, agent);
 }
 
 function loadTiers(): Record<Tier, TierCfg> {
@@ -138,6 +140,7 @@ interface PeerInfo extends PeerActivity {
 	updatedAt: string;
 	inbound: "accept" | "refuse";
 	control: boolean;
+	routingPolicy: "keep" | "auto";
 }
 interface Req {
 	op: string;
@@ -146,6 +149,8 @@ interface Req {
 	model?: string;
 	effort?: string;
 	tier?: string;
+	overridePin?: boolean;
+	reason?: string;
 	key?: string;
 	value?: unknown;
 	n?: number;
@@ -159,7 +164,7 @@ const state = {
 	instance: randomBytes(8).toString("hex"),
 	sessionLock: undefined as FileLock | undefined,
 	masterLock: undefined as FileLock | undefined,
-	saved: { name: "", restoreMaster: false },
+	saved: { name: "", restoreMaster: false, routingPolicy: "keep" as "keep" | "auto" },
 	identityError: "",
 	startedAt: new Date().toISOString(),
 	server: undefined as net.Server | undefined,
@@ -218,7 +223,7 @@ function bindIdentity(sessionId: string): void {
 	state.sessionId = sessionId;
 	notifications.bind(sessionId);
 	state.id = stablePeerId(sessionId);
-	state.saved = { name: "", restoreMaster: false };
+	state.saved = { name: "", restoreMaster: false, routingPolicy: "keep" };
 	state.identityError = "";
 	for (const dir of [ROOT, SESSION_ROOT]) {
 		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -230,14 +235,18 @@ function bindIdentity(sessionId: string): void {
 		return;
 	}
 	state.sessionLock = lock;
-	const saved = readJson<{ sessionId: string; name?: string; restoreMaster?: boolean }>(sessionPath());
+	const saved = readJson<{ sessionId: string; name?: string; restoreMaster?: boolean; routingPolicy?: string }>(sessionPath());
 	if (saved && saved.sessionId !== sessionId) {
 		lock.release();
 		state.sessionLock = undefined;
 		state.identityError = "session identity collision; refusing to overwrite stored identity";
 		return;
 	}
-	state.saved = { name: typeof saved?.name === "string" ? saved.name : "", restoreMaster: saved?.restoreMaster === true };
+	state.saved = {
+		name: typeof saved?.name === "string" ? saved.name : "",
+		restoreMaster: saved?.restoreMaster === true,
+		routingPolicy: saved?.routingPolicy === "auto" ? "auto" : "keep",
+	};
 	saveSession();
 }
 
@@ -267,7 +276,7 @@ function writeJson(file: string, value: unknown): void {
 function selfInfo(pi: ExtensionAPI): PeerInfo {
 	const ctx = state.ctx;
 	const usage = ctx?.getContextUsage?.() as { tokens?: number; percent?: number } | undefined;
-	const model = ctx?.model as { provider?: string; id?: string } | undefined;
+	const model = ctx?.models.current();
 	return {
 		id: state.id,
 		instance: state.instance,
@@ -291,6 +300,7 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 		updatedAt: new Date().toISOString(),
 		inbound: state.inbound,
 		control: state.control,
+		routingPolicy: state.saved.routingPolicy,
 	};
 }
 
@@ -407,24 +417,44 @@ function rateOk(sender: string): boolean {
 	return true;
 }
 
-/** Apply the master's chosen model/effort on the receiving peer. Never switches mid-turn. */
-async function applyRouting(pi: ExtensionAPI, ctx: ExtensionContext, req: Req): Promise<string> {
-	if (!req.model && !req.effort) return "";
-	if (!ctx.isIdle()) return "skipped (peer busy)";
-	const done: string[] = [];
-	if (req.model) {
-		const m = ctx.models.resolve(req.model);
-		const cur = ctx.model;
-		if (!m) done.push(`model "${req.model}" unknown, kept`);
-		else if (cur?.id === m.id && cur.provider === m.provider) done.push(`model=${m.provider}/${m.id} (unchanged)`);
-		else done.push((await pi.setModel(m)) ? `model=${m.provider}/${m.id}` : `model ${m.id} has no credentials, kept`);
+/** Explicit overrides are authorized by handle(); automatic dispatch cannot prove a host selection unpinned. */
+async function applyRouting(
+	pi: ExtensionAPI, ctx: ExtensionContext, req: Req, explicit = false,
+): Promise<{ ok: true; routed: string } | { ok: false; error: string }> {
+	const current = () => {
+		const model = ctx.models.current();
+		return model ? `${model.provider}/${model.id}` : "(none)";
+	};
+	const oldModel = current();
+	const oldEffort = pi.getThinkingLevel();
+	const kept = (why: string) => ({ ok: true as const, routed: `kept model=${oldModel}, effort=${oldEffort}; reason=${why}` });
+	if (req.tier === "keep") return kept("explicit keep");
+	if (!req.model && !req.effort) return kept("no routing requested");
+	if (!explicit && state.saved.routingPolicy === "keep") return kept("session pin (default; /peers unpin opts in)");
+	if (!ctx.isIdle()) {
+		return explicit ? { ok: false, error: "peer busy; explicit routing refused without dispatch; retry when idle" } : kept("automatic routing skipped: peer busy");
 	}
-	if (req.effort && EFFORTS.includes(req.effort)) {
-		if (pi.getThinkingLevel() !== req.effort) pi.setThinkingLevel(req.effort as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
-		done.push(`effort=${pi.getThinkingLevel()}`);
+	if (req.effort && !EFFORTS.includes(req.effort)) return { ok: false, error: `invalid effort "${req.effort}"` };
+	const resolved = req.model ? resolveModelRoleValue(req.model, ctx.models.list(), { settings: pi.pi.settings }) : undefined;
+	const model = resolved?.model;
+	if (req.model && (!model || resolved?.warning)) return { ok: false, error: `unavailable model "${req.model}" (unknown, unauthenticated or invalid selector); no dispatch or effort change` };
+	// Even an unchanged requested model must pass the host credential check before dispatch.
+	if (model && !(await pi.setModel(model))) {
+		return { ok: false, error: `no credentials for model "${req.model}"; no dispatch or effort change` };
 	}
+	// setModel may reset thinking; routing without an effort must preserve it.
+	const effort = req.effort ?? oldEffort;
+	if (effort && pi.getThinkingLevel() !== effort) pi.setThinkingLevel(effort as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
+	if (explicit) {
+		state.saved.routingPolicy = "keep";
+		saveSession();
+	}
+	const reason = explicit ? "explicit master override (session pinned)" : `automatic tier ${req.tier ?? "unspecified"} (${req.reason ?? "master routing"})`;
+	const routed = `model ${oldModel} -> ${current()}, effort ${oldEffort} -> ${pi.getThinkingLevel()}; reason=${reason}`;
 	publish(pi);
-	return done.join(", ");
+	ctx.ui.notify(`[peers routing] ${routed}`, "info");
+	pi.sendMessage({ customType: "peer-routing", content: `[peers routing] ${routed}`, display: true }, { triggerTurn: false });
+	return { ok: true, routed };
 }
 
 /** Resolve a tier name (light|standard|heavy) to its configured model[:effort]; pass other specs through. */
@@ -499,10 +529,14 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 		}
 		case "prompt": {
 			if (!text) return { ok: false, error: "empty prompt" };
+			if (req.overridePin === true && (!req.tier || !TIERS.includes(req.tier as Tier))) {
+				return { ok: false, error: "overridePin requires an explicit light|standard|heavy tier" };
+			}
+			const routing = await applyRouting(pi, ctx, req, req.overridePin === true);
+			if (!routing.ok) return routing;
 			if (req.tier && TIERS.includes(req.tier as Tier)) state.forcedTier = req.tier as Tier;
-			const routed = await applyRouting(pi, ctx, req);
 			pi.sendUserMessage(text, { deliverAs: "aside" });
-			return { ok: true, queued: !ctx.isIdle(), routed };
+			return { ...routing, queued: !ctx.isIdle() };
 		}
 		case "abort":
 			ctx.abort();
@@ -539,19 +573,12 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 		}
 		case "setting":
 			return settingOp(pi, req);
-		case "effort": {
+		case "effort":
 			if (!EFFORTS.includes(text)) return { ok: false, error: `effort must be one of ${EFFORTS.join(", ")}` };
-			pi.setThinkingLevel(text as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
-			publish(pi);
-			return { ok: true, routed: `effort=${pi.getThinkingLevel()}` };
-		}
-		case "model": {
-			const m = ctx.models.resolve(text);
-			if (!m) return { ok: false, error: `unknown model "${text}"` };
-			const ok = await pi.setModel(m);
-			publish(pi);
-			return ok ? { ok: true } : { ok: false, error: "no credentials for that model" };
-		}
+			return applyRouting(pi, ctx, { ...req, effort: text }, true);
+		case "model":
+			if (!text) return { ok: false, error: "missing model selector" };
+			return applyRouting(pi, ctx, { ...req, model: text }, true);
 		case "tail": {
 			const n = Math.max(1, Math.min(req.n ?? 6, 30));
 			const rows = (ctx.sessionManager.getBranch() as Array<{ type?: string; message?: { role?: string } }>)
@@ -629,7 +656,7 @@ function fmt(p: PeerInfo & Partial<IdentityStatus>, master: string | undefined):
 		.join(",");
 	const home = os.homedir();
 	const cwd = p.cwd.startsWith(home) ? `~${p.cwd.slice(home.length)}` : p.cwd;
-	return `${p.id}  ${p.name}  ${p.busy ? "busy" : "idle"}  ${formatActivity(p)}  ${p.model || "-"}${p.effort ? `:${p.effort}` : ""}${p.subagents ? `  sub:${p.subagents}` : ""}  ctx:${p.context || "-"}  ${cwd}${flags ? `  [${flags}]` : ""}`;
+	return `${p.id}  ${p.name}  ${p.busy ? "busy" : "idle"}  ${formatActivity(p)}  ${p.model || "-"}${p.effort ? `:${p.effort}` : ""}  routing:${p.routingPolicy ?? "legacy"}${p.subagents ? `  sub:${p.subagents}` : ""}  ctx:${p.context || "-"}  ${cwd}${flags ? `  [${flags}]` : ""}`;
 }
 
 function summarize(res: Record<string, unknown>): string {
@@ -695,15 +722,32 @@ export default function peers(pi: ExtensionAPI) {
 		state.tier = state.forcedTier ?? classify(event.prompt).tier;
 		state.forcedTier = undefined;
 	});
-	// Subagent models: manual overrides set by the master win, then automatic tiering, never over an operator pin.
-	pi.on("before_subagent_spawn", async event => {
+	// Operator task pins win over both peer overrides and automatic tiering.
+	pi.on("before_subagent_spawn", async (event, ctx) => {
+		const pinned = await operatorPinned(pi, event.agent);
+		if (pinned !== false) return;
 		const manual = state.subModels[event.agent] ?? state.subModels["*"];
-		if (manual) return { model: manual, note: `peers master override: ${manual}` };
-		if (!autoActive() || event.agent === "seance" || (await operatorPinned(pi, event.agent))) return;
+		if (!manual && (!autoActive() || event.agent === "seance")) return;
 		const { tier, why } = subTierFor(event.agent, event.invocationKind);
 		const cfg = loadTiers()[tier];
-		const spec = cfg.effort && cfg.effort !== "off" ? `${cfg.model}:${cfg.effort}` : cfg.model;
-		return { model: spec, note: `peers auto: ${tier} — ${why}` };
+		const spec = manual ?? `${cfg.model}:${cfg.effort}`;
+		const resolved = resolveModelRoleValue(spec, ctx.models.list(), { settings: pi.pi.settings });
+		const model = resolved.model;
+		if (!model || resolved.warning) {
+			return { block: true, reason: `peers routing: unavailable model "${spec}" (unknown, unauthenticated or invalid selector); no substitute spawned` };
+		}
+		try {
+			if (!(await ctx.modelRegistry.getApiKey(model))) {
+				return { block: true, reason: `peers routing: no credentials for "${spec}"; no substitute spawned` };
+			}
+		} catch {
+			return { block: true, reason: `peers routing: authentication failed for "${spec}"; no substitute spawned` };
+		}
+		const effort = resolved.explicitThinkingLevel ? resolved.thinkingLevel : undefined;
+		const next = `${formatModelStringWithRouting(model)}${effort !== undefined ? `:${effort}` : ""}`;
+		const note = `model ${event.patterns.join(", ") || "(host default)"} -> ${next}; reason=${manual ? "explicit peer subagent override" : `automatic tier ${tier} (${why})`}`;
+		ctx.ui.notify(`[peers routing] ${note}`, "info");
+		return { model: next, note };
 	});
 	pi.on("session_shutdown", async (_e, ctx) => {
 		if (ctx.agent.kind === "main") teardown();
@@ -728,7 +772,7 @@ export default function peers(pi: ExtensionAPI) {
 		let note = "";
 		if (req.op === "prompt" && req.text && (state.route || req.tier)) {
 			const r = routeFor(req.text, req.tier);
-			out = { ...req, model: r.model, effort: r.effort, tier: r.tier };
+			out = { ...req, model: r.model, effort: r.effort, tier: r.tier, reason: r.reason };
 			note = `[route: ${r.tier} — ${r.reason}${r.model ? `, ${r.model}/${r.effort}` : ""}]\n`;
 		}
 		const turn = notifications.current();
@@ -788,11 +832,12 @@ export default function peers(pi: ExtensionAPI) {
 			),
 		key: z.string().optional().describe("setting only: setting id, e.g. task.agentModelOverrides, modelRoles, retry.fallbackChains; for mode=list an id prefix"),
 		value: z.string().optional().describe("setting set only: JSON value, e.g. {\"task\":\"@smol\"} or \"high\" or true"),
+		overridePin: z.boolean().optional().describe("prompt only: explicit authorized model/effort override, including a pinned session; requires a non-keep tier and idle receiver. Success pins the resulting selection."),
 		tier: z
 			.enum(["light", "standard", "heavy", "keep"])
 			.optional()
 			.describe(
-				"prompt only. Cost tier for the task: light (trivial/lookup), standard (normal coding), heavy (design/debug/refactor). Omit to auto-classify; 'keep' leaves the peer's model/effort unchanged. Prefer the cheapest tier that fits.",
+				"prompt only. light|standard|heavy selects a requested tier; omit to classify automatically. Receiver pins retain model AND effort unless overridePin=true; 'keep' never changes either. Receiver /peers unpin opts in to automatic routing.",
 			),
 	});
 	pi.registerTool({
@@ -814,7 +859,10 @@ export default function peers(pi: ExtensionAPI) {
 					// plain string value
 				}
 			}
-			const text = await fanout(p.to, { op: p.action, text: p.text, n, tier: p.tier, key: p.key, value });
+			if (p.overridePin && (p.action !== "prompt" || !p.tier || p.tier === "keep")) {
+				return { content: [{ type: "text", text: "error: overridePin requires prompt with an explicit light|standard|heavy tier" }], details: {}, isError: true };
+			}
+			const text = await fanout(p.to, { op: p.action, text: p.text, n, tier: p.tier, overridePin: p.overridePin, key: p.key, value });
 			return { content: [{ type: "text", text }], details: {} };
 		},
 	});
@@ -823,7 +871,7 @@ export default function peers(pi: ExtensionAPI) {
 	const ACTIONS = ["message", "prompt", "tail", "abort", "compact", "rename", "model", "effort", "subagents", "shutdown"] as const;
 	pi.registerCommand("peers", {
 		description:
-			"Peer sessions: /peers [list|master|release|msg <peer> <text>|report <peer> <json-report>|do <peer|all> <action> [text]|set <peer|all> <get|set|clear|list> <key> [json]|route [on|off]|accept|refuse|lock|unlock]",
+			"Peer sessions: /peers [list|master|release|msg <peer> <text>|report <peer> <json-report>|do <peer|all> <action> [text]|set <peer|all> <get|set|clear|list> <key> [json]|route [on|off]|pin|unpin|accept|refuse|lock|unlock]",
 		handler: async (args, ctx) => {
 			refresh(ctx);
 			const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
@@ -866,6 +914,12 @@ export default function peers(pi: ExtensionAPI) {
 					}
 					return say(await fanout(to, { op: "setting", text: mode, key, value }));
 				}
+				case "pin":
+				case "unpin":
+					state.saved.routingPolicy = sub === "pin" ? "keep" : "auto";
+					saveSession();
+					publish(pi);
+					return say(`Session routing policy: ${state.saved.routingPolicy}; saved for this logical session. ${sub === "pin" ? "Default prompts keep model and effort." : "Automatic prompt routing may change model and effort while idle."}`);
 				case "route": {
 					const arg = rest[0];
 					if (arg === "on" || arg === "off") state.route = arg === "on";
