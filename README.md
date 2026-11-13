@@ -53,6 +53,8 @@ To remember master ownership for this session:
 
 Kernel-backed locks permit one plugin writer per logical session and one master. A second process opening the same session cannot publish a server, send peer requests or claim master; it reports `session already owned`. Close that process and resume it after the owner exits. The host may also reject duplicate sessions through its own session lease. Process exit releases the locks, including after a crash. A live legacy master also blocks a new claim, but legacy versions cannot honor the new lock protocol; upgrade all peers before relying on concurrent master claims.
 
+If a legacy peer overwrites a live upgraded master's claim, the displaced peer drops its kernel lock on the next five-second refresh without deleting the legacy claim. Other upgraded peers can claim after the legacy master releases; a displaced `--restore` session retries automatically. This recovery also applies when restoration is disabled, but does not make concurrent legacy claims safe.
+
 The extension stores names and restore preferences under `~/.omp/agent/peer-sessions` (`0700` directory, `0600` files), with lock/registry files under `~/.omp/run/peers`. Preserve this metadata when moving a saved session to another home. Do not publish it. The first upgrade changes the old process-only peer ID once; new peers still discover legacy six-hex IDs. Restart upgraded sessions to obtain stable addresses. Deleting a session's metadata forgets its restore preference and fallback name, but its session-derived ID stays the same.
 
 ### Tools
