@@ -6,7 +6,7 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    files: ["extensions/peers.ts", "lib/**/*.ts", "tests/*.test.ts"],
+    files: ["extensions/*.ts", "lib/**/*.ts", "tests/*.test.ts"],
     rules: {
       "no-empty": ["error", { allowEmptyCatch: true }],
       "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],

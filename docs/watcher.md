@@ -1,6 +1,6 @@
 # Persistent peer watcher
 
-The watcher polls the local OMP peer registry and selected lifecycle metadata. It queues turn-ended notifications, delivers batches to the current master, and keeps running when OMP has no sessions or no master. It sends no provider request itself. **A delivered notification can start a model turn in the master and consume provider quota.** Install it only if you want that behavior.
+The watcher polls the local OMP peer registry and selected lifecycle metadata. It queues turn-ended transitions and sends unreported transitions to the current master as a digest, at most once per five minutes by default. It keeps running when OMP has no sessions or no master and sends no provider request itself. **A delivered notification can start a model turn in the master and consume provider quota.** Install it only if you want that behavior.
 
 ## Run in the foreground
 
@@ -13,10 +13,10 @@ python3 tools/watch.py
 The default registry is `$HOME/.omp/run/peers`; lifecycle logs live under `$HOME/.omp/logs`. The watcher keeps private state under `$HOME/.omp-peer-watch`. You can choose another OS home or runtime directory:
 
 ```sh
-python3 tools/watch.py --home "$HOME" --state-dir "$HOME/.local/state/omp-peer-watcher" --interval 1
+python3 tools/watch.py --home "$HOME" --state-dir "$HOME/.local/state/omp-peer-watcher" --interval 1 --digest-interval 300
 ```
 
-`--interval` accepts a finite positive number of seconds. Stop a foreground watcher with Ctrl-C or SIGTERM. A second watcher using the same runtime directory exits with a singleton-lock error. Different state directories have separate locks; do not point two running watchers at the same registry.
+`--interval` controls registry polling. `--digest-interval` controls the minimum spacing between transition digests and the initial batching delay; it defaults to 300 seconds. Both accept finite positive seconds. A digest includes up to 20 pending transitions, including newer transitions that arrived during the batching window. A backlog takes multiple digest intervals to drain; no master or a failed delivery leaves it queued. Explicit reports use the ordinary peer route immediately, outside this cadence. Stop a foreground watcher with Ctrl-C or SIGTERM. A second watcher using the same runtime directory exits with a singleton-lock error. Different state directories have separate locks; do not point two running watchers at the same registry.
 
 ## Install as a macOS user LaunchAgent
 
@@ -35,7 +35,7 @@ Choose a label, interpreter, or runtime directory during installation:
 ```sh
 LABEL=org.example.omp-peer-watcher
 STATE_DIR="$HOME/.local/state/omp-peer-watcher"
-python3 tools/install_watcher.py install --label "$LABEL" --state-dir "$STATE_DIR" --python "$(command -v python3)"
+python3 tools/install_watcher.py install --label "$LABEL" --state-dir "$STATE_DIR" --python "$(command -v python3)" --digest-interval 300
 launchctl print "gui/$(id -u)/$LABEL"
 ```
 
@@ -49,9 +49,29 @@ Do not copy an operational watcher's files, logs, or state into this checkout. F
 
 The watcher groups registrations by stable session ID, prefers each live process's newest registration, and treats peer-ID changes as the same logical session. Its first observation establishes an idle baseline. A new idle registration, a replacement process's initial idle state, and a departed peer do not count as a completion.
 
-A busy-to-idle observation queues a turn-ended event after a two-second lifecycle-log flush allowance. The watcher also accepts OMP JSON lifecycle entries with `message: "agent_end maintenance routing"`, `route: "entered"`, a matching session ID, and a timestamp after its initial baseline. Those entries can catch turns that start and finish between polls. The watcher reads only these fields plus an allowlisted stop reason; it does not inspect session transcripts or preserve arbitrary lifecycle-log payloads. Existing startup logs establish cursors without replay. A log written after startup can supply a missed event.
+The plugin assigns a random token to each main agent loop, from the supported `agent_start` callback through `agent_end`. This is the logical peer turn, including any internal provider/tool continuations. Tokens do not survive into the next agent loop or a different logical session. Child-agent reports cannot claim the main session's turn.
 
-The event ID depends on the stable session and the observed event key. The watcher persists deduplication history, log cursors and an outbox, retries pending notifications when a master becomes available, and resolves the current master for each delivery attempt. It excludes the master's own events to avoid notification feedback. Queue gaps and process restarts preserve pending events. It coalesces matching lifecycle and registry observations, retaining a bounded recent history of 8,192 event IDs and 256 timing windows per session.
+The plugin writes metadata-only `end` and successful `report` records under `$HOME/.omp/run/peers/notifications/<sha256-session-id>.jsonl` (`0700` directory, `0600` files). Each record carries `version: 1`, `sessionId`, `turnId`, a numeric Unix `timestamp`, and `type`. End records add the peer name; report receipts add `report`, `destinationId`, and `destinationSessionId`. The plugin stores no report body or transcript content there. Peers advertise `notificationVersion: 1` and their latest `notificationTurnId` in the registry. The watcher uses the token to coalesce registry edges and end records, even for short turns between polls.
+
+A busy-to-idle observation queues a transition after a two-second flush allowance. For older peers without the metadata protocol, the watcher still accepts OMP JSON lifecycle entries with `message: "agent_end maintenance routing"`, `route: "entered"`, a matching session ID, and a timestamp after its initial baseline. It reads only these fields plus an allowlisted stop reason. While the metadata protocol is healthy, it advances host-log cursors without emitting log events, so a later fallback does not replay those ends. It does not inspect session transcripts or use words in message bodies to infer completion. Legacy events lack exact turn identity, so the watcher does not suppress them on the strength of an explicit report.
+
+The watcher persists event IDs, journal/log cursors, report receipts and the outbox. It retains the existing version-1 state format with additive fields; upgrades keep queued events, cursor positions and deduplication history. Old outbox entries remain deliverable without a turn token or enqueue timestamp. First installation samples up to the final 4 MiB of each journal to retain recent report receipts, including a report just before startup whose turn ends afterward; historical end records do not generate notifications. Restarts resume journal cursors and read newly created journals after the original baseline. The watcher resolves the current master for each delivery attempt and excludes the master's events to avoid notification feedback. It retains 8,192 recent event IDs, 256 timing windows, and receipts for 256 recent turns per session.
+
+### Explicit reports
+
+Send an important report with its optional kind:
+
+```text
+peers_send({to: "<master-peer-id>", text: "Acceptance checks passed.", report: "DONE"})
+```
+
+The allowed kinds are `DONE`, `BLOCKED`, `WAITING`, and `DECISION`. The interactive equivalent is `/peers report <peer|all> <kind> <text>`. This is a delivery marker, not a structured-report framework; text stays free-form. Existing `peers_send` calls and `/peers msg` keep their behavior.
+
+The sender delivers the body through the ordinary peer message RPC immediately. It records a receipt only if the destination is the current master both before the send and after a successful acknowledgement, and the receiver acknowledges the same peer ID and logical session ID as the selected destination. Failed, refused, timed-out, legacy, or mismatched acknowledgements cannot authorize suppression. An ordinary message, a report to another peer, and a child-agent or out-of-turn report cannot authorize suppression either. The receiver's normal refusal/rate limits still apply, and the sender sees failures through the ordinary send result.
+
+At digest delivery, the watcher removes only redundant end/idle notices with a receipt for the exact sender session, logical turn and current master destination. It does not remove or delay the report itself. A receipt from a prior turn or a report to a previous master cannot hide a notice for the new destination. Multiple important reports in one turn all take the ordinary route. A late acknowledgement retains the identity of the sending turn, even if another turn starts before it arrives.
+
+Receipt bookkeeping failures do not fail a delivered report. A journal write failure removes the peer's metadata-protocol advertisement so the watcher can fall back to host lifecycle logs and registry transitions; a later successful write restores the advertisement. If the sender exits between delivery and durable receipt recording, the watcher may send an extra digest notice; it does not guess that delivery succeeded.
 
 Treat delivery as **at least once**, not exactly once: if the receiving master accepts a message and the acknowledgement or subsequent state save fails, the watcher can repeat that event ID. Consumers should deduplicate by event ID. A master can change after the lookup but before the socket write; a notification already in flight can reach that previous master. Future attempts use the current claim.
 
@@ -72,11 +92,11 @@ Stop the installed agent first or use its runtime alone; the singleton lock prev
 
 ## Logs and privacy
 
-The launch agent writes `$STATE_DIR/watcher.stdout.log` and `watcher.stderr.log`. Without `--state-dir`, `STATE_DIR` means `$HOME/.omp-peer-watch`. Lifecycle diagnostics contain readiness, event IDs/kinds, master IDs and error classes. State includes stable session IDs, peer names, observed process identities and log cursor paths. Keep these files local even though the watcher does not store assistant excerpts, provider errors, credentials or transcript text.
+The launch agent writes `$STATE_DIR/watcher.stdout.log` and `watcher.stderr.log`. Without `--state-dir`, `STATE_DIR` means `$HOME/.omp-peer-watch`. Lifecycle diagnostics contain readiness, event IDs/kinds, master IDs and error classes. State includes stable session IDs, peer names, observed process identities, journal/log cursor paths and report destination IDs. Keep these files and the plugin's notification journals local even though they contain no assistant excerpts, report bodies, provider errors, credentials or transcript text.
 
-The watcher does not rotate launchd output files. Stop the agent before archiving or truncating its logs, then reinstall to resume it. State metadata for old sessions and log cursors can also grow over a long installation lifetime. Clearing state loses deduplication history; preserve it unless you intend a fresh baseline. Corrupt or unsupported state produces a startup error rather than an overwrite.
+The watcher does not rotate launchd output or notification journals. Stop the watcher and relevant peer sessions before archiving or truncating their metadata journals; journal replay remains bounded by retained event IDs. State metadata for old sessions and log cursors can grow over a long installation lifetime. Clearing state loses deduplication history; preserve it unless you intend a fresh baseline. Corrupt or unsupported state produces a startup error rather than an overwrite.
 
-OMP lifecycle-log names and the `agent_end maintenance routing` metadata are host implementation details, not a stable peer protocol. If a host upgrade changes them, registry busy-to-idle detection still works, but it can miss short turns between polls. Delayed timestamps outside a turn's observed busy window can also prevent cross-source coalescing. Validate a host upgrade with the offline checks before enabling it on active work.
+OMP lifecycle-log names and the `agent_end maintenance routing` metadata are host implementation details, used only for older peers. If a host upgrade changes them, legacy registry busy-to-idle detection still works but can miss short turns between polls. Delayed legacy timestamps outside an observed busy window can prevent cross-source coalescing. Upgraded peers use supported extension lifecycle callbacks and the metadata protocol instead.
 
 ## Uninstall
 
@@ -103,4 +123,4 @@ npm run test:watcher
 npm run test:smoke
 ```
 
-The quick checks use temporary directories, a local fake Unix socket, the existing smoke polling helper, controlled timestamps and mocked launchctl calls. They do not start OMP, a launch agent, or a model provider. The integration smoke uses the existing keyless OMP setup and refuses inbound master messages while checking watcher startup, silent idle/departure handling and shutdown. Both remove the temporary runtime files and stop their subprocesses.
+Run `npm ci --ignore-scripts` first and install Bun for the offline routing regression. The quick checks use temporary homes, local Unix sockets, controlled timestamps and mocked launchctl calls. The routing regression exercises the registered send tool, command, receiver acknowledgement and lifecycle callbacks without starting a model provider. Python regressions cover exact-turn/destination isolation, restart/retry deduplication, v1 outbox preservation and digest batching. The OMP integration smoke keeps its keyless setup and refuses inbound master messages while checking watcher startup, silent idle/departure handling and shutdown. Tests remove temporary runtime files and stop their subprocesses.
