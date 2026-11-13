@@ -2,6 +2,7 @@
 // Copyright (c) 2026 PIIIX-org contributors
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AdvisorStatusOverviewEntry } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
@@ -25,6 +26,7 @@ function setup() {
 		ircWakesPending: false,
 		hasPostPromptWork: false,
 		getGoalModeState: () => undefined as object | undefined,
+		getAdvisorStatusOverview: () => ({ configured: false, advisors: [] as AdvisorStatusOverviewEntry[] }),
 		getAsyncJobTree: () => asyncJobTree(manager, "Main", { recentLimit: 0 }),
 		hasPendingAsyncWork: () => manager.getRunningJobs({ ownerId: "Main" }).length > 0
 			|| manager.getDeliveryState({ ownerId: "Main" }).queued > 0,
@@ -167,6 +169,27 @@ describe("peer activity metadata", () => {
 		session.hasPendingAsyncWork = () => true;
 		expect(read().hasPendingAsyncWork).toBe(true);
 		expect(read().isSettled).toBe(false);
+	});
+
+	test.each(["root", "child"])("%s advisor review backlog blocks settlement until drained", owner => {
+		const { registry, session, read } = fixture();
+		const reviewed = owner === "root" ? session : { ...session };
+		if (owner === "child") registry.register({
+			id: "reviewed-child", displayName: "reviewed child", kind: "sub", parentId: "Main",
+			session: reviewed as unknown as AgentSessionHandle,
+		});
+		const advisor = { name: "reviewer", status: "running" as const, yielded: false, backlog: 1, isPaused: false };
+		reviewed.getAdvisorStatusOverview = () => ({ configured: true, advisors: [advisor] });
+		expect(read().activity).toMatchObject({ activeJobs: 0, activeSubagents: 0 });
+		expect(read().hasPendingAsyncWork).toBe(false);
+		expect(read().isSettled).toBe(false);
+		advisor.backlog = 0;
+		expect(read().isSettled).toBe(true);
+		advisor.backlog = Number.NaN;
+		expect(read().isSettled).toBeNull();
+		Object.assign(reviewed, { getAdvisorStatusOverview: undefined });
+		expect(read().isSettled).toBeNull();
+		expect(read().activity.unknownReasons).toContain("advisor_review_state_unavailable");
 	});
 
 	test("unsupported services, null job snapshots and missing wake probes remain unknown", () => {
