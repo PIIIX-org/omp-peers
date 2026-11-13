@@ -152,20 +152,24 @@ try {
 	sessionId = "another-logical-session";
 	await emit("session_switch");
 	await emit("agent_start");
+	const sendingTurn = fs.readdirSync(root).filter(file => /^p[0-9a-f]{16}\.json$/.test(file))
+		.map(file => JSON.parse(fs.readFileSync(path.join(root, file), "utf8")))
+		.find(peer => peer.sessionId === sessionId).notificationTurnId;
 	await send(master, "new logical session report", "WAITING");
 	await emit("agent_end");
-	assert.equal(journal().filter(row => row.type === "report").at(-1)!.sessionId, sessionId);
+	assert.deepEqual(journal().filter(row => row.type === "report" && row.turnId === sendingTurn)
+		.map(row => ({ sessionId: row.sessionId, report: row.report })), [{ sessionId, report: "WAITING" }]);
 	await emit("agent_start");
 	await commands.get("peers")!(`report ${master} BLOCKED operator report in active turn`, ctx);
 	await emit("agent_end");
-	assert.equal(journal().filter(row => row.type === "report").at(-1)!.report, "BLOCKED");
+	assert.equal(journal().filter(row => row.type === "report" && row.sessionId === sessionId).at(-1)!.report, "BLOCKED");
 	assert.equal(received.at(-1)!.text, "operator report in active turn");
 	await emit("agent_start");
 	for (const kind of ["DONE", "BLOCKED", "WAITING", "DECISION"]) {
 		await send(master, `same-turn ${kind}`, kind);
 	}
 	await emit("agent_end");
-	assert.equal(new Set(journal().filter(row => row.type === "report").slice(-4).map(row => row.turnId)).size, 1);
+	assert.equal(new Set(journal().filter(row => row.type === "report" && row.sessionId === sessionId).slice(-4).map(row => row.turnId)).size, 1);
 	assert.deepEqual(received.slice(-4).map(row => row.text), ["same-turn DONE", "same-turn BLOCKED", "same-turn WAITING", "same-turn DECISION"]);
 	// Metadata I/O failure must not turn a successful report into a failed send.
 	const directory = path.join(root, "notifications");
