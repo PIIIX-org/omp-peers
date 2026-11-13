@@ -41,6 +41,8 @@ jobs:
         run: npm run lint
       - name: Check background activity and quiescence regressions
         run: npm run test:activity
+      - name: Check duplicate peer identity regressions
+        run: npm run test:identity
       - name: Compile Python and run quick watcher and scanner tests
         env:
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}/omp-peers-pycache
