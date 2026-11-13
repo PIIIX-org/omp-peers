@@ -57,11 +57,32 @@ The extension stores names and restore preferences under `~/.omp/agent/peer-sess
 
 ### Tools
 
-- `peers_list`: list sessions, models, effort, busy/idle state, context usage, and the master.
+- `peers_list`: list sessions, models, effort, busy/idle state, background job/subagent counts, settled state, context usage, and the master.
 - `peers_send`: deliver an agent-attributed message to a peer or `all`. Set optional `report: "DONE" | "BLOCKED" | "WAITING" | "DECISION"` for an explicit report. The body takes the ordinary route immediately; a successful same-turn delivery to the current master can suppress a redundant watcher notice. Use `/peers report <peer|all> <kind> <text>` from the command interface.
 - `peers_control`: master-only prompt, abort, compact, model, effort, subagents, setting, rename, tail, or shutdown. `status` does not require master ownership.
 
 A message to an idle peer can start a model turn and consume its provider quota. A master's `prompt` starts or queues user work. `abort`, `compact`, and `shutdown` affect running sessions; review your target before sending them. Status and tail inspect local state without asking a model.
+
+### Background activity and quiescence
+
+Peer registry JSON and the read-only `status` RPC expose:
+
+| Field | Meaning |
+| --- | --- |
+| `activity.activeJobs` | Running background jobs owned by this session or descendant agents. Includes task jobs; excludes foreground-backed jobs. |
+| `activity.activeSubagents` | Descendant subagents with a live streaming session. Excludes idle/parked agents, advisors and unrelated session trees. |
+| `activity.unknownReasons` | Fixed capability/reliability reason codes; no job labels, commands, output or transcript content. |
+| `hasPendingAsyncWork` | The host's owner-scoped async-wake predicate, including pending delivery and delivered results awaiting injection. |
+| `isSettled` | Conservative tree quiescence at observation time. `true` means no observed running jobs/agents, queued/admitted input, async/IRC wake, post-prompt work or advisor review backlog, and autonomous scheduling proven disabled. It does not mean the task passed its acceptance criteria. |
+
+Counts and predicates use `null` for unavailable capabilities. Older registrations may omit these fields. Neither case means zero or settled. Text status uses `jobs:? agents:? settled:unknown`. Job and subagent counts overlap for task-backed workers; do not add them together.
+
+Status reads current host metadata on each request; the registry refreshes on lifecycle events and at most five seconds after completion/cancellation. A running job prevents `isSettled: true` even if its automatic delivery is suppressed. Cancellation removes the running count; completion may leave pending wake work after the count reaches zero.
+
+OMP 18.18.1 exports the read-only `AgentRegistry` under `@oh-my-pi/pi-coding-agent/registry/agent-registry`. The plugin validates its own registry ref against the current session ID before reading that local session's public `getAsyncJobTree()`, `hasPendingAsyncWork()`, queue/admission and wake-state APIs. It checks `getAdvisorStatusOverview().advisors[].backlog` for queued or in-flight reviews in the root and live descendants; unavailable advisor state keeps settlement unknown. It walks metadata parent links and uses `registry.isRunning()` to count streaming children. It does not scan transcripts, count OS processes as jobs, or revive parked agents.
+
+The host's scheduled-turn probe belongs to mode owners, so active/paused autonomous modes retain `isSettled: null` with `autonomous_scheduler_unavailable` unless known work already makes it `false`. TUI status needs `ctx.sessionModes.getState()` to prove goal/loop/vibe modes inactive. RPC status needs the local session's public `getGoalModeState()` to prove no goal mode. Unsupported mode/host capabilities remain unknown.
+
 
 ### Model routing
 
@@ -145,7 +166,7 @@ Run from this checkout with Python 3.9 or newer:
 python3 tools/watch.py
 ```
 
-The watcher keeps running without OMP or a master. It queues metadata-only turn-ended transitions and sends a readable digest to the current master through the local message RPC, at most once per five minutes by default (`--digest-interval 300`). Explicit reports keep their immediate ordinary delivery route. **Delivery can start a model turn in the master and consume provider quota.** A turn-ended or idle event does not prove task completion; current peers do not report background-work quiescence.
+The watcher keeps running without OMP or a master. It queues metadata-only turn-ended transitions and sends a readable digest to the current master through the local message RPC, at most once per five minutes by default (`--digest-interval 300`). Explicit reports keep their immediate ordinary delivery route. **Delivery can start a model turn in the master and consume provider quota.** A turn-ended or idle event does not prove task completion. Notifications distinguish an agent yield from live quiescence, report available background counts, and retain `UNKNOWN` on older or unavailable hosts.
 
 The watcher deduplicates by stable session and event IDs, keeps a version-1-compatible outbox across restarts, and excludes the current master's events to prevent feedback. It suppresses an empty notice only after an acknowledged explicit report for the same logical session, agent-loop turn and current master destination. Initial idle peers, replacement-process initial idle states and departures do not count as completions. It reads peer registry, plugin notification metadata and selected legacy lifecycle-log metadata, never session transcripts. State lives under `$HOME/.omp-peer-watch` with a `0700` directory and `0600` files; state and logs still contain private session metadata. Only one watcher may use a runtime directory.
 
@@ -168,6 +189,14 @@ Run the integration smoke from this checkout:
 ```sh
 python3 tests/smoke.py
 ```
+
+```sh
+npm run test:activity
+npm run test:activity-smoke
+```
+
+Activity regressions cover job completion/cancellation, delivery gaps, streaming versus parked agents and unavailable capabilities. The activity smoke registers real session-owned jobs in a disposable OMP process and checks both socket status and registry refresh. It acknowledges a completion before delivery to avoid a model wake; it does not connect to a provider.
+
 
 The smoke links the plugin into a temporary home and runs real OMP RPC processes with a keyless local-only model configuration. It exercises control gates, model switching, saved-session restarts, crash recovery, master contention/restore opt-out, and watcher cleanup. It uses no real provider credentials or model turns and removes its temporary state on exit.
 

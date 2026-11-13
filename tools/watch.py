@@ -185,11 +185,17 @@ class Watcher:
             try:
                 info = path.stat()
                 cursor = self.state["cursors"].get(str(path))
-                position = info.st_size if cursor is None and baseline and not self.restored else 0
+                # Bound first-install receipt history; old end records still fail the baseline check.
+                position = max(0, info.st_size - 4 * 1024 * 1024) if cursor is None and baseline and not self.restored else 0
                 if cursor and cursor[0] == info.st_ino and cursor[1] <= info.st_size:
                     position = cursor[1]
                 with path.open("rb") as source:
-                    source.seek(position)
+                    source.seek(max(0, position - 1))
+                    if position and source.read(1) != b"\n":
+                        while True:
+                            fragment = source.readline(16384)
+                            if not fragment or fragment.endswith(b"\n"):
+                                break
                     for _ in range(2000):
                         start = source.tell()
                         line = source.readline(16384)
@@ -205,7 +211,8 @@ class Watcher:
                             if (item.get("version") != 1 or not isinstance(sid, str) or not sid
                                     or not isinstance(turn, str) or not turn or len(turn) > 128
                                     or not isinstance(stamp, (int, float)) or isinstance(stamp, bool)
-                                    or not math.isfinite(stamp) or stamp < self.state["since"]):
+                                    or not math.isfinite(stamp)
+                                    or (stamp < self.state["since"] and item.get("type") != "report")):
                                 continue
                         except (ValueError, AttributeError):
                             continue
@@ -241,10 +248,17 @@ class Watcher:
 
     def lifecycle(self, sid, peers, record, baseline=False, notify=True):
         for pid in sorted({peer["pid"] for peer in peers}):
+            metadata_healthy = any(peer["pid"] == pid and peer.get("notificationVersion") == 1 for peer in peers)
             for path in sorted(self.log_dir.glob("omp.*." + str(pid) + ".log")):
                 try:
                     info = path.stat()
                     cursor = self.state["cursors"].get(str(path))
+                    if metadata_healthy:
+                        checkpoint = [info.st_ino, info.st_size]
+                        if cursor != checkpoint:
+                            self.state["cursors"][str(path)] = checkpoint
+                            self.dirty = True
+                        continue
                     if cursor is None:
                         # Existing startup logs establish a baseline, not a replay.
                         position = info.st_size if baseline else 0
@@ -315,8 +329,7 @@ class Watcher:
                 record["processes"] = processes
                 self.dirty = True
             is_master = sid == master_sid
-            legacy = [peer for peer in peers if peer.get("notificationVersion") != 1]
-            self.lifecycle(sid, legacy, record, baseline=baseline,
+            self.lifecycle(sid, peers, record, baseline=baseline,
                            notify=not is_master and not record.get("was_master", False))
             if is_master or record.get("was_master", False):
                 # Consume master lifecycle metadata without reflecting watcher-
@@ -368,15 +381,34 @@ class Watcher:
                     states.append(info)
             except (OSError, ValueError, KeyError, ConnectionError):
                 continue
+        yielded = "agent yielded; " if event["kind"] in ("agent_end", "idle_transition") else ""
         if not states:
-            live = "live state unavailable; background/task completion UNKNOWN"
-        elif any(s.get("hasPendingAsyncWork") is True for s in states):
-            live = "background work pending; NOT task-complete"
-        elif len(states) == len(peers) and all(s.get("isSettled") is True and s.get("hasPendingAsyncWork") is False for s in states):
-            live = "session reports settled (no pending wake work); task completion unverified"
+            live = yielded + "live state unavailable; background/task completion UNKNOWN"
         else:
-            live = "live=" + ("active" if any(s.get("busy") for s in states) else "idle")
-            live += "; background/task completion UNKNOWN (peer API does not report quiescence)"
+            activities = [s["activity"] if isinstance(s.get("activity"), dict) else {} for s in states]
+            def count(key):
+                values = [activity.get(key) for activity in activities]
+                if len(states) == len(peers) and all(type(v) is int and v >= 0 for v in values):
+                    # Registrations describe the same logical session, not additive workers.
+                    return str(max(values))
+                return "?"
+
+            counts = "jobs=" + count("activeJobs") + "; active subagents=" + count("activeSubagents")
+            active = any(s.get("busy") is True for s in states)
+            work = any(s.get("hasPendingAsyncWork") is True or any(
+                type(value) is int and value > 0
+                for value in (activity.get("activeJobs"), activity.get("activeSubagents"))
+            ) for s, activity in zip(states, activities))
+            if work:
+                live = "background work pending; NOT task-complete"
+            elif (not active and len(states) == len(peers)
+                  and all(s.get("busy") is False and s.get("isSettled") is True
+                          and s.get("hasPendingAsyncWork") is False for s in states)):
+                live = "session reports quiescence (settled; no pending wake work); task completion unverified"
+            else:
+                live = "live=" + ("active" if active else "idle/unknown")
+                live += "; background/task completion UNKNOWN (quiescence unavailable)"
+            live = yielded + live + "; " + counts
         return (f"- {json.dumps(event['name'], ensure_ascii=True)}: {event['detail']} "
                 f"[{event['kind']}; session={event['session']}; event={event['event']}"
                 + (f"; turn={event['turn']}" if event.get("turn") else "") + f"] {live}")

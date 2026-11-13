@@ -325,6 +325,39 @@ class WatcherChecks(unittest.TestCase):
         self.watcher.observe()
         self.assertEqual(len(self.watcher.state["outbox"]), 1)
 
+    def test_startup_keeps_active_turn_receipt_without_replaying_historical_ends(self):
+        self.master()
+        self.peer(busy=True, notificationVersion=1, notificationTurnId="active-turn")
+        self.notification(turn="historical-turn", timestamp=self.now - 2)
+        self.notification("report", turn="active-turn", timestamp=self.now - 1, report="DONE",
+                          destinationSessionId="master-session", destinationId="pmaster")
+        self.watcher.observe(baseline=True)
+        self.assertEqual(self.watcher.state["outbox"], [])
+        self.now += 1
+        self.notification(turn="active-turn")
+        self.watcher.observe()
+        with patch.object(watch, "peer_rpc") as rpc:
+            self.watcher.deliver({})
+        rpc.assert_not_called()
+        self.assertEqual(self.watcher.state["outbox"], [])
+
+    def test_journal_failure_fallback_does_not_replay_healthy_host_log_ends(self):
+        self.peer(notificationVersion=1)
+        self.watcher.observe(baseline=True)
+        self.now += 1
+        self.notification(turn="healthy-turn")
+        self.lifecycle()
+        self.watcher.observe()
+        self.assertEqual(len(self.watcher.state["outbox"]), 1)
+        self.now += 1
+        self.peer()
+        self.lifecycle()
+        self.watcher.observe()
+        events = self.watcher.state["outbox"]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(sum(event.get("turn") == "healthy-turn" for event in events), 1)
+        self.assertEqual(sum("turn" not in event for event in events), 1)
+
     def test_late_report_and_pending_turn_survive_restart(self):
         self.master()
         self.peer(notificationVersion=1)
@@ -455,6 +488,47 @@ class WatcherChecks(unittest.TestCase):
             self.watcher.deliver({})
         self.assertEqual(rpc.call_count, 1)
         self.assertEqual(self.watcher.state["outbox"], [])
+
+    def test_yield_pending_jobs_then_quiescence_are_distinct_live_labels(self):
+        peer = self.peer()
+        event = {"session": "worker-session", "event": "yield", "name": "worker",
+                 "kind": "agent_end", "detail": "agent loop ended"}
+        snapshots = [
+            ({"busy": False, "hasPendingAsyncWork": True, "isSettled": False,
+              "activity": {"activeJobs": 1, "activeSubagents": 0}}, "NOT task-complete", "jobs=1"),
+            ({"busy": False, "hasPendingAsyncWork": True, "isSettled": False,
+              "activity": {"activeJobs": 0, "activeSubagents": 0}}, "NOT task-complete", "jobs=0"),
+            ({"busy": False, "hasPendingAsyncWork": False, "isSettled": True,
+              "activity": {"activeJobs": 0, "activeSubagents": 0}}, "reports quiescence", "jobs=0"),
+            # Known work overrides contradictory settled flags from another host.
+            ({"busy": False, "hasPendingAsyncWork": False, "isSettled": True,
+              "activity": {"activeJobs": 0, "activeSubagents": 1}}, "NOT task-complete", "active subagents=1"),
+            ({"busy": False, "hasPendingAsyncWork": None, "isSettled": None,
+              "activity": {"activeJobs": None, "activeSubagents": None}}, "UNKNOWN", "jobs=?"),
+            ({"busy": True, "hasPendingAsyncWork": False, "isSettled": True}, "UNKNOWN", "jobs=?"),
+            ({"busy": False, "activity": "old incompatible schema"}, "UNKNOWN", "jobs=?"),
+        ]
+        for info, expected, counts in snapshots:
+            with self.subTest(info=info), patch.object(watch, "peer_rpc", return_value={"ok": True, "info": info}):
+                live = self.watcher.describe(event, {"worker-session": [peer]})
+                self.assertIn("agent yielded", live)
+                self.assertIn(expected, live)
+                self.assertIn(counts, live)
+                self.assertNotIn("task done", live)
+
+    def test_partial_or_mixed_host_status_does_not_establish_quiescence(self):
+        first = self.peer()
+        second = self.peer("palias")
+        event = {"session": "worker-session", "event": "yield", "name": "worker",
+                 "kind": "idle_transition", "detail": "observed active -> idle"}
+        known = {"busy": False, "isSettled": True, "hasPendingAsyncWork": False,
+                 "activity": {"activeJobs": 0, "activeSubagents": 0}}
+        for replies in (({"info": known}, {"info": {"busy": False}}),
+                        ({"info": known}, ConnectionError("unavailable"))):
+            with self.subTest(replies=replies), patch.object(watch, "peer_rpc", side_effect=replies):
+                live = self.watcher.describe(event, {"worker-session": [first, second]})
+                self.assertIn("UNKNOWN", live)
+                self.assertIn("jobs=?", live)
 
     def test_runtime_permissions_and_symlink_rejection(self):
         self.watcher.save()

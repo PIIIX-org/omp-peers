@@ -6,6 +6,14 @@
 - Add hosted CI for TypeScript checks, Python verification, publication leak checks, and isolated plugin smoke coverage.
 - Document the contribution workflow and add a pull request template.
 
+### Background activity status
+
+- Expose nullable tree-owned background job and streaming subagent counts, the host's pending async-wake predicate, and conservative settled state through peer status/registry.
+- Preserve unknown capabilities and autonomous scheduling uncertainty instead of inventing zero counts or quiescence. Read host metadata without transcripts or parked-agent revival.
+- Label watcher notifications as agent yields, pending work or live quiescence without treating a settled session as task completion.
+- Add deterministic activity/delivery/cancellation regressions and an isolated OMP session-job smoke with no model turns.
+
+
 ### Persistent watcher
 
 - Replace the exit-on-event watcher with a persistent singleton that queues turn-ended notifications for the current master and preserves session/event deduplication across restarts. Initial idle registrations and peer departures do not count as completions.
