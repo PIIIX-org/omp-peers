@@ -37,7 +37,7 @@ Open two OMP sessions. In the coordinating session:
 /peers release
 ```
 
-Target a peer by its stable ID, exact name, or unique name/ID prefix. Use `all` to target the other peers. Targets exclude the sending session. `/peers` opens the interactive dashboard.
+Target a peer by its stable ID, exact name, or unique name/ID prefix. Exact IDs take precedence over another peer's name. Use `all` to target the other logical sessions. Targets exclude the sending logical session, including its legacy aliases. `/peers` opens the interactive dashboard.
 
 ### Session identity and master restoration
 
@@ -56,6 +56,12 @@ Kernel-backed locks permit one plugin writer per logical session and one master.
 If a legacy peer overwrites a live upgraded master's claim, the displaced peer drops its kernel lock on the next five-second refresh without deleting the legacy claim. Other upgraded peers can claim after the legacy master releases; a displaced `--restore` session retries automatically. This recovery also applies when restoration is disabled, but does not make concurrent legacy claims safe.
 
 The extension stores names and restore preferences under `~/.omp/agent/peer-sessions` (`0700` directory, `0600` files), with lock/registry files under `~/.omp/run/peers`. Preserve this metadata when moving a saved session to another home. Do not publish it. The first upgrade changes the old process-only peer ID once; new peers still discover legacy six-hex IDs. Restart upgraded sessions to obtain stable addresses. Deleting a session's metadata forgets its restore preference and fallback name, but its session-derived ID stays the same.
+
+Duplicate registrations remain visible; listing never deletes a live duplicate. Roster flags show `duplicate-name:<ids>` and `duplicate-session:<ids>`. Same-name sessions with different logical identities are each legitimate. Duplicate-name sends fail with candidate IDs: retry with the exact intended ID.
+
+`canonical` identifies a stable registration whose live socket confirms its current PID, instance, logical session ID and owned session lock. Other aliases show `canonical:<id>`. Timestamps, name ordering and a held lock alone do not establish ownership. Unreachable, refusing or legacy writers without that proof show `canonical:unknown (use explicit ID)`; exact IDs still work subject to ordinary inbound/control gates.
+
+Broadcasts deliver once per logical session, using its proved canonical writer when aliases exist. If any duplicate logical session has no proved writer, the entire broadcast fails before delivery and lists actionable IDs; send to an explicit ID instead. Unique legacy sessions and same-name distinct sessions continue to receive ordinary broadcasts.
 
 ### Tools
 
@@ -194,13 +200,14 @@ python3 tests/smoke.py
 
 ```sh
 npm run test:activity
+npm run test:identity
 npm run test:activity-smoke
 ```
 
 Activity regressions cover job completion/cancellation, delivery gaps, streaming versus parked agents and unavailable capabilities. The activity smoke registers real session-owned jobs in a disposable OMP process and checks both socket status and registry refresh. It acknowledges a completion before delivery to avoid a model wake; it does not connect to a provider.
 
 
-The smoke links the plugin into a temporary home and runs real OMP RPC processes with a keyless local-only model configuration. It exercises control gates, model switching, saved-session restarts, crash recovery, master contention/restore opt-out, legacy-overwrite lock recovery with and without auto-restore, and watcher cleanup. It uses no real provider credentials or model turns and removes its temporary state on exit.
+The smoke links the plugin into a temporary home and runs real OMP RPC processes with a keyless local-only model configuration. It exercises control gates, model switching, saved-session restarts, crash recovery, master contention/restore opt-out, legacy-overwrite lock recovery with and without auto-restore, duplicate-name and logical-alias rosters, exact-ID/name collisions, deduplicated and blocked broadcasts, and watcher cleanup. Legacy fixture sockets receive explicit-ID messages locally without waking a model. It uses no real provider credentials or model turns and removes its temporary state on exit.
 
 ## License
 
