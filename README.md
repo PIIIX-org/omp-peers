@@ -88,7 +88,7 @@ The host's scheduled-turn probe belongs to mode owners, so active/paused autonom
 
 ### Model routing
 
-Prompt routing defaults to enabled. The master classifies prompts as `light`, `standard`, or `heavy` using local keyword/length heuristics. It selects the corresponding model role and reasoning effort before sending work. Busy peers skip prompt model/effort routing and keep their current selection.
+Prompt classification defaults to enabled on the sender, but **receivers keep their current model and effort by default**. OMP 18.18.1 exposes the current model, not top-level operator-selection provenance, so the plugin conservatively treats every session as pinned. Normal prompts still dispatch; only automatic model/effort changes require a local opt-in. Status/registry show `routing:keep` or `routing:auto`.
 
 ```text
 /peers route
@@ -99,7 +99,11 @@ Prompt routing defaults to enabled. The master classifies prompts as `light`, `s
 /peers do <peer-id> subagents clear
 ```
 
-Use the `tier: "keep"` argument of the `peers_control` prompt action to keep the peer's model/effort for one task. Direct model and effort actions apply to subsequent requests, including while a peer is busy. Set effort with its own action instead of relying on a model-selector suffix to change it.
+On the receiving session, `/peers unpin` opts in to automatic prompt tiering; `/peers pin` restores the safe default. This policy is saved per logical session under `~/.omp/agent/peer-sessions` and survives resume; it is not a host model pin and does not change OMP configuration. A later local `/model` selection does not revoke the explicit `unpin` opt-in: run `/peers pin` before delegating if that selection must remain fixed. Sender `/peers route off` disables its automatic proposals, not receiver pins.
+
+`tier: "keep"` always preserves both model and effort. Other tiers alone do not bypass pins. An authorized master can explicitly override with `peers_control` `{action:"prompt", to:"<peer-id>", text:"...", tier:"heavy", overridePin:true}`; direct `model` and `effort` actions are also explicit overrides. Successful explicit changes pin the resulting selection again. Set effort with its own action instead of relying on a model-selector suffix. Control still requires the existing master authorization and receiver unlock.
+
+Busy sessions queue ordinary prompts without automatic model/effort changes. Explicit prompt/model/effort overrides fail while busy, without dispatch or mutation; retry after the current turn ends. Unavailable requested models (including failed credentials) fail before effort changes or prompt dispatch; no replacement model is selected. Configured role aliases retain OMP's operator-configured priority-list semantics and the resolved identity is reported. Every applied route reports old/new model, old/new effort and reason to the sender and in a visible receiver notice/history entry; retained routes explain the pin or busy reason to the sender.
 
 Default prompt tiers:
 
@@ -129,7 +133,9 @@ To override tiers, create `~/.omp/agent/peers.json`:
 }
 ```
 
-Subagent auto-routing defaults to `auto-managed`: it runs while a master exists and the peer allows control. `auto` enables it without a master; `auto-off` disables it. Manual peer subagent overrides win over automatic routing and OMP operator model pins. Automatic routing respects operator pins, leaves `seance` alone, and otherwise chooses a specialist tier or the parent task's tier. Manual overrides affect future spawns and remain until cleared or the process exits.
+Subagent auto-routing defaults to `auto-managed`: it runs while a master exists and the peer allows control. `auto` enables it without a master; `auto-off` disables it. **OMP operator `task.agentModelOverrides` pins win over both manual peer overrides and automatic routing.** To deliberately replace an operator task pin, the operator must edit/clear that setting explicitly (or authorize the master's existing `setting` action); ordinary peer subagent overrides cannot bypass it. If the host cannot expose task-pin settings, the plugin leaves the host selection intact. Otherwise manual peer overrides beat automatic tiering, and automatic routing leaves `seance` alone. Overrides affect future spawns until cleared or process exit. Unavailable plugin-selected models block the spawn instead of falling back; applied replacements include old/new selectors and their routing reason in the host's visible route note.
+
+Supported API evidence: the pinned 18.18.1 package declares `ExtensionContext.model`, `ctx.models.current()/resolve()`, `ExtensionAPI.setModel(): Promise<boolean>` and `setThinkingLevel()`, but no top-level pin-provenance field. Its public `AgentSession.setModel(model, role?, {selector?, thinkingLevel?, persist?})` and `setModelTemporary()` are setters, not evidence that an existing selection is unpinned. The settings registry exposes `task.agentModelOverrides`, and `before_subagent_spawn` exposes original `patterns` plus a visible result `note` and `block/reason`. The plugin uses those supported surfaces rather than inventing host pin metadata.
 
 ### Runtime settings
 
