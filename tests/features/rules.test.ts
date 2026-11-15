@@ -27,6 +27,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 		now: () => 1_700_000_000_000,
 		self: () => PEERS.find(peer => peer.id === self)!,
 		isMaster: () => master,
+		acceptsRemote: () => true,
 		peers: async () => PEERS,
 		groupsOf: peerId => groups[peerId] ?? [],
 	};
@@ -285,20 +286,57 @@ describe("injection", () => {
 		expect(out).toContain("2. r1");
 		expect(await run("list --effective p00000000000000f9")).toContain("1. r1  global  g");
 	});
+
+	test("a locked or refusing session is injected only its own rules, never rules authored by others", async () => {
+		await add("global", "from master");
+		await add(`session:${A}`, "master wrote this for a");
+		const own = await addRule(host(A, false), `session:${A}`, "self added");
+		expect(own.ok).toBe(true);
+		expect(lines(injected(A))).toEqual(["master wrote this for a", "self added", "from master"]);
+		const locked = { ...host(A, false), acceptsRemote: () => false };
+		expect(lines(agentContext(locked))).toEqual(["self added"]);
+		await removeRule(host(A, false), "r3");
+		expect(agentContext(locked)).toBeUndefined();
+	});
+
+	test("a redundant copy keeps its key so a conflicting global cannot slip in beside it", async () => {
+		await add("global", "use tabs", "style");
+		await add("global", "use spaces", "style");
+		await add(`session:${A}`, "use tabs");
+		expect(lines(injected(A))).toEqual(["use tabs"]);
+		const statuses = effectiveRules(stored().rules, A, []).map(entry => `${entry.rule.id}:${entry.status}`);
+		expect(statuses).toEqual(["r3:active", "r1:redundant", "r2:overridden"]);
+	});
+
+	test("limits: per-scope and total rule counts refuse the add; injection is size-capped deterministically", async () => {
+		for (let i = 0; i < 25; i++) await add("global", `rule number ${i}`);
+		const over = await addRule(master(), "global", "one too many");
+		expect(over.ok).toBe(false);
+		expect(!over.ok && over.error).toContain("scope limit");
+		for (const g of ["g1", "g2", "g3"]) for (let i = 0; i < 25; i++) await add(`group:${g}`, `${g} ${"x".repeat(380)} ${i}`);
+		const total = await addRule(master(), "group:g4", "past the total");
+		expect(total.ok).toBe(false);
+		expect(!total.ok && total.error).toContain("rule limit");
+		groups[A] = ["g1", "g2", "g3"];
+		const text = injected(A)!;
+		expect(text.length).toBeLessThanOrEqual(8192 + 200);
+		expect(text).toMatch(/\(\d+ lower-precedence rule\(s\) omitted: 8192-byte injection cap\)/);
+		expect(text).toBe(injected(A)!);
+	});
 });
 
 describe("concurrency across real processes", () => {
 	const spawn = (tag: string, count: number) => Bun.spawn([process.execPath, path.join(import.meta.dir, "child_add.ts"), home, tag, String(count)], { stdout: "pipe", stderr: "pipe" });
 
 	test("adds from two processes lose nothing and ids stay unique", async () => {
-		const children = [spawn("left", 15), spawn("right", 15)];
+		const children = [spawn("left", 12), spawn("right", 12)];
 		const codes = await Promise.all(children.map(child => child.exited));
 		expect(codes).toEqual([0, 0]);
 		const state = stored();
-		expect(state.rules).toHaveLength(30);
-		expect(new Set(state.rules.map(r => r.id)).size).toBe(30);
-		expect(new Set(state.rules.map(r => r.text)).size).toBe(30);
-		expect(state.nextId).toBe(31);
+		expect(state.rules).toHaveLength(24);
+		expect(new Set(state.rules.map(r => r.id)).size).toBe(24);
+		expect(new Set(state.rules.map(r => r.text)).size).toBe(24);
+		expect(state.nextId).toBe(25);
 	});
 
 	test("identical adds racing in two processes store exactly one rule", async () => {

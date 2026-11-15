@@ -41,6 +41,9 @@ export interface Effective {
 }
 
 const MAX_TEXT = 400;
+const MAX_RULES = 100;
+const MAX_SCOPE_RULES = 25;
+const MAX_INJECT = 8192;
 const GROUP_RE = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 const KEY_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 const PEER_ID_RE = /^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
@@ -113,7 +116,11 @@ export function effectiveRules(rules: Rule[], peerId: string, groups: string[]):
 		const holder = rule.key ? byKey.get(rule.key) : undefined;
 		if (holder) return { rule, status: holder.text === rule.text ? "redundant" : "overridden", by: holder.id };
 		const same = byText.get(rule.text);
-		if (same) return { rule, status: "redundant", by: same.id };
+		if (same) {
+			// A redundant copy still holds its key, so a later rule with that key and other text cannot slip in.
+			if (rule.key && !byKey.has(rule.key)) byKey.set(rule.key, rule);
+			return { rule, status: "redundant", by: same.id };
+		}
 		if (rule.key) byKey.set(rule.key, rule);
 		byText.set(rule.text, rule);
 		return { rule, status: "active" };
@@ -131,10 +138,21 @@ function potentialConflicts(rules: Rule[], rule: Rule): Rule[] {
 export function renderInjection(entries: Effective[]): string | undefined {
 	const active = entries.filter(entry => entry.status === "active");
 	if (!active.length) return undefined;
-	return [
-		"Standing rules for this session (peers rules registry; most specific first). Follow them; an explicit instruction in the user's request for this task overrides them.",
-		...active.map(({ rule }) => `- [${rule.id} ${rule.scope.startsWith("session:") ? "session" : rule.scope}] ${rule.text}`),
-	].join("\n");
+	const header = "Standing rules for this session (peers rules registry; most specific first). Follow them; an explicit instruction in the user's request for this task overrides them.";
+	const lines = [header];
+	let size = header.length;
+	let omitted = 0;
+	for (const { rule } of active) {
+		const line = `- [${rule.id} ${rule.scope.startsWith("session:") ? "session" : rule.scope}] ${rule.text}`;
+		// Bounded: once one rule does not fit, every lower-precedence rule is omitted (deterministic).
+		if (omitted || size + line.length + 1 > MAX_INJECT) omitted++;
+		else {
+			lines.push(line);
+			size += line.length + 1;
+		}
+	}
+	if (omitted) lines.push(`- (${omitted} lower-precedence rule(s) omitted: ${MAX_INJECT}-byte injection cap)`);
+	return lines.join("\n");
 }
 
 // ---- Validation --------------------------------------------------------------------------------
@@ -196,6 +214,8 @@ export async function addRule(host: FeatureHost, scopeSpec: string, rawText: str
 	return updateState<RulesState, AddResult>(rulesFile(host.home), emptyState, validateState, current => {
 		const existing = current.rules.find(rule => rule.scope === scope && rule.text === text);
 		if (existing) return { result: { ok: false, error: `duplicate: ${existing.id} already has this scope and text`, existing: existing.id } };
+		if (current.rules.length >= MAX_RULES) return { result: { ok: false, error: `rule limit reached (${MAX_RULES}); remove a rule first` } };
+		if (current.rules.filter(rule => rule.scope === scope).length >= MAX_SCOPE_RULES) return { result: { ok: false, error: `scope limit reached (${MAX_SCOPE_RULES} rules for ${scope}); remove a rule first` } };
 		const rule: Rule = { id: `r${current.nextId}`, scope, text, ...(key ? { key } : {}), addedBy, createdAt };
 		const rules = [...current.rules, rule];
 		return { state: { version: 1, nextId: current.nextId + 1, rules }, result: { ok: true, rule, conflicts: potentialConflicts(rules, rule) } };
@@ -220,7 +240,10 @@ export async function removeRule(host: FeatureHost, idSpec: string): Promise<Rem
 /** The context injected for this session's next agent start, read fresh from disk each time. */
 export function agentContext(host: FeatureHost): string | undefined {
 	const self = host.self().id;
-	return renderInjection(effectiveRules(readRules(host).rules, self, host.groupsOf(self)));
+	const all = readRules(host).rules;
+	// A session that refuses or locks out others must not receive rules authored by others.
+	const own = host.acceptsRemote() ? all : all.filter(rule => rule.addedBy === self);
+	return renderInjection(effectiveRules(own, self, host.groupsOf(self)));
 }
 
 // ---- Presentation ------------------------------------------------------------------------------
@@ -312,10 +335,8 @@ async function command(args: string[], host: FeatureHost): Promise<string> {
 		return `error: ${(error as Error).message}`;
 	}
 }
-
 export const rules: Feature = {
 	name: "rules",
-	summary: "Scoped standing rules injected at agent start",
 	command,
 	agentContext,
 };

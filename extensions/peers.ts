@@ -171,6 +171,8 @@ const state = {
 	sessionLock: undefined as FileLock | undefined,
 	masterLock: undefined as FileLock | undefined,
 	saved: { name: "", restoreMaster: false, routingPolicy: "keep" as "keep" | "auto" },
+	// Host session object this process is pinned to; refreshes from other sessions never rebind (see bind()).
+	manager: undefined as object | undefined,
 	identityError: "",
 	startedAt: new Date().toISOString(),
 	server: undefined as net.Server | undefined,
@@ -185,12 +187,20 @@ const state = {
 	timer: undefined as unknown,
 	rate: new Map<string, number[]>(),
 };
+let exitHooked = false;
 const sockPath = () => path.join(ROOT, `${state.id}.sock`);
 const infoPath = (id: string) => path.join(ROOT, `${id}.json`);
 const sessionPath = () => path.join(SESSION_ROOT, `${state.id}.json`);
 
+// Persist only non-default state, or update a file that already exists (so a release/unpin still sticks).
+// A file owned by a different session id is never overwritten.
 function saveSession(): void {
-	writeJson(sessionPath(), { sessionId: state.sessionId, ...state.saved });
+	const file = sessionPath();
+	const existing = readJson<{ sessionId?: string }>(file);
+	if (existing && existing.sessionId !== state.sessionId) return;
+	const { name, restoreMaster, routingPolicy } = state.saved;
+	if (!existing && !name && !restoreMaster && routingPolicy === "keep") return;
+	writeJson(file, { sessionId: state.sessionId, ...state.saved });
 }
 
 function releaseMaster(): void {
@@ -657,7 +667,6 @@ function startServer(pi: ExtensionAPI): void {
 	});
 	server.unref();
 	state.server = server;
-	process.on("exit", teardown);
 }
 
 function teardown(): void {
@@ -701,9 +710,19 @@ function summarize(res: Record<string, unknown>, name = "peer"): string {
 export default function peers(pi: ExtensionAPI) {
 	const z = pi.zod;
 	pi.setLabel("Peers (cross-session messaging + master control)");
+	// One process-level cleanup hook, however many times the identity rebinds.
+	if (!exitHooked) {
+		exitHooked = true;
+		process.on("exit", teardown);
+	}
 
+	// ACP can host several sessions in one process, each with its own session manager. The first bound manager owns this
+	// process's identity; events from other managers are ignored. OMP mutates one manager in place for /new, /resume and
+	// /fork, so only the pinned manager may switch the logical identity (via `session_switch` or any refresh).
 	const bind = (ctx: ExtensionContext): boolean => {
 		if (ctx.agent.kind !== "main") return false;
+		if (state.manager && state.manager !== ctx.sessionManager) return false;
+		state.manager = ctx.sessionManager;
 		bindIdentity(ctx.sessionManager.getSessionId());
 		state.ctx = ctx;
 		return true;
@@ -763,6 +782,7 @@ export default function peers(pi: ExtensionAPI) {
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
 				.map(p => ({ id: p.id, name: p.name })),
 			groupsOf: () => [],
+			acceptsRemote: () => state.inbound === "accept" && state.control,
 		};
 	};
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -807,7 +827,12 @@ export default function peers(pi: ExtensionAPI) {
 		return { model: next, note };
 	});
 	pi.on("session_shutdown", async (_e, ctx) => {
-		if (ctx.agent.kind === "main") teardown();
+		// A pinned process releases its identity only when the pinned session shuts down.
+		if (ctx.agent.kind !== "main" || (state.manager && state.manager !== ctx.sessionManager)) return;
+		teardown();
+		state.manager = undefined;
+		if (state.timer) ctx.clearTimer(state.timer as never);
+		state.timer = undefined;
 	});
 
 	const senderInfo = () => ({ id: state.id, name: selfInfo(pi).name });
@@ -958,7 +983,6 @@ export default function peers(pi: ExtensionAPI) {
 					return say(`This session (${state.id}) is now the master.${state.saved.restoreMaster ? " Restore on resume enabled." : ""}`);
 				}
 				case "release":
-					if (!state.sessionLock?.acquired) return say(state.identityError);
 					state.saved.restoreMaster = false;
 					saveSession();
 					releaseMaster();

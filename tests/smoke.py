@@ -408,6 +408,9 @@ def main():
             ids = wait_for(identities)
             master, worker = peers
             master_id, worker_id = ids[master.proc.pid], ids[worker.proc.pid]
+            saved_dir = agent / "peer-sessions"
+            assert not list(saved_dir.glob("*.json")), "default sessions must not persist peer metadata"
+            print("PASS default sessions write no peer-sessions metadata")
             master.command("/peers list", worker_id)
             worker.command(f"/peers do {master_id} rename forbidden", "Not the master")
             master.command("/peers master", "now the master")
@@ -415,6 +418,9 @@ def main():
             master.command(f"/peers do {worker_id} rename forbidden", "peer is locked")
             worker.command("/peers unlock", "allowed")
             master.command(f"/peers do {worker_id} rename smoke-worker", "ok")
+            wait_for(lambda: (saved_dir / f"{worker_id}.json").exists())
+            assert json.loads((saved_dir / f"{worker_id}.json").read_text())["name"] == "smoke-worker"
+            assert not (saved_dir / f"{master_id}.json").exists(), "unnamed session still has no metadata"
             master.command(f"/peers do {worker_id} status", "smoke-worker")
             worker.command("/peers refuse", "refuse")
             master.command(f"/peers do {worker_id} status", "refuses inbound")
@@ -557,7 +563,6 @@ def main():
             winner = master if row("master")["id"] == master_id else worker
             winner.command("/peers release", "released")
             master.command("/peers master", "now the master")
-            saved_dir = agent / "peer-sessions"
             assert saved_dir.stat().st_mode & 0o777 == 0o700
             assert all(file.stat().st_mode & 0o777 == 0o600 for file in saved_dir.glob("*.json"))
             print("PASS simultaneous claims elect one master; durable metadata remains private")
