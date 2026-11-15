@@ -99,8 +99,16 @@ def run(h):
     assert len(requests) == served_before, "listing started a model turn"
     print("PASS the master lists questions grouped by source; listing writes nothing and wakes nobody")
 
+    # The master is told (count and ids only) that questions are open; other sessions are not.
+    line = "Decision inbox: 2 open question(s) from other sessions (q1, q2)."
+    master_turn = turn(master, "Reply with the word ok.")
+    assert any(line in dump(b) for b in master_turn), [dump(b)[-300:] for b in master_turn]
+    assert not any("Ship the release today" in dump(b) and line in dump(b) for b in master_turn)
+    assert not any("Decision inbox:" in dump(b) for b in turn(worker, "Reply with the word ok."))
+    print("PASS the master's next agent start carries only the open count and ids; other sessions get nothing")
+
     denied = h.say(worker, "/peers inbox answer q1 yes")
-    assert "only the master session" in denied, denied
+    assert denied == "error: only the master session may answer, defer, reopen or retry inbox questions; run /peers master first", denied
     assert json.loads(file.read_text())["entries"][0]["state"] == "open"
     print("PASS a non-master session cannot answer")
 

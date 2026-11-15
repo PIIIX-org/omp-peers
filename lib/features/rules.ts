@@ -45,6 +45,7 @@ const MAX_TEXT = 400;
 const MAX_RULES = 100;
 const MAX_SCOPE_RULES = 25;
 const MAX_INJECT = 8192;
+const NOTE_RESERVE = 100;
 const GROUP_RE = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 const KEY_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 const PEER_ID_RE = /^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
@@ -126,25 +127,38 @@ function potentialConflicts(rules: Rule[], rule: Rule): Rule[] {
 		!(rank(rule.scope) === 0 && rank(other.scope) === 0 && rule.scope !== other.scope)).sort(compareRules);
 }
 
-/** Exactly the text injected: the active rules, most specific first. */
-export function renderInjection(entries: Effective[]): string | undefined {
+export interface InjectionPlan {
+	text: string | undefined;
+	total: number;
+	injected: number;
+	omitted: number;
+}
+
+/** What is injected: active rules in precedence order until the byte budget (reserving room for the omission note) is spent. */
+export function planInjection(entries: Effective[]): InjectionPlan {
 	const active = entries.filter(entry => entry.status === "active");
-	if (!active.length) return undefined;
+	if (!active.length) return { text: undefined, total: 0, injected: 0, omitted: 0 };
 	const header = "Standing rules for this session (peers rules registry; most specific first). Follow them; an explicit instruction in the user's request for this task overrides them.";
 	const lines = [header];
-	let size = header.length;
+	let size = Buffer.byteLength(header);
 	let omitted = 0;
 	for (const { rule } of active) {
 		const line = `- [${rule.id} ${rule.scope.startsWith("session:") ? "session" : rule.scope}] ${rule.text}`;
+		const bytes = Buffer.byteLength(line) + 1;
 		// Bounded: once one rule does not fit, every lower-precedence rule is omitted (deterministic).
-		if (omitted || size + line.length + 1 > MAX_INJECT) omitted++;
+		if (omitted || size + bytes > MAX_INJECT - NOTE_RESERVE) omitted++;
 		else {
 			lines.push(line);
-			size += line.length + 1;
+			size += bytes;
 		}
 	}
 	if (omitted) lines.push(`- (${omitted} lower-precedence rule(s) omitted: ${MAX_INJECT}-byte injection cap)`);
-	return lines.join("\n");
+	return { text: lines.join("\n"), total: active.length, injected: active.length - omitted, omitted };
+}
+
+/** Exactly the text injected: the active rules, most specific first. */
+export function renderInjection(entries: Effective[]): string | undefined {
+	return planInjection(entries).text;
 }
 
 // ---- Validation --------------------------------------------------------------------------------
@@ -262,20 +276,28 @@ function renderEntries(entries: Effective[], names: Map<string, string>): string
 async function describePeer(host: FeatureHost, spec: string, heading: string): Promise<string> {
 	const resolved = await resolvePeer(host, spec, true);
 	if (!resolved.id) return `error: ${resolved.error}`;
+	const id = resolved.id;
 	const peers = await host.peers();
 	const names = new Map(peers.map(peer => [peer.id, peer.name]));
-	const groups = host.groupsOf(resolved.id).map(group => group.toLowerCase()).sort();
-	const entries = effectiveRules(readRules(host).rules, resolved.id, groups);
-	const active = entries.filter(entry => entry.status === "active").length;
-	const who = names.get(resolved.id);
+	const groups = host.groupsOf(id).map(group => group.toLowerCase()).sort();
+	const isSelf = id === host.self().id;
+	// Same selection as injection: a peer that refuses or locks out others only receives rules it added itself.
+	const accepts = isSelf ? host.acceptsRemote() : peers.find(peer => peer.id === id)?.acceptsRemote;
+	const own = accepts === false ? readRules(host).rules.filter(rule => rule.addedBy === id) : readRules(host).rules;
+	const entries = effectiveRules(own, id, groups);
+	const plan = planInjection(entries);
+	const who = names.get(id);
+	const note = accepts === false ? "inbound is refused or control is locked: only rules this session added itself are injected"
+		: accepts === undefined ? "inbound state unknown (not published): assuming it accepts others' rules" : undefined;
 	return [
-		`${heading} ${who ? `${who} ` : ""}(${resolved.id})`,
+		`${heading} ${who ? `${who} ` : ""}(${id})`,
 		`groups: ${groups.join(", ") || "(none)"}`,
 		PRECEDENCE,
+		...(note ? [note] : []),
 		"effective rules, injected in this order:",
 		...renderEntries(entries, names),
-		active
-			? `injection: ${active} rule(s) are added when ${resolved.id === host.self().id ? "this" : "that"} session's main agent next starts`
+		plan.total
+			? `injection: ${plan.injected} of ${plan.total} rule(s) are added when ${isSelf ? "this" : "that"} session's main agent next starts${plan.omitted ? ` (${plan.omitted} omitted: ${MAX_INJECT}-byte injection cap)` : ""}`
 			: "injection: none; no rules apply, so nothing is added",
 	].join("\n");
 }
