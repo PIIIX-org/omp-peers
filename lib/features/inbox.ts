@@ -315,7 +315,7 @@ function describeResolve(result: ResolveResult & { ok: true }, verb: string): st
 	switch (delivery) {
 		case "delivered": return `${entry.id} answered; the answer was delivered to ${entry.source.name} (${entry.source.id})`;
 		case "pending": return `${entry.id} answered; ${entry.source.name} (${entry.source.id}) is not reachable from this session, so delivery is pending. It can read the answer with peers_decision check, or run /peers inbox retry ${entry.id}`;
-		default: return `${entry.id} answered; ${entry.delivery}. Fix the cause and run /peers inbox retry ${entry.id}, or the session can read it with peers_decision check`;
+		default: return `${entry.id} answered; ${entry.delivery}${entry.delivery.endsWith("session is paused") ? " (only that session's own user can /peers resume)" : ""}. Fix the cause and run /peers inbox retry ${entry.id}, or the session can read it with peers_decision check`;
 	}
 }
 

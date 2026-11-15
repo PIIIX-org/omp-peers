@@ -71,6 +71,7 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 
 - Standing rules: `/peers rules add|remove|list|explain` stores scoped (global, group, session) instructions once and appends the matching ones at each main-agent start. See [docs/features/rules.md](docs/features/rules.md).
 - Decision inbox: sessions queue short user questions with `peers_decision` or `/peers inbox ask`; the master lists, answers or defers them with `/peers inbox`, and an answer is sent once to the live asking session. See [docs/features/inbox.md](docs/features/inbox.md).
+- Session task board: `/peers board list|assign|set|clear|stale` keeps a persisted board of each session's assigned task and last reported status (stable-ID keyed, honest about stale and unknown). See [docs/features/board.md](docs/features/board.md).
 - Pause and resume: `/peers pause [reason]` and `/peers resume` persistently stop automated wakes (master messages and prompts, watcher digests) of a session until you resume it; status and listing still work. See [docs/features/pause.md](docs/features/pause.md).
 
 ### Tools
