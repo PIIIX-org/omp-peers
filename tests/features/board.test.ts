@@ -41,6 +41,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 			return live;
 		},
 		groupsOf: () => [],
+		send: async () => ({ status: "offline" }),
 	};
 }
 const master = () => host(MASTER);
