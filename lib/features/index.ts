@@ -3,6 +3,7 @@
 import type { zod } from "@oh-my-pi/pi-coding-agent";
 import type { FeatureHost } from "./host";
 import { inbox } from "./inbox";
+import { locks } from "./locks";
 import { rules } from "./rules";
 
 /** An LLM tool a feature contributes. The extension registers it; the feature never imports host runtime values. */
@@ -28,4 +29,4 @@ export interface Feature {
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox];
+export const FEATURES: Feature[] = [rules, inbox, locks];

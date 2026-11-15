@@ -71,6 +71,7 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 
 - Standing rules: `/peers rules add|remove|list|explain` stores scoped (global, group, session) instructions once and appends the matching ones at each main-agent start. See [docs/features/rules.md](docs/features/rules.md).
 - Decision inbox: sessions queue short user questions with `peers_decision` or `/peers inbox ask`; the master lists, answers or defers them with `/peers inbox`, and an answer is sent once to the live asking session. See [docs/features/inbox.md](docs/features/inbox.md).
+- Shared locks: `/peers locks acquire|renew|release|status` and the `peers_lock` tool give sessions named locks and semaphores with capacity, owner-only release and TTL expiry; contention returns `busy` instead of waiting. See [docs/features/locks.md](docs/features/locks.md).
 
 ### Tools
 
