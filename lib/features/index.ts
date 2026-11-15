@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 PIIIX-org contributors
+import type { Report } from "../reports";
+import { board } from "./board";
 import type { FeatureHost } from "./host";
 import { rules } from "./rules";
 
@@ -10,7 +12,9 @@ export interface Feature {
 	command(args: string[], host: FeatureHost): Promise<string>;
 	/** Context added before this session's next agent start; undefined adds nothing. May throw. */
 	agentContext?(host: FeatureHost): string | undefined;
+	/** A structured report this session accepted; `from` is the sender's claimed identity, not authenticated. May reject. */
+	onReport?(report: Report, from: { id: string; name: string }, host: FeatureHost): Promise<void>;
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules];
+export const FEATURES: Feature[] = [rules, board];

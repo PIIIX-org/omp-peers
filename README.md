@@ -70,6 +70,7 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 ### Optional features
 
 - Standing rules: `/peers rules add|remove|list|explain` stores scoped (global, group, session) instructions once and appends the matching ones at each main-agent start. See [docs/features/rules.md](docs/features/rules.md).
+- Session task board: `/peers board list|assign|set|clear|stale` keeps a persisted board of each session's assigned task and last reported status (stable-ID keyed, honest about stale and unknown). See [docs/features/board.md](docs/features/board.md).
 
 ### Tools
 

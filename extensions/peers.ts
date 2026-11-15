@@ -503,6 +503,9 @@ async function settingOp(pi: ExtensionAPI, req: Req): Promise<Record<string, unk
 	return { ok: true, key, value: s.get(scope), provenance: s.provenance(scope) };
 }
 
+// Set by the extension factory: feature hooks that run from the receiver path need the same host the commands get.
+let featureHostFor: ((ctx: ExtensionContext) => FeatureHost) | undefined;
+
 async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknown>> {
 	const ctx = state.ctx;
 	if (!ctx) return { ok: false, error: "session not ready" };
@@ -518,13 +521,25 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 			return { ok: true, info: selfInfo(pi), sessionOwner: state.sessionLock?.acquired === true };
 		case "message": {
 			let text: string;
+			let report: Report | undefined;
 			try {
-				text = readMessage(req).text;
+				({ text, report } = readMessage(req));
 			} catch (error) {
 				return { ok: false, error: `invalid message/report: ${(error as Error).message}` };
 			}
 			const from = req.from ?? { id: "?", name: "unknown" };
 			if (!rateOk(from.id)) return { ok: false, error: "rate limited" };
+			if (report && req.from && featureHostFor) {
+				// Only an explicit structured report feeds features; a failing hook never blocks delivery.
+				const host = featureHostFor(ctx);
+				for (const feature of FEATURES) {
+					try {
+						await feature.onReport?.(report, req.from, host);
+					} catch (error) {
+						ctx.ui.notify(`peers ${feature.name}: report not recorded: ${(error as Error).message}`, "warning");
+					}
+				}
+			}
 			pi.sendMessage(
 				{
 					customType: "peer-message",
@@ -759,6 +774,7 @@ export default function peers(pi: ExtensionAPI) {
 			acceptsRemote: () => state.inbound === "accept" && state.control,
 		};
 	};
+	featureHostFor = featureHost;
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		const host = featureHost(ctx);
