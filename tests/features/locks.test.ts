@@ -32,6 +32,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 		acceptsRemote: () => true,
 		peers: async () => [],
 		groupsOf: () => [],
+		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		send: async () => ({ status: "offline" }),
 	};
 }
