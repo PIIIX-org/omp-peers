@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { FEATURES } from "../../lib/features";
-import { assignTask, board, boardFile, clearEntry, formatAge, recordReport, setStatus, staleConfig, type BoardState, type BoardStatus } from "../../lib/features/board";
+import { assignTask, board, boardFile, clearEntry, formatAge, isStale, recordReport, setStatus, staleConfig, type BoardState, type BoardStatus } from "../../lib/features/board";
 import type { FeatureHost, PeerView } from "../../lib/features/host";
 import type { Report } from "../../lib/reports";
 import { stateRoot } from "../../lib/features/store";
@@ -178,12 +178,14 @@ describe("reports feed the board", () => {
 		expect(stored().entries).toHaveLength(1);
 	});
 
-	test("the same report delivered twice changes nothing; a sender claiming another id writes only that id", async () => {
-		await recordReport(master(), done, { id: A, name: "worker-a" });
-		const before = fs.readFileSync(boardFile(home), "utf8");
-		now += HOUR;
-		await recordReport(host(B), done, { id: A, name: "worker-a" });
-		expect(fs.readFileSync(boardFile(home), "utf8")).toBe(before);
+	test("re-sending the same report refreshes its time, so a still-valid WAITING stops being stale; a sender claiming another id writes only that id", async () => {
+		const waiting: Report = { kind: "WAITING", unit: "Consumer validation", background: "pending", nextAction: "Wait for results" };
+		await recordReport(master(), waiting, { id: A, name: "worker-a" });
+		now += 25 * HOUR;
+		expect(isStale(entry(A)!, now, 24)).toBe(true);
+		await recordReport(host(B), waiting, { id: A, name: "worker-a" });
+		expect(entry(A)).toMatchObject({ status: "waiting", updatedAt: now });
+		expect(isStale(entry(A)!, now, 24)).toBe(false);
 		await recordReport(host(B), done, { id: C, name: "claimed" });
 		expect(stored().entries.map(e => [e.session, e.updatedBy])).toEqual([[A, A], [C, C]]);
 	});

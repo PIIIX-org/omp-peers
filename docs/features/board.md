@@ -29,7 +29,7 @@ One entry per stable logical session ID (the ID derived from the session, not fr
 
 ## Reports
 
-When a session accepts a structured report message (`peers_send` with a `report`, or `/peers report`), the receiving session updates the sender's entry: `DONE` becomes `done`, `BLOCKED` `blocked`, `WAITING` `waiting`, `DECISION` `decision`. The entry's unit is the report's `unit` (dropped if it looks like a credential). The assigned task is kept; a manual note is cleared. A sender without an entry gets one with source `report`. A repeated identical report changes nothing. Ordinary text messages, idle transitions and session histories are never read.
+When a session accepts a structured report message (`peers_send` with a `report`, or `/peers report`), the receiving session updates the sender's entry: `DONE` becomes `done`, `BLOCKED` `blocked`, `WAITING` `waiting`, `DECISION` `decision`. The entry's unit is the report's `unit` (dropped if it looks like a credential). The assigned task is kept; a manual note is cleared. A sender without an entry gets one with source `report`. Every accepted report refreshes the entry's time, so a still-valid WAITING report that is re-sent stops being stale. Reports sent by a subagent are delivered as ordinary messages but never update the board, because a subagent's status is not its parent session's status. Ordinary text messages, idle transitions and session histories are never read.
 
 ## Staleness and unknown status
 

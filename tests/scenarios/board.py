@@ -3,10 +3,25 @@
 """/peers board through two real OMP processes: assignment, a structured report, restart, read-only listing."""
 import json
 import re
+import socket
 import stat
 import time
 
 from smoke import wait_for
+
+
+def rpc(row, request):
+    """Speak the peer socket protocol directly, as another sender would."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(10)
+        conn.connect(row["sock"])
+        conn.sendall(json.dumps(request).encode() + b"\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = conn.recv(65536)
+            assert chunk, "peer closed without a reply"
+            data += chunk
+    return json.loads(data)
 
 HEADER = "statuses are claims by the writer, not verified"
 
@@ -70,6 +85,28 @@ def run(h):
     assert "Offline checks passed" not in raw and "sneaky" not in raw
     assert stat.S_IMODE(h.state.stat().st_mode) == 0o700 and stat.S_IMODE(board_file.stat().st_mode) == 0o600
     print("PASS a real structured DONE report marks the entry done, claimed by the sender, keeping the task")
+
+    # A subagent's report is delivered like a message but never feeds the board.
+    original = board_file.read_bytes()
+    start = len(master.frames)
+    child = {"kind": "BLOCKED", "unit": "Child task", "blocker": "Waiting for a fixture", "nextAction": "Ask the parent"}
+    reply = rpc(master_row, {"op": "message", "report": child, "from": {"id": worker_id, "name": "worker-b"}, "subagent": True})
+    assert reply["ok"] is True, reply
+    wait_for(lambda: any(f.get("type") == "agent_end" for f in master.frames[start:]), seconds=30)
+    assert board_file.read_bytes() == original, "a subagent report changed the board"
+    print("PASS a subagent's report is delivered (the master takes a turn) but leaves the board untouched")
+
+    # An unreadable board never blocks a real report: the sender still gets ok, the receiver still takes its turn,
+    # a warning is shown, and the unreadable file is not overwritten.
+    board_file.write_text("{ not valid json")
+    start = len(master.frames)
+    sent = h.say(worker, f"/peers report {master_id} " + json.dumps(report))
+    assert sent == f"{master_name} ({master_id}): ok", sent
+    wait_for(lambda: any(f.get("type") == "agent_end" for f in master.frames[start:]), seconds=30)
+    assert any("report not recorded" in json.dumps(f) for f in master.frames[start:]), "no warning for the unrecorded report"
+    assert board_file.read_text() == "{ not valid json"
+    board_file.write_bytes(original)
+    print("PASS an unreadable board does not block a report: delivered, warned, and the file is left as it was")
 
     session_file = worker.call("get_state")["sessionFile"]
     worker.close()

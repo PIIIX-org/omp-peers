@@ -157,6 +157,8 @@ interface Req {
 	value?: unknown;
 	n?: number;
 	report?: Report;
+	/** Set by a sender whose report came from a subagent, not its main session; never feeds report-driven features. */
+	subagent?: boolean;
 }
 
 // Child agents share the main session's server; only one process may publish a logical session.
@@ -529,7 +531,7 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 			}
 			const from = req.from ?? { id: "?", name: "unknown" };
 			if (!rateOk(from.id)) return { ok: false, error: "rate limited" };
-			if (report && req.from && featureHostFor) {
+			if (report && req.from && featureHostFor && req.subagent !== true) {
 				// Only an explicit structured report feeds features; a failing hook never blocks delivery.
 				const host = featureHostFor(ctx);
 				for (const feature of FEATURES) {
@@ -851,7 +853,8 @@ export default function peers(pi: ExtensionAPI) {
 		const reportMaster = req.report ? masterId() : undefined;
 		const lines = await Promise.all(
 			targets.map(async t => {
-				const response = await call(t, { ...out, from: senderInfo() });
+				// A subagent's report must not stamp its parent's state: the receiver skips feature hooks for it.
+				const response = await call(t, { ...out, from: senderInfo(), ...(recordReport ? {} : { subagent: true }) });
 				if (req.op === "message" && req.report && recordReport && reportMaster === t.id && masterId() === t.id) {
 					notifications.reported(turn, req.report.kind, t, response);
 				}

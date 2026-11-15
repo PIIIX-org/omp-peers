@@ -238,8 +238,6 @@ export async function recordReport(host: FeatureHost, report: Report, from: { id
 	const updatedAt = host.now();
 	await updateState<BoardState, void>(boardFile(host.home), emptyState, validateState, current => {
 		const existing = current.entries.find(e => e.session === from.id);
-		// The same report delivered again (for example by a broadcast to several sessions) changes nothing.
-		if (existing && existing.source === "report" && existing.status === status && existing.unit === unit && !existing.note && existing.updatedBy === from.id) return { result: undefined };
 		if (!existing && current.entries.length >= MAX_ENTRIES) throw new Error(`board limit reached (${MAX_ENTRIES} entries); report from ${from.id} not recorded`);
 		const entry: BoardEntry = {
 			session: from.id,
