@@ -756,6 +756,7 @@ export default function peers(pi: ExtensionAPI) {
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
 				.map(p => ({ id: p.id, name: p.name })),
 			groupsOf: () => [],
+			acceptsRemote: () => state.inbound === "accept" && state.control,
 		};
 	};
 	pi.on("before_agent_start", async (event, ctx) => {

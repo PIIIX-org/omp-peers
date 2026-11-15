@@ -43,7 +43,7 @@ Adding a rule whose scope and text already exist is rejected and reports the exi
 
 On each main-agent start, the extension reads the rules file, selects the rules for that session and appends them to the system prompt through OMP's documented `before_agent_start` result (`systemPrompt`). The user's prompt is not changed. The text is not stored in the conversation, so a rule you remove is gone from the next agent start and cannot linger in earlier turns. Only the main session whose stable ID matches is affected; subagents are not. When no rule applies, nothing is injected. If the rules file cannot be read, the session starts without rules and a warning says why.
 
-Injected text lists the active rules most specific first, each tagged with its ID and scope (`- [r2 session] ...`).
+Injected text lists the active rules most specific first, each tagged with its ID and scope (`- [r2 session] ...`). A session that has run `/peers lock` or `/peers refuse` (or started with `OMP_PEERS_INBOUND=refuse`) is injected only rules it added itself; rules authored by other sessions are not injected until it accepts and unlocks again. Injection is capped at 8192 bytes: when the active rules do not fit, the first rule that does not fit and every lower-precedence rule after it are omitted and one line states how many. To keep this bounded, `add` refuses past 25 rules per scope or 100 rules in total.
 
 Limits: another extension that replaces the whole system prompt after this one can drop the rules. A host without `before_agent_start` system-prompt results is unsupported (OMP 18.18.1 is the pinned minimum); there is no fallback injection.
 
