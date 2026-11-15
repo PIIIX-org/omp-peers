@@ -6,6 +6,10 @@
 
 - Add `/peers rules` with global/group/session scopes, deterministic precedence, visible key conflicts, duplicate and credential rejection, master-gated changes, and a private cross-process-safe `rules.json`; matching rules are appended to the main session's system prompt at each agent start. Introduce the shared feature registry, private state store and real-OMP scenario runner (`npm run test:features`, `npm run test:features-smoke`).
 
+### Audit log
+
+- Add opt-in `/peers audit on|off|status|tail|clear --yes`: a private local record (`peer-state/audit.jsonl`, 0600, append-only, symlink/hard-link/owner/permission checks) of every master control attempt and outcome with sender claims kept as claims, no prompt text, setting values or transcripts, a fixed reason vocabulary, size and age retention with one rotated file, and write failures that never block the control op.
+
 ### Lifecycle cleanup
 
 - Pin the first bound session manager per process so extra ACP sessions cannot swap the peer identity or master claim; only the pinned manager's `session_switch` moves the logical identity; a switch from another manager is ignored. Document single-session-per-process behavior.

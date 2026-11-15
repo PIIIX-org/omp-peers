@@ -77,7 +77,7 @@ function writeAtomic(file: string, value: unknown): void {
 	}
 }
 
-async function acquire(lockPath: string, timeoutMs: number): Promise<FileLock> {
+export async function acquire(lockPath: string, timeoutMs: number): Promise<FileLock> {
 	const deadline = Date.now() + timeoutMs;
 	for (let attempt = 0; ; attempt++) {
 		const lock = FileLock.tryAcquire(lockPath);

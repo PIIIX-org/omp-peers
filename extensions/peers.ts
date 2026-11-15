@@ -28,6 +28,7 @@ import { formatActivity, initializeActivityHost, readActivity, type PeerActivity
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
 import { FEATURES } from "../lib/features";
+import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInput } from "../lib/features/audit";
 import type { FeatureHost } from "../lib/features/host";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
@@ -157,6 +158,8 @@ interface Req {
 	value?: unknown;
 	n?: number;
 	report?: Report;
+	/** Random id the sender attaches to a control op so both sides' audit records correlate. A claim, like `from`. */
+	request?: string;
 }
 
 // Child agents share the main session's server; only one process may publish a logical session.
@@ -503,7 +506,7 @@ async function settingOp(pi: ExtensionAPI, req: Req): Promise<Record<string, unk
 	return { ok: true, key, value: s.get(scope), provenance: s.provenance(scope) };
 }
 
-async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknown>> {
+async function handle(pi: ExtensionAPI, req: Req, trace: { masterChecked?: boolean } = {}): Promise<Record<string, unknown>> {
 	const ctx = state.ctx;
 	if (!ctx) return { ok: false, error: "session not ready" };
 	if (state.inbound === "refuse") return { ok: false, error: "peer refuses inbound requests" };
@@ -511,7 +514,8 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 	const text = typeof req.text === "string" ? req.text : "";
 	if (CONTROL_OPS.has(req.op)) {
 		if (!state.control) return { ok: false, error: "peer is locked (control refused)" };
-		if (!req.from?.id || masterId() !== req.from.id) return { ok: false, error: "sender is not the master session" };
+		trace.masterChecked = !!req.from?.id && masterId() === req.from.id;
+		if (!trace.masterChecked) return { ok: false, error: "sender is not the master session" };
 	}
 	switch (req.op) {
 		case "status":
@@ -608,6 +612,28 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 	}
 }
 
+// Local audit log (opt-in): the receiving session records every control attempt and its outcome. Recording never
+// throws and never blocks the op; `req.from` is only a claim, so records say "claimed actor".
+const auditWarn = (text: string) => state.ctx?.ui.notify(text, "warning");
+const auditRecord = (input: AuditInput) => auditLog.record(os.homedir(), Date.now(), input, auditWarn);
+
+async function handleAudited(pi: ExtensionAPI, req: Req): Promise<Record<string, unknown>> {
+	if (!CONTROL_OPS.has(req.op)) return handle(pi, req);
+	const base = {
+		request: validRequestId(req.request) ?? newRequestId(),
+		side: "receiver" as const,
+		actor: { id: req.from?.id, name: req.from?.name },
+		target: { id: state.id, name: pi.getSessionName() || state.saved.name || path.basename(state.ctx?.cwd ?? process.cwd()) },
+		op: req.op,
+		args: req,
+	};
+	await auditRecord({ ...base, phase: "attempted" });
+	const trace: { masterChecked?: boolean } = {};
+	const response = await handle(pi, req, trace).catch(e => ({ ok: false, error: String((e as Error)?.message ?? e) }));
+	await auditRecord({ ...base, phase: "completed", masterChecked: trace.masterChecked, result: classifyResponse(req.op, response) });
+	return response;
+}
+
 function startServer(pi: ExtensionAPI): void {
 	if (state.server || !state.sessionLock?.acquired) return;
 	fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 });
@@ -631,7 +657,7 @@ function startServer(pi: ExtensionAPI): void {
 				conn.end(`${JSON.stringify({ ok: false, error: "bad request" })}\n`);
 				return;
 			}
-			handle(pi, req)
+			handleAudited(pi, req)
 				.catch(e => ({ ok: false, error: String((e as Error)?.message ?? e) }))
 				.then(res => conn.end(`${JSON.stringify(res)}\n`));
 		});
@@ -835,7 +861,11 @@ export default function peers(pi: ExtensionAPI) {
 		const reportMaster = req.report ? masterId() : undefined;
 		const lines = await Promise.all(
 			targets.map(async t => {
-				const response = await call(t, { ...out, from: senderInfo() });
+				const request = CONTROL_OPS.has(req.op) ? newRequestId() : undefined;
+				const audit = request && { request, side: "sender" as const, actor: senderInfo(), target: t, op: req.op, args: req };
+				if (audit) await auditRecord({ ...audit, phase: "attempted" });
+				const response = await call(t, { ...out, from: senderInfo(), request });
+				if (audit) await auditRecord({ ...audit, phase: "completed", result: classifyResponse(req.op, response) });
 				if (req.op === "message" && req.report && recordReport && reportMaster === t.id && masterId() === t.id) {
 					notifications.reported(turn, req.report.kind, t, response);
 				}
