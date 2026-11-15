@@ -29,7 +29,7 @@ import { readMessage, sendIngressParameters, sendParameters, type Report } from 
 import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
 import { FEATURES } from "../lib/features";
 import type { FeatureHost } from "../lib/features/host";
-import { pauseSession, readPause, resumeSession, wakeGate } from "../lib/features/pause";
+import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
