@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 PIIIX-org contributors
 import type { zod } from "@oh-my-pi/pi-coding-agent";
+import type { Report } from "../reports";
+import { board } from "./board";
 import type { FeatureHost } from "./host";
 import { inbox } from "./inbox";
 import { locks } from "./locks";
+import { pause, resume } from "./pause";
 import { rules } from "./rules";
 
 /** An LLM tool a feature contributes. The extension registers it; the feature never imports host runtime values. */
@@ -24,9 +27,11 @@ export interface Feature {
 	command(args: string[], host: FeatureHost): Promise<string>;
 	/** Context added before this session's next agent start; undefined adds nothing. May throw. */
 	agentContext?(host: FeatureHost): string | undefined;
+	/** A structured report this session accepted; `from` is the sender's claimed identity, not authenticated. May reject. */
+	onReport?(report: Report, from: { id: string; name: string }, host: FeatureHost): Promise<void>;
 	/** LLM tools registered once at extension load; each call receives the calling session's host. */
 	tools?(): ToolSpec[];
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox, locks];
+export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks];

@@ -24,6 +24,12 @@ import time
 RPC_TIMEOUT = 2
 # Allow one bounded RPC plus time to persist state before launchd escalates.
 MANAGED_EXIT_TIMEOUT = RPC_TIMEOUT + 3
+# A paused recipient refuses every wake. Keep the digest queued and probe again only this rarely.
+PAUSED_RETRY_SECONDS = 30
+
+
+class PeerPaused(ConnectionError):
+    """The peer is explicitly paused: its wake gate refused the request. Not a fault; retry after it resumes."""
 
 
 def read_json(path):
@@ -112,6 +118,8 @@ def peer_rpc(peer, request, *, stop=None):
                 raise ConnectionError("peer response too large")
         remaining()  # A late acknowledgement cannot commit a cancelled delivery.
         response = json.loads(data.split(b"\n", 1)[0])
+        if isinstance(response, dict) and response.get("ok") is False and response.get("paused") is True:
+            raise PeerPaused("peer is paused")
         if not isinstance(response, dict) or response.get("ok") is not True:
             # Peer error text can contain private content. Do not copy it into logs.
             raise ConnectionError("peer refused notification")
@@ -506,6 +514,12 @@ class Watcher:
         try:
             peer_rpc(master, {"op": "message", "from": {"id": "completion-watcher", "name": "Completion watcher"},
                              "text": text}, stop=self.is_stopping)
+        except PeerPaused:
+            # The master is paused: every digest stays queued, unacknowledged, and the retry is slow and quiet.
+            self.next_send = time.monotonic() + PAUSED_RETRY_SECONDS
+            if not self.stopping:
+                self.report_error("notification deferred: the master session is paused; digests stay queued until it resumes")
+            return
         except (OSError, ValueError, ConnectionError) as error:
             if not self.stopping:
                 self.report_error("notification pending retry: " + type(error).__name__)
