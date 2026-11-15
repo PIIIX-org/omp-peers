@@ -6,6 +6,10 @@
 
 - Add `/peers groups list|add|remove|delete|members|preview` (private `groups.json`, keyed by stable session id, 64 groups of 64 members) and a `group:<name>` target for `/peers msg|report|do`, `peers_send` and `peers_control`: recipients that are paused (from the published registry flag; the receiver's wake gate stays authoritative), refusing inbound or locked (control ops) are skipped and listed as `skipped: <name> (<reason>)`; unknown, empty, no-recipient and unproven-duplicate-writer groups are explicit errors and `all` is unchanged. Group-scoped standing rules now match real membership.
 
+### Shared locks
+
+- Add `/peers locks` and the `peers_lock` tool: named locks and semaphores (capacity 1-64, TTL with renewal) stored in a private `locks.json` and acquired atomically across processes. A session holds at most one slot per name (a second acquire is refused; use renew). Contention returns `acquired`, `busy` (names the holders, never waits) or `refused`; only the owner releases, an unexpired lease is never stolen (including after a restart of the same session), expired leases are reclaimed lazily, `status` is read-only, and the master can `force-release` (a live lease only with `--yes-live`).
+
 ### Decision inbox
 
 - Add `/peers inbox` and the `peers_decision` tool: sessions queue deduplicated, credential-screened questions into a private cross-process-safe `inbox.json`; the master lists them grouped by source (read-only, never wakes a session) and answers, defers, reopens or retries them. An answer is sent once to the live asking session through the normal send path with the outcome recorded; otherwise it stays pending for `peers_decision check`. Extend the feature registry with `tools()` and the feature host with `send()`.
