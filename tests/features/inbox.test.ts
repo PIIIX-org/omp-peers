@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { FEATURES } from "../../lib/features";
 import type { FeatureHost, SendResult } from "../../lib/features/host";
-import { answerQuestion, askQuestion, checkQuestions, deferQuestion, inbox, inboxFile, readInbox, reopenQuestion, retryDelivery, type InboxState } from "../../lib/features/inbox";
+import { agentContext, answerQuestion, askQuestion, checkQuestions, deferQuestion, inbox, inboxFile, readInbox, reopenQuestion, retryDelivery, type InboxState } from "../../lib/features/inbox";
 
 const MASTER = "p00000000000000aa";
 const A = "p00000000000000a1";
@@ -366,6 +366,38 @@ describe("capacity", () => {
 		// Both delivered entries are gone; every remaining entry is unresolved, so there is no room.
 		expect(await askQuestion(host(B), { question: "overflow" })).toEqual({ ok: false, error: expect.stringContaining("inbox is full") });
 		expect(stored().entries).toHaveLength(500);
+	});
+
+	test("an inbox full of pending answers frees room oldest-answered-first; open and deferred entries stay; a master context line counts open questions", async () => {
+		const seed: InboxState = { version: 1, nextId: 501, entries: [] };
+		for (let i = 1; i <= 500; i++) {
+			const base = { id: `q${i}`, source: { id: A, name: "worker-a" }, question: `question ${i}`, dedupKey: `text:question ${i}`, createdAt: i };
+			if (i === 1) seed.entries.push({ ...base, state: "answered", resolution: "r", resolvedAt: 1, delivery: "pending" });
+			else if (i === 2) seed.entries.push({ ...base, state: "answered", resolution: "r", resolvedAt: 2, delivery: "undeliverable: peer refuses inbound requests" });
+			else if (i === 3) seed.entries.push({ ...base, state: "answered", resolution: "r", resolvedAt: 3, delivery: "delivered" });
+			else seed.entries.push({ ...base, state: i % 2 ? "open" : "deferred", delivery: "pending" });
+		}
+		fs.mkdirSync(path.dirname(inboxFile(home)), { recursive: true });
+		fs.writeFileSync(inboxFile(home), JSON.stringify(seed));
+		await ask(B, "one");
+		expect(stored().entries.some(e => e.id === "q3")).toBe(false);
+		expect(stored().entries.slice(0, 2).map(e => e.id)).toEqual(["q1", "q2"]);
+		await ask(B, "two");
+		expect(stored().entries.slice(0, 2).map(e => e.id)).toEqual(["q2", "q4"]);
+		await ask(B, "three");
+		expect(stored().entries.some(e => e.state === "answered")).toBe(false);
+		const full = await askQuestion(host(B), { question: "overflow" });
+		expect(full).toEqual({ ok: false, error: "inbox is full (500 entries, all open or deferred); answer some to free room" });
+		expect(stored().entries).toHaveLength(500);
+		expect(stored().entries.filter(e => e.state === "deferred").length).toBeGreaterThan(0);
+		// Answering frees room again, and the master sees a count line without question text.
+		const line = agentContext(master())!;
+		expect(line).toMatch(/^Decision inbox: \d+ open question\(s\) from other sessions \(q\d+, /);
+		expect(line).not.toContain("question 5");
+		expect(agentContext(host(A, false))).toBeUndefined();
+		expect(agentContext({ ...master(), acceptsRemote: () => false })).toBeUndefined();
+		fs.rmSync(inboxFile(home));
+		expect(agentContext(master())).toBeUndefined();
 	});
 });
 

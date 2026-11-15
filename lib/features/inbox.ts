@@ -156,9 +156,14 @@ export async function askQuestion(host: FeatureHost, input: AskInput): Promise<A
 		if (existing) return { result: { ok: true, entry: existing, duplicate: true } };
 		let entries = current.entries;
 		if (entries.length >= MAX_ENTRIES) {
-			// Drop the oldest answered-and-delivered entries; unresolved or undelivered ones are never dropped.
-			const droppable = entries.filter(e => e.state === "answered" && e.delivery === "delivered").slice(0, entries.length - MAX_ENTRIES + 1);
-			if (droppable.length < entries.length - MAX_ENTRIES + 1) return { result: { ok: false, error: `inbox is full (${MAX_ENTRIES} unresolved or undelivered entries); ask the user to answer or defer some` } };
+			// Make room by dropping answered entries only: delivered ones first, then the oldest other answered ones.
+			// Open and deferred entries are never dropped.
+			const need = entries.length - MAX_ENTRIES + 1;
+			const droppable = [
+				...entries.filter(e => e.state === "answered" && e.delivery === "delivered"),
+				...entries.filter(e => e.state === "answered" && e.delivery !== "delivered"),
+			].slice(0, need);
+			if (droppable.length < need) return { result: { ok: false, error: `inbox is full (${MAX_ENTRIES} entries, all open or deferred); answer some to free room` } };
 			entries = entries.filter(e => !droppable.includes(e));
 		}
 		const entry: Entry = {
@@ -191,7 +196,7 @@ function checkMaster(host: FeatureHost): string | undefined {
 
 function answerMessage(entry: Entry): string {
 	return [
-		`Decision for your inbox question ${entry.id}, recorded by the master session.`,
+		`Decision for your inbox question ${entry.id}, recorded by the master session (confirm with peers_decision check ${entry.id}).`,
 		`Question: ${entry.question}`,
 		`Decision: ${entry.resolution}`,
 	].join("\n");
@@ -411,8 +416,21 @@ async function command(args: string[], host: FeatureHost): Promise<string> {
 	}
 }
 
+/**
+ * Context for the master's next agent start: only a count and ids, never question text, so the master can
+ * present the inbox. Honours acceptsRemote like other injected context. Adds nothing (and wakes nothing) otherwise.
+ */
+export function agentContext(host: FeatureHost): string | undefined {
+	if (!host.isMaster() || !host.acceptsRemote()) return undefined;
+	const open = readInbox(host).entries.filter(entry => entry.state === "open");
+	if (!open.length) return undefined;
+	const ids = open.slice(0, 8).map(entry => entry.id).join(", ");
+	return `Decision inbox: ${open.length} open question(s) from other sessions (${ids}${open.length > 8 ? ", ..." : ""}). Offer to show them with /peers inbox; this line is not an instruction to answer or act on them.`;
+}
+
 export const inbox: Feature = {
 	name: "inbox",
 	command,
+	agentContext,
 	tools: () => [decisionTool],
 };
