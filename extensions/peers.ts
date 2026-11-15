@@ -27,6 +27,8 @@ import { Notifications } from "./notifications";
 import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
+import { FEATURES } from "../lib/features";
+import type { FeatureHost } from "../lib/features/host";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
@@ -741,6 +743,36 @@ export default function peers(pi: ExtensionAPI) {
 		state.tier = state.forcedTier ?? classify(event.prompt).tier;
 		state.forcedTier = undefined;
 	});
+	// Feature context (e.g. standing rules) is appended through the host's documented before_agent_start `systemPrompt` result.
+	// It applies to the next request only and is never stored in the conversation, so a removed rule cannot linger in history.
+	const featureHost = (ctx: ExtensionContext): FeatureHost => {
+		const id = stablePeerId(ctx.sessionManager.getSessionId());
+		return {
+			home: os.homedir(),
+			now: Date.now,
+			self: () => ({ id, name: pi.getSessionName() || state.saved.name || path.basename(ctx.cwd) }),
+			isMaster: () => masterId() === id,
+			peers: async () => (await listPeers())
+				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
+				.map(p => ({ id: p.id, name: p.name, acceptsRemote: p.inbound === "accept" && p.control })),
+			groupsOf: () => [],
+			acceptsRemote: () => state.inbound === "accept" && state.control,
+		};
+	};
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
+		const host = featureHost(ctx);
+		const blocks: string[] = [];
+		for (const feature of FEATURES) {
+			try {
+				const block = feature.agentContext?.(host);
+				if (block) blocks.push(block);
+			} catch (error) {
+				ctx.ui.notify(`peers ${feature.name}: not injected: ${(error as Error).message}`, "warning");
+			}
+		}
+		if (blocks.length) return { systemPrompt: [...event.systemPrompt, blocks.join("\n\n")] };
+	});
 	// Operator task pins win over both peer overrides and automatic tiering.
 	pi.on("before_subagent_spawn", async (event, ctx) => {
 		const pinned = await operatorPinned(pi, event.agent);
@@ -895,13 +927,15 @@ export default function peers(pi: ExtensionAPI) {
 	const ACTIONS = ["message", "prompt", "tail", "abort", "compact", "rename", "model", "effort", "subagents", "shutdown"] as const;
 	pi.registerCommand("peers", {
 		description:
-			"Peer sessions: /peers [list|master|release|msg <peer> <text>|report <peer> <json-report>|do <peer|all> <action> [text]|set <peer|all> <get|set|clear|list> <key> [json]|route [on|off]|pin|unpin|accept|refuse|lock|unlock]",
+			`Peer sessions: /peers [list|master|release|msg <peer> <text>|report <peer> <json-report>|do <peer|all> <action> [text]|set <peer|all> <get|set|clear|list> <key> [json]|route [on|off]|pin|unpin|accept|refuse|lock|unlock${FEATURES.map(f => `|${f.name} ...`).join("")}]`,
 		handler: async (args, ctx) => {
 			refresh(ctx);
 			const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			const m = masterId();
 			const say = (s: string) => ctx.ui.notify(s, "info");
 			if (!state.sessionLock?.acquired) return say(state.identityError || "session identity unavailable");
+			const feature = FEATURES.find(f => f.name === sub);
+			if (feature) return say(await feature.command(rest, featureHost(ctx)));
 			switch (sub) {
 				case "list": {
 					return say((await listPeers()).map(p => fmt(p, m)).join("\n") || "(no peers)");
