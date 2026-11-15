@@ -171,12 +171,10 @@ async function resumeCommand(args: string[], host: FeatureHost): Promise<string>
 
 export const pause: Feature = {
 	name: "pause",
-	summary: "Refuse wake-triggering peer traffic to this session until resumed",
 	command: pauseCommand,
 };
 
 export const resume: Feature = {
 	name: "resume",
-	summary: "Clear this session's pause",
 	command: resumeCommand,
 };

@@ -24,6 +24,7 @@ function host(self: string): FeatureHost {
 		now: () => NOW,
 		self: () => ({ id: self, name: NAMES[self] }),
 		isMaster: () => false,
+		acceptsRemote: () => true,
 		peers: async () => [],
 		groupsOf: () => [],
 	};
