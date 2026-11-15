@@ -28,7 +28,7 @@ import { formatActivity, initializeActivityHost, readActivity, type PeerActivity
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
 import { FEATURES } from "../lib/features";
-import type { FeatureHost } from "../lib/features/host";
+import type { FeatureHost, SendResult } from "../lib/features/host";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
@@ -773,6 +773,7 @@ export default function peers(pi: ExtensionAPI) {
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
 				.map(p => ({ id: p.id, name: p.name, acceptsRemote: p.inbound === "accept" && p.control })),
 			groupsOf: () => [],
+			send: (to, req) => sendTo(to, req.text),
 			acceptsRemote: () => state.inbound === "accept" && state.control,
 		};
 	};
@@ -864,6 +865,22 @@ export default function peers(pi: ExtensionAPI) {
 		return note + lines.join("\n");
 	}
 
+	/** One message to one live session by stable id, through the same resolution and socket path as fanout(). */
+	async function sendTo(to: string, text: string): Promise<SendResult> {
+		if (!state.sessionLock?.acquired) return { status: "failed", reason: state.identityError || "session identity unavailable" };
+		let message: ReturnType<typeof readMessage>;
+		try {
+			message = readMessage({ text });
+		} catch (error) {
+			return { status: "failed", reason: `invalid message: ${(error as Error).message}` };
+		}
+		if (!(await listPeers()).some(p => p.id === to)) return { status: "offline" };
+		const { peers: targets, error } = await resolveTargets(to);
+		if (error || targets.length !== 1 || targets[0].id !== to) return { status: "failed", reason: error ?? "target is ambiguous" };
+		const response = await call(targets[0], { op: "message", text: message.text, from: senderInfo() });
+		return response.ok ? { status: "delivered" } : { status: "failed", reason: String(response.error) };
+	}
+
 	// ---- LLM tools -------------------------------------------------------------------------
 	pi.registerTool({
 		name: "peers_list",
@@ -895,6 +912,22 @@ export default function peers(pi: ExtensionAPI) {
 			return { content: [{ type: "text", text }], details: {}, ...(text.startsWith("error:") ? { isError: true } : {}) };
 		},
 	});
+
+	for (const feature of FEATURES) {
+		for (const spec of feature.tools?.() ?? []) {
+			pi.registerTool({
+				name: spec.name,
+				label: spec.label,
+				description: spec.description,
+				parameters: spec.parameters(z),
+				async execute(_id, p: unknown, _signal, _onUpdate, ctx) {
+					if (!state.sessionLock?.acquired) return { content: [{ type: "text", text: `error: ${state.identityError || "session identity unavailable"}` }], details: {}, isError: true };
+					const out = await spec.execute((p ?? {}) as Record<string, unknown>, featureHost(ctx.agent.kind === "main" ? ctx : (state.ctx ?? ctx)));
+					return { content: [{ type: "text", text: out.text }], details: {}, ...(out.isError ? { isError: true } : {}) };
+				},
+			});
+		}
+	}
 
 	const controlParameters = z.object({
 		to: z.string().describe("Stable peer id, name (or unique prefix), or 'all'"),
