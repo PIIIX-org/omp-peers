@@ -45,11 +45,12 @@ describe("wake gate decision table", () => {
 		expect(wakeGate(paused, "prompt")).toEqual({ allow: false, result: { ok: false, status: "refused", paused: true, error: "session is paused" } });
 	});
 
-	test("paused: every non-wake op stays available", () => {
-		for (const op of ["status", "tail", "abort", "rename", "compact", "model", "effort", "subagents", "setting", "shutdown", "pause", "resume"]) {
+	test("paused: every non-wake op stays available; resume is not an op at all", () => {
+		for (const op of ["status", "tail", "abort", "rename", "compact", "model", "effort", "subagents", "setting", "shutdown", "pause"]) {
 			expect(wakeGate(paused, op)).toEqual({ allow: true });
 		}
-		expect([...NON_WAKE_OPS].sort()).toEqual(["abort", "compact", "effort", "model", "pause", "rename", "resume", "setting", "shutdown", "status", "subagents", "tail"]);
+		expect([...NON_WAKE_OPS].sort()).toEqual(["abort", "compact", "effort", "model", "pause", "rename", "setting", "shutdown", "status", "subagents", "tail"]);
+		expect(wakeGate(paused, "resume")).toEqual({ allow: false, result: { ok: false, status: "refused", paused: true, error: "session is paused" } });
 	});
 
 	test("paused: an op the table has never heard of fails closed", () => {
