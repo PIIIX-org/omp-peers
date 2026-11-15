@@ -911,7 +911,7 @@ export default function peers(pi: ExtensionAPI) {
 			return { status: "failed", reason: `invalid message: ${(error as Error).message}` };
 		}
 		if (!(await listPeers()).some(p => p.id === to)) return { status: "offline" };
-		const { peers: targets, error } = await resolveTargets(to);
+		const { peers: targets, error } = await resolveTargets(to, "message");
 		if (error || targets.length !== 1 || targets[0].id !== to) return { status: "failed", reason: error ?? "target is ambiguous" };
 		const response = await call(targets[0], { op: "message", text: message.text, from: senderInfo() });
 		return response.ok ? { status: "delivered" } : { status: "failed", reason: String(response.error) };

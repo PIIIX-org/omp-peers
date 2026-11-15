@@ -55,6 +55,7 @@ function host(self: string, master = self === "master"): FeatureHost {
 			const result = resolvePeerTargets(`group:${name}`, await roster(), selfId, self, groupTargeting(home, op));
 			return { recipients: result.peers.map(p => ({ id: logicalId(p), name: p.name })), skipped: result.skipped ?? [], error: result.error };
 		},
+		send: async () => ({ status: "offline" }),
 	};
 }
 const say = (args: string, self = "master") => groups.command(args.split(/\s+/).filter(Boolean), host(self));

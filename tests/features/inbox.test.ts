@@ -36,6 +36,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 		acceptsRemote: () => true,
 		peers: async () => live.map(id => ({ id, name: NAMES[id] })),
 		groupsOf: () => [],
+		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		send: async (to, req) => {
 			sent.push({ to, text: req.text });
 			return outcome;
