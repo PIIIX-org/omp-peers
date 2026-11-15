@@ -63,6 +63,10 @@ Duplicate registrations remain visible; listing never deletes a live duplicate. 
 
 Broadcasts deliver once per logical session, using its proved canonical writer when aliases exist. If any duplicate logical session has no proved writer, the entire broadcast fails before delivery and lists actionable IDs; send to an explicit ID instead. Unique legacy sessions and same-name distinct sessions continue to receive ordinary broadcasts.
 
+### Optional features
+
+- Standing rules: `/peers rules add|remove|list|explain` stores scoped (global, group, session) instructions once and appends the matching ones at each main-agent start. See [docs/features/rules.md](docs/features/rules.md).
+
 ### Tools
 
 - `peers_list`: list sessions, models, effort, busy/idle state, background job/subagent counts, settled state, context usage, and the master.

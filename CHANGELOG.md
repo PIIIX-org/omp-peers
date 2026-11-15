@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Standing rules
+
+- Add `/peers rules` with global/group/session scopes, deterministic precedence, visible key conflicts, duplicate and credential rejection, master-gated changes, and a private cross-process-safe `rules.json`; matching rules are appended to the main session's system prompt at each agent start. Introduce the shared feature registry, private state store and real-OMP scenario runner (`npm run test:features`, `npm run test:features-smoke`).
+
 ### Structured reports
 
 - Replace kind-only markers with strict DONE/BLOCKED/WAITING/DECISION objects, per-kind required human fields, explicit WAITING background state and separate DONE evidence references.

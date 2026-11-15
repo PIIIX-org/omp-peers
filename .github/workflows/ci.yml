@@ -45,11 +45,13 @@ jobs:
         run: npm run test:reports
       - name: Check duplicate peer identity regressions
         run: npm run test:identity
+      - name: Check feature store and standing rules
+        run: npm run test:features
       - name: Compile Python and run watcher, routing and scanner tests
         env:
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}/omp-peers-pycache
         run: |
-          python3 -m py_compile tools/watch.py tools/install_watcher.py tests/smoke.py tests/activity_smoke.py tests/routing_smoke.py tests/test_routing.py tests/test_watcher.py tests/test_leak_scan.py scripts/leak_scan.py
+          python3 -m py_compile tools/watch.py tools/install_watcher.py tests/smoke.py tests/activity_smoke.py tests/routing_smoke.py tests/features_smoke.py tests/scenarios/*.py tests/test_routing.py tests/test_watcher.py tests/test_leak_scan.py scripts/leak_scan.py
           npm run test:watcher
       - name: Exercise two real pinned OMP processes without provider calls
         run: npm run test:smoke
@@ -57,3 +59,5 @@ jobs:
         run: npm run test:activity-smoke
       - name: Exercise actual OMP pin and upstream routing with a loopback fake gateway
         run: npm run test:routing-smoke
+      - name: Exercise feature scenarios in real pinned OMP processes with a loopback fake gateway
+        run: npm run test:features-smoke
