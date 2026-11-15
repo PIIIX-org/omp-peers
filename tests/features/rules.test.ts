@@ -219,7 +219,15 @@ describe("matching, precedence and conflicts", () => {
 		expect(out).toContain("1. r2  group:web  [key=tests]  run Y");
 		expect(out).toContain("2. r3  global  be brief");
 		expect(out).toContain("overridden: r1  global  [key=tests]  run X  -- conflicts with r2");
-		expect(out).toContain("injection: 2 rule(s)");
+		expect(out).toContain("injection: 2 of 2 rule(s)");
+		const lockedPeers = { ...master(), peers: async () => PEERS.map(peer => peer.id === A ? { ...peer, acceptsRemote: false } : peer) };
+		const lockedView = await rules.command(["explain", A], lockedPeers);
+		expect(lockedView).toContain("only rules this session added itself are injected");
+		expect(lockedView).toContain("injection: none; no rules apply");
+		await addRule(host(A, false), `session:${A}`, "self rule");
+		expect(await rules.command(["explain", A], lockedPeers)).toContain("injection: 1 of 1 rule(s)");
+		const offline = await run("explain p00000000000000f9");
+		expect(offline).toContain("inbound state unknown");
 		groups[B] = [];
 		expect(await run(`explain ${B}`)).toContain("1. r1  global  [key=tests]  run X");
 		expect(await run("explain nobody")).toContain("error: no live peer matches");
@@ -320,9 +328,14 @@ describe("injection", () => {
 		expect(!total.ok && total.error).toContain("rule limit");
 		groups[A] = ["g1", "g2", "g3"];
 		const text = injected(A)!;
-		expect(text.length).toBeLessThanOrEqual(8192 + 200);
+		expect(Buffer.byteLength(text)).toBeLessThanOrEqual(8192);
+		const omitted = Number(/\((\d+) lower-precedence/.exec(text)![1]);
+		const injectedCount = lines(text).length - 1; // the omission note is a list line too
 		expect(text).toMatch(/\(\d+ lower-precedence rule\(s\) omitted: 8192-byte injection cap\)/);
 		expect(text).toBe(injected(A)!);
+		const explained = await run(`explain ${A}`);
+		expect(explained).toContain(`injection: ${injectedCount} of ${injectedCount + omitted} rule(s)`);
+		expect(explained).toContain(`${omitted} omitted: 8192-byte injection cap`);
 	});
 });
 

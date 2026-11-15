@@ -6,6 +6,8 @@ export interface PeerView {
 	/** Stable peer id. */
 	id: string;
 	name: string;
+	/** Whether the peer accepts requests from others (published inbound/control state); undefined when unknown. */
+	acceptsRemote?: boolean;
 }
 
 /** Outcome of delivering one message to one peer through the extension's normal send path. */
