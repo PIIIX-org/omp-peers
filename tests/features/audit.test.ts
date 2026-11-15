@@ -29,6 +29,7 @@ const host = (): FeatureHost => ({
 	acceptsRemote: () => true,
 	peers: async () => [],
 	groupsOf: () => [],
+	send: async () => ({ status: "offline" }),
 });
 const cmd = (args: string, log = new AuditLog()) => auditCommand(args.split(/\s+/).filter(Boolean), host(), log);
 const paths = () => auditPaths(home);
