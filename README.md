@@ -70,6 +70,7 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 ### Optional features
 
 - Standing rules: `/peers rules add|remove|list|explain` stores scoped (global, group, session) instructions once and appends the matching ones at each main-agent start. See [docs/features/rules.md](docs/features/rules.md).
+- Decision inbox: sessions queue short user questions with `peers_decision` or `/peers inbox ask`; the master lists, answers or defers them with `/peers inbox`, and an answer is sent once to the live asking session. See [docs/features/inbox.md](docs/features/inbox.md).
 - Audit log: `/peers audit on|off|status|tail|clear --yes` keeps an opt-in, private, local record of master control attempts and outcomes (no prompt text, setting values or transcripts). See [docs/features/audit.md](docs/features/audit.md).
 
 ### Tools
