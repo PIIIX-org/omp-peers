@@ -822,6 +822,141 @@ class SocketChecks(unittest.TestCase):
                 self.assertEqual(captured, [{"op": "message", "text": "metadata test"}])
 
 
+PAUSED = {"ok": False, "status": "deferred", "paused": True, "error": "session is paused"}
+
+
+class FakeMaster:
+    """A real Unix-socket peer that answers like the extension's receiver: refuses wakes while paused."""
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.paused = True
+        self.requests = []
+        self.delivered = []
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(self.path)
+        self.server.listen(8)
+        self.server.settimeout(0.05)
+        self.closing = threading.Event()
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        while not self.closing.is_set():
+            try:
+                conn = self.server.accept()[0]
+            except socket.timeout:
+                continue
+            with conn:
+                conn.settimeout(5)
+                request = json.loads(conn.makefile("rb").readline())
+                self.requests.append(request)
+                if request["op"] == "message" and self.paused:
+                    reply = PAUSED
+                else:
+                    if request["op"] == "message":
+                        self.delivered.append(request)
+                    reply = {"ok": True}
+                conn.sendall(json.dumps(reply).encode() + b"\n")
+
+    def close(self):
+        self.closing.set()
+        self.thread.join(timeout=5)
+        self.server.close()
+
+
+class PausedMasterChecks(unittest.TestCase):
+    """Delivery through the real RPC to a master whose wake gate refuses while it is paused."""
+
+    peer = WatcherChecks.peer
+    master = WatcherChecks.master
+
+    def setUp(self):
+        WatcherChecks.setUp(self)
+        self.fake = FakeMaster(self.home / "pmaster.sock")
+        self.addCleanup(self.fake.close)
+        row = self.master()
+        row["sock"] = self.fake.path
+        (self.registry / "pmaster.json").write_text(json.dumps(row))
+
+    def attempt(self, watcher=None):
+        watcher = watcher or self.watcher
+        watcher.next_send = 0  # Bypass only the retry delay under test; every other gate stays real.
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            watcher.deliver({})
+        return stderr.getvalue()
+
+    def test_rpc_distinguishes_a_paused_refusal_from_other_refusals(self):
+        with self.assertRaises(watch.PeerPaused):
+            watch.peer_rpc({"sock": self.fake.path}, {"op": "message", "text": "x"})
+        self.assertTrue(issubclass(watch.PeerPaused, ConnectionError))
+        for reply in ({"ok": False, "error": "peer refuses inbound requests"},
+                      {"ok": False, "paused": False, "error": "other"}, {"ok": True, "paused": True}):
+            with patch.object(watch.socket, "socket") as create:
+                create.return_value.__enter__.return_value.recv.return_value = json.dumps(reply).encode() + b"\n"
+                try:
+                    watch.peer_rpc({"sock": "synthetic.sock"}, {"op": "message"})
+                except watch.PeerPaused:
+                    self.fail("only an explicit paused refusal is a pause: " + json.dumps(reply))
+                except ConnectionError:
+                    self.assertIsNot(reply.get("ok"), True)
+
+    def test_paused_master_keeps_the_event_queued_quietly_and_delivers_once_after_resume(self):
+        self.watcher.enqueue("worker-session", "worker", "turn-1", "agent_end", "agent loop ended")
+        self.watcher.save()
+        event = self.watcher.state["outbox"][0]["event"]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            warnings = [self.attempt() for _ in range(3)]
+        # Refused each time it was tried, never marked delivered, never dropped, and persisted for a restart.
+        self.assertEqual(len(self.fake.requests), 3)
+        self.assertEqual(self.fake.delivered, [])
+        self.assertEqual([e["event"] for e in self.watcher.state["outbox"]], [event])
+        self.assertEqual([e["event"] for e in state_ready(self.watcher.state_file)["outbox"]], [event])
+        self.assertNotIn("next_digest_at", self.watcher.state)
+        self.assertNotIn("WATCHER_DELIVERED", output.getvalue())
+        # Bounded noise: one distinct warning for the whole paused period, with no peer text in it.
+        self.assertEqual(sum("deferred" in w for w in warnings), 1, warnings)
+        self.assertEqual(warnings[0], "WATCHER_WARNING notification deferred: the master session is paused; digests stay queued until it resumes\n")
+        # Bounded traffic: without the test bypass the watcher does not probe again before the slow retry.
+        before = len(self.fake.requests)
+        self.watcher.deliver({})
+        self.assertEqual(len(self.fake.requests), before)
+        self.assertGreater(self.watcher.next_send, watch.time.monotonic() + watch.PAUSED_RETRY_SECONDS - 5)
+        # Resume: the next attempt delivers the original event exactly once and empties the queue.
+        self.fake.paused = False
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self.attempt(), "")
+            self.attempt()
+        self.assertEqual(len(self.fake.delivered), 1)
+        self.assertIn(event, self.fake.delivered[0]["text"])
+        self.assertEqual(output.getvalue().count("WATCHER_DELIVERED"), 1)
+        self.assertEqual(self.watcher.state["outbox"], [])
+        self.assertEqual(state_ready(self.watcher.state_file)["outbox"], [])
+
+    def test_queued_event_survives_watcher_restart_while_the_master_stays_paused(self):
+        self.watcher.enqueue("worker-session", "worker", "turn-1", "agent_end", "agent loop ended")
+        self.watcher.save()
+        event = self.watcher.state["outbox"][0]["event"]
+        self.attempt()
+        restarted = watch.Watcher(self.home, self.home / "watcher", digest_interval=0)
+        restarted.load()
+        self.assertEqual([e["event"] for e in restarted.state["outbox"]], [event])
+        self.attempt(restarted)
+        self.assertEqual(self.fake.delivered, [])
+        self.fake.paused = False
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.attempt(restarted)
+        self.assertEqual(len(self.fake.delivered), 1)
+        self.assertIn(event, self.fake.delivered[0]["text"])
+        self.assertEqual(restarted.state["outbox"], [])
+
+    def test_status_probe_still_works_while_paused(self):
+        self.assertEqual(watch.peer_rpc({"sock": self.fake.path}, {"op": "status"}), {"ok": True})
+
+
 class ProcessChecks(unittest.TestCase):
     def test_sigterm_cancels_stalled_rpc_preserving_twenty_events(self):
         for operation in ("status", "message"):

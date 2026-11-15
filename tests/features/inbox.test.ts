@@ -246,6 +246,19 @@ describe("answer delivery", () => {
 		expect(checkQuestions(host(A), "q1")).toEqual({ ok: true, text: expect.stringContaining("delivery: undeliverable: rate limited") });
 	});
 
+	test("an answer to a paused asking session is stored as undeliverable and the asker can still read it with check", async () => {
+		await ask(A, "Ship it?");
+		outcome = { status: "failed", reason: "session is paused" };
+		const reply = await run("answer q1 yes");
+		expect(stored().entries[0].delivery).toBe("undeliverable: session is paused");
+		expect(reply).toContain("session is paused");
+		expect(reply).toContain("only that session's own user can /peers resume");
+		expect(checkQuestions(host(A), "q1")).toEqual({ ok: true, text: expect.stringContaining("delivery: undeliverable: session is paused") });
+		outcome = { status: "delivered" };
+		await retryDelivery(master(), "q1");
+		expect(stored().entries[0].delivery).toBe("delivered");
+	});
+
 	test("an offline source keeps the resolution, stays pending, is read by check, and retry delivers once it is live", async () => {
 		await ask(A, "Ship it?");
 		outcome = { status: "offline" };

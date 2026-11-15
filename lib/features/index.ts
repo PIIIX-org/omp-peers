@@ -6,6 +6,7 @@ import { board } from "./board";
 import type { FeatureHost } from "./host";
 import { audit } from "./audit";
 import { inbox } from "./inbox";
+import { pause, resume } from "./pause";
 import { rules } from "./rules";
 
 /** An LLM tool a feature contributes. The extension registers it; the feature never imports host runtime values. */
@@ -33,4 +34,4 @@ export interface Feature {
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox, board, audit];
+export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, audit];

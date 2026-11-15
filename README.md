@@ -72,13 +72,14 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 - Standing rules: `/peers rules add|remove|list|explain` stores scoped (global, group, session) instructions once and appends the matching ones at each main-agent start. See [docs/features/rules.md](docs/features/rules.md).
 - Decision inbox: sessions queue short user questions with `peers_decision` or `/peers inbox ask`; the master lists, answers or defers them with `/peers inbox`, and an answer is sent once to the live asking session. See [docs/features/inbox.md](docs/features/inbox.md).
 - Session task board: `/peers board list|assign|set|clear|stale` keeps a persisted board of each session's assigned task and last reported status (stable-ID keyed, honest about stale and unknown). See [docs/features/board.md](docs/features/board.md).
+- Pause and resume: `/peers pause [reason]` and `/peers resume` persistently stop automated wakes (master messages and prompts, watcher digests) of a session until you resume it; status and listing still work. See [docs/features/pause.md](docs/features/pause.md).
 - Audit log: `/peers audit on|off|status|tail|clear --yes` keeps an opt-in, private, local record of master control attempts and outcomes (no prompt text, setting values or transcripts). See [docs/features/audit.md](docs/features/audit.md).
 
 ### Tools
 
 - `peers_list`: list sessions, models, effort, busy/idle state, background job/subagent counts, settled state, context usage, and the master.
 - `peers_send`: deliver an agent-attributed message to a peer or `all`. Supply either `text` for an ordinary message or `report` for a structured report, never both. Reports deliver immediately; successful same-turn main-session delivery to the current master can suppress a redundant watcher notice.
-- `peers_control`: master-only prompt, abort, compact, model, effort, subagents, setting, rename, tail, or shutdown. `status` does not require master ownership.
+- `peers_control`: master-only prompt, abort, compact, model, effort, subagents, setting, rename, tail, shutdown, or pause. `status` does not require master ownership. There is no remote resume: only the paused session's own user can run `/peers resume`.
 
 A message to an idle peer can start a model turn and consume its provider quota. A master's `prompt` starts or queues user work. `abort`, `compact`, and `shutdown` affect running sessions; review your target before sending them. Status and tail inspect local state without asking a model.
 
