@@ -2,9 +2,13 @@
 
 ## Unreleased
 
+### Decision inbox
+
+- Add `/peers inbox` and the `peers_decision` tool: sessions queue deduplicated, credential-screened questions into a private cross-process-safe `inbox.json`; the master lists them grouped by source (read-only, never wakes a session) and answers, defers, reopens or retries them. An answer is sent once to the live asking session through the normal send path with the outcome recorded; otherwise it stays pending for `peers_decision check`. Extend the feature registry with `tools()` and the feature host with `send()`.
+
 ### Pause and resume
 
-- Add `/peers pause [reason]`, `/peers resume` and master-only `pause`/`resume` control ops: a persisted per-session state (`pause.json`, also published as `paused`/`pausedSince` in the registry) enforced by one receiver-side wake gate (`wakeGate`) that refuses `message` and `prompt` with a structured deferred/refused result while status, tail and the other non-wake ops stay available. Senders print `deferred: <name> is paused`; the completion watcher keeps its digest queued with bounded retries and delivers it once after resume.
+- Add `/peers pause [reason]`, `/peers resume` and a master-only `pause` control op. Resume is user-controlled: only the paused session's own `/peers resume` clears a pause, and no remote caller, including the master's agent, can. State is persisted per session (`pause.json`, also published as `paused`/`pausedSince` in the registry) and enforced by one receiver-side wake gate (`wakeGate`) that refuses `message` and `prompt` with a structured deferred/refused result while status, tail and the other non-wake ops stay available. Senders print `not delivered: <name> is paused; resend after its user resumes it`; the completion watcher keeps its digest queued with bounded retries and delivers it once after resume.
 
 ### Standing rules
 

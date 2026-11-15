@@ -27,6 +27,7 @@ function host(self: string): FeatureHost {
 		acceptsRemote: () => true,
 		peers: async () => [],
 		groupsOf: () => [],
+		send: async () => ({ status: "offline" }),
 	};
 }
 const stored = (): PauseState => JSON.parse(fs.readFileSync(pauseFile(home), "utf8"));
