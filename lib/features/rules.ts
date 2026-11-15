@@ -12,6 +12,7 @@
 import * as path from "node:path";
 import type { FeatureHost, PeerView } from "./host";
 import type { Feature } from "./index";
+import { looksLikeSecret } from "./secrets";
 import { readState, stateRoot, updateState } from "./store";
 
 export interface Rule {
@@ -46,15 +47,6 @@ const KEY_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 const PEER_ID_RE = /^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
 const RULE_ID_RE = /^r[1-9][0-9]*$/;
 const MASTER_ONLY = "only the master session may change rules that apply to other sessions; run /peers master first";
-
-// Conservative credential patterns (same families as scripts/leak_scan.py, plus URL userinfo).
-const SECRET_PATTERNS: RegExp[] = [
-	/\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{16,}|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})\b/,
-	/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
-	/["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?token|token|client[_-]?secret|secret|passwd|password)["']?\s*[:=]\s*["']?[A-Za-z0-9_./+~=-]{12,}/i,
-	/\bBearer\s+[A-Za-z0-9_./+~=-]{16,}/i,
-	/:\/\/[^\s/:@]+:[^\s/@]+@/,
-];
 
 export const rulesFile = (home: string) => path.join(stateRoot(home), "rules.json");
 
@@ -141,7 +133,7 @@ export function renderInjection(entries: Effective[]): string | undefined {
 
 /** Error text when `text` looks like a credential; never echoes the match. */
 export function screenText(text: string): string | undefined {
-	return SECRET_PATTERNS.some(pattern => pattern.test(text))
+	return looksLikeSecret(text)
 		? "rule text looks like a credential or token; rules are stored in plain text and injected into prompts. Describe where the secret lives instead of including it"
 		: undefined;
 }

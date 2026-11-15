@@ -13,6 +13,7 @@ const host: FeatureHost = {
 	isMaster: () => true,
 	peers: async () => [],
 	groupsOf: () => [],
+	send: async () => ({ status: "offline" }),
 };
 for (let i = 0; i < Number(count); i++) {
 	const result = await addRule(host, "global", `${tag} rule ${i}`);

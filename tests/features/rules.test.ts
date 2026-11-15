@@ -29,6 +29,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 		isMaster: () => master,
 		peers: async () => PEERS,
 		groupsOf: peerId => groups[peerId] ?? [],
+		send: async () => ({ status: "offline" }),
 	};
 }
 const master = () => host(MASTER);
