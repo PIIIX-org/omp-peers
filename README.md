@@ -66,12 +66,13 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 ### Optional features
 
 - Standing rules: `/peers rules add|remove|list|explain` stores scoped (global, group, session) instructions once and appends the matching ones at each main-agent start. See [docs/features/rules.md](docs/features/rules.md).
+- Pause and resume: `/peers pause [reason]` and `/peers resume` persistently stop automated wakes (master messages and prompts, watcher digests) of a session until you resume it; status and listing still work. See [docs/features/pause.md](docs/features/pause.md).
 
 ### Tools
 
 - `peers_list`: list sessions, models, effort, busy/idle state, background job/subagent counts, settled state, context usage, and the master.
 - `peers_send`: deliver an agent-attributed message to a peer or `all`. Supply either `text` for an ordinary message or `report` for a structured report, never both. Reports deliver immediately; successful same-turn main-session delivery to the current master can suppress a redundant watcher notice.
-- `peers_control`: master-only prompt, abort, compact, model, effort, subagents, setting, rename, tail, or shutdown. `status` does not require master ownership.
+- `peers_control`: master-only prompt, abort, compact, model, effort, subagents, setting, rename, tail, shutdown, pause, or resume. `status` does not require master ownership.
 
 A message to an idle peer can start a model turn and consume its provider quota. A master's `prompt` starts or queues user work. `abort`, `compact`, and `shutdown` affect running sessions; review your target before sending them. Status and tail inspect local state without asking a model.
 

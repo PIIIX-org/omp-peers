@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Pause and resume
+
+- Add `/peers pause [reason]`, `/peers resume` and master-only `pause`/`resume` control ops: a persisted per-session state (`pause.json`, also published as `paused`/`pausedSince` in the registry) enforced by one receiver-side wake gate (`wakeGate`) that refuses `message` and `prompt` with a structured deferred/refused result while status, tail and the other non-wake ops stay available. Senders print `deferred: <name> is paused`; the completion watcher keeps its digest queued with bounded retries and delivers it once after resume.
+
 ### Standing rules
 
 - Add `/peers rules` with global/group/session scopes, deterministic precedence, visible key conflicts, duplicate and credential rejection, master-gated changes, and a private cross-process-safe `rules.json`; matching rules are appended to the main session's system prompt at each agent start. Introduce the shared feature registry, private state store and real-OMP scenario runner (`npm run test:features`, `npm run test:features-smoke`).
