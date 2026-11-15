@@ -111,3 +111,95 @@ describe("duplicate peer identities", () => {
 		expect(resolvePeerTargets("One", roster, self.id, self.sessionId).peers).toEqual([roster[0]]);
 	});
 });
+
+describe("group targets", () => {
+	const reasons: Record<string, string> = {};
+	const targeting = (groups: Record<string, string[]>) => ({
+		members: (name: string) => (Object.hasOwn(groups, name) ? groups[name] : undefined),
+		skip: (peer: { name: string }) => reasons[peer.name],
+	});
+	const resolve = async (spec: string, rows: ReturnType<typeof registration>[], groups: Record<string, string[]>, proven = true) =>
+		resolvePeerTargets(spec, await identifyPeers(rows, async () => proven), self.id, self.sessionId, targeting(groups));
+	const a = registration("a", "Worker-A");
+	const b = registration("b", "Worker-B");
+	const c = registration("c", "Worker-C");
+
+	test("a group target selects its live members, never the sender, and reports every exclusion", async () => {
+		reasons["Worker-B"] = "paused";
+		const mine = registration("sender", "Sender");
+		const result = await resolve("GROUP:frontend", [mine, a, b, c], { frontend: [a.id, b.id, mine.id, "p00000000000000e5"] });
+		expect(result.peers.map(p => p.id)).toEqual([a.id]);
+		expect(result.skipped).toEqual([
+			{ name: "Sender", reason: "this session" },
+			{ name: "Worker-B", reason: "paused" },
+			{ name: "p00000000000000e5", reason: "not running" },
+		]); // sorted by name in code-unit order
+		expect(result.error).toBeUndefined();
+		delete reasons["Worker-B"];
+	});
+
+	test("membership is keyed by the logical session, not by a peer ID", async () => {
+		const rotated = registration("a", "Worker-A", "p000009");
+		const result = await resolve("group:frontend", [rotated, b], { frontend: [stablePeerId("a")] });
+		expect(result.peers).toEqual([expect.objectContaining({ id: "p000009" })]);
+		expect(result.skipped).toEqual([]);
+		// An alias ID in the group file would match nothing: the file holds stable IDs.
+		expect((await resolve("group:frontend", [rotated, b], { frontend: ["p000009"] })).error).toBe('group "frontend" has no running members');
+	});
+
+	test("unknown, empty, no running member and no eligible recipient are explicit errors", async () => {
+		reasons["Worker-A"] = "refuses inbound requests";
+		expect((await resolve("group:nope", [a], { frontend: [a.id] })).error).toBe('unknown group "nope"');
+		expect((await resolve("group:frontend", [a], { frontend: [] })).error).toBe('group "frontend" is empty; add members with /peers groups add frontend <peer>');
+		const none = await resolve("group:frontend", [a], { frontend: [b.id] });
+		expect(none).toEqual({ peers: [], error: 'group "frontend" has no running members', skipped: [{ name: b.id, reason: "not running" }] });
+		const blocked = await resolve("group:frontend", [a], { frontend: [a.id] });
+		expect(blocked).toEqual({ peers: [], error: 'group "frontend" has no eligible recipients right now', skipped: [{ name: "Worker-A", reason: "refuses inbound requests" }] });
+		delete reasons["Worker-A"];
+	});
+
+	test("a logical session without a proven writer is skipped as ambiguous, not guessed, and does not block the others", async () => {
+		const first = registration("s", "Shared", "p000001");
+		const second = registration("s", "Shared", "p000002");
+		const result = await resolve("group:frontend", [a, first, second], { frontend: [a.id, stablePeerId("s")] }, false);
+		expect(result.peers.map(p => p.id)).toEqual([a.id]);
+		expect(result.skipped).toEqual([{ name: "Shared", reason: `ambiguous: 2 registrations share this logical session and none is proven: Shared (p000001), Shared (p000002); use an explicit peer ID` }]);
+		// With a proven writer the same session is one recipient.
+		const owner = registration("s", "Shared");
+		expect((await resolve("group:frontend", [a, owner, first], { frontend: [stablePeerId("s")] })).peers).toEqual([expect.objectContaining({ id: owner.id })]);
+	});
+
+	test("a group name and a peer name that collide is ambiguous; without a group the peer name keeps its ordinary meaning", async () => {
+		const named = registration("n", "group:frontend");
+		const colliding = await resolve("group:frontend", [a, named], { frontend: [a.id] });
+		expect(colliding.peers).toEqual([]);
+		expect(colliding.error).toContain('"group:frontend" is ambiguous: it names a group and a peer: group:frontend (');
+		expect((await resolve("group:frontend", [a, named], {})).peers).toEqual([expect.objectContaining({ id: named.id })]);
+		expect((await resolve(named.id, [a, named], { frontend: [a.id] })).peers).toEqual([expect.objectContaining({ id: named.id })]);
+	});
+
+	test("unscoped targets are unchanged by group support", async () => {
+		reasons["Worker-A"] = "paused";
+		const rows = [a, b, registration("shared", "Shared", "p000001"), registration("shared", "Shared")];
+		const groups = { frontend: [a.id] };
+		for (const spec of ["all", "worker", "Worker-A", "worker-b", a.id, b.id, "missing", "group", "grp:frontend"]) {
+			const roster = await identifyPeers(rows, async () => true);
+			expect(resolvePeerTargets(spec, roster, self.id, self.sessionId, targeting(groups))).toEqual(resolvePeerTargets(spec, roster, self.id, self.sessionId));
+		}
+		const everyone = resolvePeerTargets("all", await identifyPeers(rows, async () => true), self.id, self.sessionId, targeting(groups));
+		expect(everyone.peers.map(p => p.name)).toEqual(["Worker-A", "Worker-B", "Shared"]); // paused members are still addressed by 'all'
+		expect(everyone.skipped).toBeUndefined();
+		expect((await resolve("group:", rows, groups)).error).toBe('unknown group ""'); // the one spelling whose error text names the group
+		// Without a targeting argument `group:x` is just a name that matches nothing.
+		expect(resolvePeerTargets("group:frontend", await identifyPeers(rows, async () => true), self.id, self.sessionId).error).toBe('no peer matches "group:frontend"');
+		delete reasons["Worker-A"];
+	});
+
+	test("an unproven duplicate still blocks 'all' exactly as before", async () => {
+		const first = registration("s", "Shared", "p000001");
+		const second = registration("s", "Shared", "p000002");
+		const result = await resolve("all", [a, first, second], { frontend: [a.id] }, false);
+		expect(result.peers).toEqual([]);
+		expect(result.error).toContain("broadcast not sent: logical session has no proven writer");
+	});
+});

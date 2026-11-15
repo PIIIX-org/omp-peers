@@ -29,7 +29,7 @@ A rule applies to a peer when its scope is `global`, `group:<g>` for a group the
 2. group rules, by lexical group name, then rule ID,
 3. global rules, by rule ID.
 
-Group membership comes from the extension's group registry. Until a group registry exists, no session belongs to any group, so group rules apply to nobody.
+Group membership comes from the group registry (`/peers groups`, see [groups.md](groups.md)), read fresh at each agent start: a group rule starts applying to a session when it joins the group and stops when it leaves. A session in no group, or a group that does not exist, matches no group rules. If `groups.json` cannot be read, the rules are not injected for that start and a warning is shown.
 
 ### Conflicts
 

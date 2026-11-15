@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 PIIIX-org contributors
+import { groups } from "./groups";
 import type { FeatureHost } from "./host";
 import { pause, resume } from "./pause";
 import { rules } from "./rules";
@@ -14,4 +15,4 @@ export interface Feature {
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, pause, resume];
+export const FEATURES: Feature[] = [rules, pause, resume, groups];

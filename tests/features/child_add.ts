@@ -14,6 +14,7 @@ const host: FeatureHost = {
 	acceptsRemote: () => true,
 	peers: async () => [],
 	groupsOf: () => [],
+	resolveGroup: async () => ({ recipients: [], skipped: [] }), // not exercised by this suite
 };
 for (let i = 0; i < Number(count); i++) {
 	const result = await addRule(host, "global", `${tag} rule ${i}`);

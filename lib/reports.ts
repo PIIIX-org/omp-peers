@@ -31,7 +31,7 @@ export const reportSchema = z.union([
 export type Report = z.infer<typeof reportSchema>;
 
 export const sendParameters = z.object({
-	to: z.string().describe("Stable peer id, name (or unique prefix), or 'all'"),
+	to: z.string().describe("Stable peer id, name (or unique prefix), 'all', or 'group:<name>' (paused and refusing members are skipped and listed)"),
 	text: z.string().optional().describe("Ordinary message body; mutually exclusive with report"),
 	report: reportSchema.optional().describe("Structured report; mutually exclusive with text. Human fields need readable Unicode words."),
 }).strict();

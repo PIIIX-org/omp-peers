@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Session groups
+
+- Add `/peers groups list|add|remove|delete|members|preview` (private `groups.json`, keyed by stable session id, 64 groups of 64 members) and a `group:<name>` target for `/peers msg|report|do`, `peers_send` and `peers_control`: recipients that are paused (from the published registry flag; the receiver's wake gate stays authoritative), refusing inbound, locked (control ops) or ambiguous are skipped and listed as `skipped: <name> (<reason>)`; unknown, empty and no-recipient groups are explicit errors and `all` is unchanged. Group-scoped standing rules now match real membership.
+
 ### Pause and resume
 
 - Add `/peers pause [reason]`, `/peers resume` and master-only `pause`/`resume` control ops: a persisted per-session state (`pause.json`, also published as `paused`/`pausedSince` in the registry) enforced by one receiver-side wake gate (`wakeGate`) that refuses `message` and `prompt` with a structured deferred/refused result while status, tail and the other non-wake ops stay available. Senders print `deferred: <name> is paused`; the completion watcher keeps its digest queued with bounded retries and delivers it once after resume.

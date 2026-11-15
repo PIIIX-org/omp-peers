@@ -45,7 +45,7 @@ const MAX_RULES = 100;
 const MAX_SCOPE_RULES = 25;
 const MAX_INJECT = 8192;
 const NOTE_RESERVE = 100;
-const GROUP_RE = /^[a-z0-9][a-z0-9._-]{0,47}$/;
+export const GROUP_RE = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 const KEY_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 const PEER_ID_RE = /^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
 const RULE_ID_RE = /^r[1-9][0-9]*$/;
@@ -187,7 +187,7 @@ function normalizeText(raw: string): { text?: string; error?: string } {
 	return { text };
 }
 
-async function resolvePeer(host: FeatureHost, spec: string, allowOffline: boolean): Promise<{ id?: string; error?: string }> {
+export async function resolvePeer(host: FeatureHost, spec: string, allowOffline: boolean): Promise<{ id?: string; error?: string }> {
 	const s = spec.toLowerCase();
 	const peers = await host.peers();
 	const byId = peers.find(peer => peer.id === s);

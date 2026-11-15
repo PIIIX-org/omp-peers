@@ -1,13 +1,23 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 PIIIX-org contributors
 
+import type { Skipped } from "../identity";
+
 /** A live logical peer session as features see it. */
 export interface PeerView {
-	/** Stable peer id. */
+	/** Stable logical-session id (the same id a session computes for itself), never a peer-instance id. */
 	id: string;
 	name: string;
 	/** Whether the peer accepts requests from others (published inbound/control state); undefined when unknown. */
 	acceptsRemote?: boolean;
+}
+
+/** Who a request addressed to `group:<name>` reaches right now; `skipped` lists every member left out and why. */
+export interface GroupPlan {
+	recipients: PeerView[];
+	skipped: Skipped[];
+	/** Set when nothing would be sent (empty or unknown group, no running or eligible member, ambiguity). */
+	error?: string;
 }
 
 /**
@@ -25,6 +35,8 @@ export interface FeatureHost {
 	acceptsRemote(): boolean;
 	/** Live logical sessions, including this one. */
 	peers(): Promise<PeerView[]>;
-	/** Group names a peer belongs to; empty until group membership exists. */
+	/** Group names a peer (stable id) belongs to, read from the group registry. Throws when the registry is unreadable. */
 	groupsOf(peerId: string): string[];
+	/** The recipients and skipped members of `op` sent to `group:<name>` now: the resolution a real send uses. Read-only. */
+	resolveGroup(name: string, op: string): Promise<GroupPlan>;
 }

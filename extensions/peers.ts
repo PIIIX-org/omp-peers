@@ -26,9 +26,10 @@ import { formatModelStringWithRouting, resolveModelRoleValue } from "@oh-my-pi/p
 import { Notifications } from "./notifications";
 import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
-import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
+import { identifyPeers, identityFlags, logicalId, matchesWriter, resolvePeerTargets, skippedLine, stablePeerId, type IdentityStatus, type Skipped } from "../lib/identity";
 import { FEATURES } from "../lib/features";
 import type { FeatureHost } from "../lib/features/host";
+import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
 import { pauseSession, readPause, resumeSession, wakeGate } from "../lib/features/pause";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
@@ -36,7 +37,6 @@ const MASTER_FILE = path.join(ROOT, "master.json");
 const SESSION_ROOT = path.join(os.homedir(), ".omp", "agent", "peer-sessions");
 const MASTER_LOCK = path.join(ROOT, "master.lock");
 const notifications = new Notifications(ROOT);
-const CONTROL_OPS = new Set(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "pause", "resume"]);
 // Settings the master may never touch remotely (credentials, trust/approval/sandbox, transports).
 const SETTING_DENY = /^(auth|secrets|collab|share|mcp|providers)\.|approval|token|apikey|api_key|password|credential|trust|sandbox|extension/i;
 const MAX_LINE = 256 * 1024;
@@ -384,8 +384,14 @@ async function listPeers(): Promise<Array<PeerInfo & IdentityStatus>> {
 	});
 }
 
-async function resolveTargets(spec: string): Promise<{ peers: PeerInfo[]; error?: string }> {
-	return resolvePeerTargets(spec, await listPeers(), state.id, state.sessionId);
+/** `op` decides which group members are skipped (refusing, locked for control ops, paused for wake ops). */
+async function resolveTargets(spec: string, op: string): Promise<{ peers: Array<PeerInfo & IdentityStatus>; error?: string; skipped?: Skipped[] }> {
+	const roster = await listPeers();
+	try {
+		return resolvePeerTargets(spec, roster, state.id, state.sessionId, groupTargeting<PeerInfo & IdentityStatus>(os.homedir(), op));
+	} catch (error) {
+		return { peers: [], error: (error as Error).message };
+	}
 }
 
 function call(peer: PeerInfo, req: Req, timeoutMs = 10_000): Promise<Record<string, unknown>> {
@@ -780,8 +786,12 @@ export default function peers(pi: ExtensionAPI) {
 			isMaster: () => masterId() === id,
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
-				.map(p => ({ id: p.id, name: p.name, acceptsRemote: p.inbound === "accept" && p.control })),
-			groupsOf: () => [],
+				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control })),
+			groupsOf: peerId => groupsOf(os.homedir(), peerId),
+			resolveGroup: async (name, op) => {
+				const { peers, error, skipped } = await resolveTargets(`group:${name}`, op);
+				return { recipients: peers.map(p => ({ id: logicalId(p), name: p.name })), skipped: skipped ?? [], error };
+			},
 			acceptsRemote: () => state.inbound === "accept" && state.control,
 		};
 	};
@@ -848,8 +858,8 @@ export default function peers(pi: ExtensionAPI) {
 			}
 		}
 		if (!state.sessionLock?.acquired) return `error: ${state.identityError || "session identity unavailable"}`;
-		const { peers: targets, error } = await resolveTargets(spec);
-		if (error) return `error: ${error}`;
+		const { peers: targets, error, skipped = [] } = await resolveTargets(spec, req.op);
+		if (error) return [`error: ${error}`, ...skipped.map(skippedLine)].join("\n");
 		let out = req;
 		let note = "";
 		if (req.op === "prompt" && req.text && (state.route || req.tier)) {
@@ -869,7 +879,7 @@ export default function peers(pi: ExtensionAPI) {
 				return response.ok === false && response.paused === true ? `${summary} (${t.id})` : `${t.name} (${t.id}): ${summary}`;
 			}),
 		);
-		return note + lines.join("\n");
+		return note + [...lines, ...skipped.map(skippedLine)].join("\n");
 	}
 
 	// ---- LLM tools -------------------------------------------------------------------------
@@ -892,7 +902,7 @@ export default function peers(pi: ExtensionAPI) {
 		name: "peers_send",
 		label: "Message Peer",
 		description:
-			"Send an agent-attributed message to a peer or 'all'. Supply either ordinary text or a structured report (kind plus required human-readable fields). Reports deliver immediately; only acknowledged main-session reports suppress exact same-turn watcher notices. Idle recipients may start a turn.",
+			"Send an agent-attributed message to a peer, 'all', or 'group:<name>' (a group set with /peers groups; paused and refusing members are skipped and listed in the result). Supply either ordinary text or a structured report (kind plus required human-readable fields). Reports deliver immediately; only acknowledged main-session reports suppress exact same-turn watcher notices. Idle recipients may start a turn.",
 		parameters: sendIngressParameters,
 		async execute(_id, p: unknown, _signal, _onUpdate, ctx) {
 			const parsed = sendParameters.safeParse(p);
@@ -905,7 +915,7 @@ export default function peers(pi: ExtensionAPI) {
 	});
 
 	const controlParameters = z.object({
-		to: z.string().describe("Stable peer id, name (or unique prefix), or 'all'"),
+		to: z.string().describe("Stable peer id, name (or unique prefix), 'all', or 'group:<name>' (members that are paused, refusing or locked are skipped and listed)"),
 		action: z.enum(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "status", "pause", "resume"]),
 		text: z
 			.string()
@@ -927,7 +937,7 @@ export default function peers(pi: ExtensionAPI) {
 		name: "peers_control",
 		label: "Control Peer",
 		description:
-			"MASTER ONLY. Control other omp sessions (by id/name or 'all'): prompt (give the session a task as if the user typed it), abort, compact, model (text=model spec), rename (text=name), tail (read its last messages; text=count), shutdown, status, pause (refuse new wake-triggering messages/prompts until resume; text=optional reason), resume. Fails unless this session is the master (claimed by the user with /peers master).",
+			"MASTER ONLY. Control other omp sessions (by id/name, 'all' or 'group:<name>'): prompt (give the session a task as if the user typed it), abort, compact, model (text=model spec), rename (text=name), tail (read its last messages; text=count), shutdown, status, pause (refuse new wake-triggering messages/prompts until resume; text=optional reason), resume. Fails unless this session is the master (claimed by the user with /peers master).",
 		parameters: controlParameters,
 		async execute(_id, p: typeof controlParameters.infer) {
 			if (p.action !== "status" && masterId() !== state.id) {
