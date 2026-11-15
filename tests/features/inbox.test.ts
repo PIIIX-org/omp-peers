@@ -33,6 +33,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 		now: () => clock++,
 		self: () => ({ id: self, name: NAMES[self] }),
 		isMaster: () => master,
+		acceptsRemote: () => true,
 		peers: async () => live.map(id => ({ id, name: NAMES[id] })),
 		groupsOf: () => [],
 		send: async (to, req) => {

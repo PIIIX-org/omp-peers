@@ -11,6 +11,7 @@ const host: FeatureHost = {
 	now: Date.now,
 	self: () => ({ id: "p0000000000000001", name: "master" }),
 	isMaster: () => true,
+	acceptsRemote: () => true,
 	peers: async () => [],
 	groupsOf: () => [],
 	send: async () => ({ status: "offline" }),

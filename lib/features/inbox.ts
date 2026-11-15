@@ -413,7 +413,6 @@ async function command(args: string[], host: FeatureHost): Promise<string> {
 
 export const inbox: Feature = {
 	name: "inbox",
-	summary: "Shared decision inbox for owner questions",
 	command,
 	tools: () => [decisionTool],
 };

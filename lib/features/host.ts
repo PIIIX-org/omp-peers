@@ -28,6 +28,8 @@ export interface FeatureHost {
 	self(): PeerView;
 	/** Whether this session currently holds the master role (same check as peer control ops). */
 	isMaster(): boolean;
+	/** Whether this session accepts requests from others (inbound accepted and control not locked). */
+	acceptsRemote(): boolean;
 	/** Live logical sessions, including this one. */
 	peers(): Promise<PeerView[]>;
 	/** Group names a peer belongs to; empty until group membership exists. */

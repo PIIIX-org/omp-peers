@@ -11,6 +11,7 @@ const host: FeatureHost = {
 	now: Date.now,
 	self: () => ({ id, name: `session-${tag}` }),
 	isMaster: () => false,
+	acceptsRemote: () => true,
 	peers: async () => [],
 	groupsOf: () => [],
 	send: async () => ({ status: "offline" }),

@@ -95,3 +95,12 @@ def run(h):
     assert h.row(worker)["id"] == worker_row["id"]
     assert injected(h.ask(worker, "Reply with the word ok.")) == ["- [r4 global] survive restart"]
     print("PASS rules persist on disk and apply to the resumed session")
+
+    # A locked session must not receive rules authored by others; its own rules still apply.
+    assert "locked" in h.say(worker, "/peers lock") or h.row(worker)["control"] is False
+    assert injected(h.ask(worker, "Reply with the word ok.")) is None
+    assert h.say(worker, f"/peers rules add session:{worker_row['id']} own rule").startswith("added r5")
+    assert injected(h.ask(worker, "Reply with the word ok.")) == ["- [r5 session] own rule"]
+    h.say(worker, "/peers unlock")
+    assert injected(h.ask(worker, "Reply with the word ok.")) == ["- [r5 session] own rule", "- [r4 global] survive restart"]
+    print("PASS a locked session is injected only its own rules")

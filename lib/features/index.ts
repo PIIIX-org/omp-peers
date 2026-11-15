@@ -19,7 +19,6 @@ export interface ToolSpec {
 export interface Feature {
 	/** `/peers <name> ...` routes to `command`. */
 	name: string;
-	summary: string;
 	/** `args` are the whitespace-split tokens after the feature name. Returns text shown to the user. */
 	command(args: string[], host: FeatureHost): Promise<string>;
 	/** Context added before this session's next agent start; undefined adds nothing. May throw. */
