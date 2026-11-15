@@ -29,13 +29,14 @@ import { readMessage, sendIngressParameters, sendParameters, type Report } from 
 import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
 import { FEATURES } from "../lib/features";
 import type { FeatureHost, SendResult } from "../lib/features/host";
+import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
 const SESSION_ROOT = path.join(os.homedir(), ".omp", "agent", "peer-sessions");
 const MASTER_LOCK = path.join(ROOT, "master.lock");
 const notifications = new Notifications(ROOT);
-const CONTROL_OPS = new Set(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown"]);
+const CONTROL_OPS = new Set(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "pause"]);
 // Settings the master may never touch remotely (credentials, trust/approval/sandbox, transports).
 const SETTING_DENY = /^(auth|secrets|collab|share|mcp|providers)\.|approval|token|apikey|api_key|password|credential|trust|sandbox|extension/i;
 const MAX_LINE = 256 * 1024;
@@ -143,6 +144,9 @@ interface PeerInfo extends PeerActivity {
 	inbound: "accept" | "refuse";
 	control: boolean;
 	routingPolicy: "keep" | "auto";
+	/** Explicit pause: wake-triggering requests are refused. Absent on registrations from older versions. */
+	paused?: boolean;
+	pausedSince?: string;
 }
 interface Req {
 	op: string;
@@ -291,6 +295,7 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 	const ctx = state.ctx;
 	const usage = ctx?.getContextUsage?.() as { tokens?: number; percent?: number } | undefined;
 	const model = ctx?.models.current();
+	const pause = readPause(os.homedir(), state.id);
 	return {
 		id: state.id,
 		instance: state.instance,
@@ -315,6 +320,8 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 		inbound: state.inbound,
 		control: state.control,
 		routingPolicy: state.saved.routingPolicy,
+		paused: pause.paused,
+		pausedSince: pause.since === undefined ? undefined : new Date(pause.since).toISOString(),
 	};
 }
 
@@ -518,9 +525,21 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 		if (!state.control) return { ok: false, error: "peer is locked (control refused)" };
 		if (!req.from?.id || masterId() !== req.from.id) return { ok: false, error: "sender is not the master session" };
 	}
+	// Resume is the paused session's own user action (/peers resume); no remote caller, including the master's agent, can clear a pause.
+	if (req.op === "resume") return { ok: false, error: "resume is only available as /peers resume in the paused session itself" };
+	// The one wake gate: every sender (master dispatch, peers_send, the watcher, future digests and triggers) reaches
+	// this receiver, so a paused session refuses wake-triggering ops here regardless of who asks.
+	const gate = wakeGate(readPause(os.homedir(), state.id), req.op);
+	if (!gate.allow) return gate.result;
 	switch (req.op) {
 		case "status":
 			return { ok: true, info: selfInfo(pi), sessionOwner: state.sessionLock?.acquired === true };
+		case "pause": {
+			const paused = await pauseSession(os.homedir(), state.id, req.from?.id ?? "", Date.now(), text);
+			if (!paused.ok) return { ok: false, error: paused.error };
+			publish(pi);
+			return { ok: true, paused: true, pausedSince: new Date(paused.entry.since).toISOString() };
+		}
 		case "message": {
 			let text: string;
 			let report: Report | undefined;
@@ -678,7 +697,7 @@ function teardown(): void {
 }
 
 function fmt(p: PeerInfo & Partial<IdentityStatus>, master: string | undefined): string {
-	const flags = [p.id === master ? "★master" : "", p.id === state.id ? "this" : "", p.inbound === "refuse" ? "refuses" : p.control ? "" : "locked",
+	const flags = [p.id === master ? "★master" : "", p.id === state.id ? "this" : "", p.paused === true ? "paused" : "", p.inbound === "refuse" ? "refuses" : p.control ? "" : "locked",
 		...(p.duplicateNames && p.duplicateSession ? identityFlags(p as PeerInfo & IdentityStatus) : [])]
 		.filter(Boolean)
 		.join(",");
@@ -687,12 +706,17 @@ function fmt(p: PeerInfo & Partial<IdentityStatus>, master: string | undefined):
 	return `${p.id}  ${p.name}  ${p.busy ? "busy" : "idle"}  ${formatActivity(p)}  ${p.model || "-"}${p.effort ? `:${p.effort}` : ""}  routing:${p.routingPolicy ?? "legacy"}${p.subagents ? `  sub:${p.subagents}` : ""}  ctx:${p.context || "-"}  ${cwd}${flags ? `  [${flags}]` : ""}`;
 }
 
-function summarize(res: Record<string, unknown>): string {
-	if (!res.ok) return `failed: ${String(res.error)}`;
+/** `name` labels a paused refusal: the sender sees who is paused and that the request was deferred, not that it failed. */
+function summarize(res: Record<string, unknown>, name = "peer"): string {
+	if (!res.ok) {
+		if (res.paused === true && (res.status === "deferred" || res.status === "refused")) return `not delivered: ${name} is paused; resend after its user resumes it`;
+		return `failed: ${String(res.error)}`;
+	}
 	if (Array.isArray(res.entries)) {
 		return (res.entries as Array<{ role: string; text: string }>).map(e => `${e.role}: ${e.text}`).join("\n---\n") || "(empty)";
 	}
 	if (res.info) return fmt(res.info as PeerInfo, masterId());
+	if (typeof res.paused === "boolean") return res.paused ? "ok (paused)" : "ok (resumed)";
 	if (Array.isArray(res.settings)) return (res.settings as string[]).join(", ") || "(none)";
 	if ("key" in res && "value" in res) return `${String(res.key)} = ${JSON.stringify(res.value)} (${String(res.provenance)})`;
 	return typeof res.routed === "string" && res.routed ? `ok (${res.routed})` : "ok";
@@ -730,7 +754,7 @@ export default function peers(pi: ExtensionAPI) {
 		if (state.saved.restoreMaster && state.server?.listening) claimMaster();
 		const n = scanPeers().filter(p => p.id !== state.id).length;
 		const m = masterId();
-		ctx.ui.setStatus("peers", `peers:${n}${m === state.id ? " ★master" : m ? ` master:${m}` : ""}`);
+		ctx.ui.setStatus("peers", `peers:${n}${m === state.id ? " ★master" : m ? ` master:${m}` : ""}${readPause(os.homedir(), state.id).paused ? " paused" : ""}`);
 	};
 
 	pi.on("session_start", async (_e, ctx) => {
@@ -859,7 +883,8 @@ export default function peers(pi: ExtensionAPI) {
 				if (req.op === "message" && req.report && recordReport && reportMaster === t.id && masterId() === t.id) {
 					notifications.reported(turn, req.report.kind, t, response);
 				}
-				return `${t.name} (${t.id}): ${summarize(response)}`;
+				const summary = summarize(response, t.name);
+				return response.ok === false && response.paused === true ? `${summary} (${t.id})` : `${t.name} (${t.id}): ${summary}`;
 			}),
 		);
 		return note + lines.join("\n");
@@ -931,12 +956,12 @@ export default function peers(pi: ExtensionAPI) {
 
 	const controlParameters = z.object({
 		to: z.string().describe("Stable peer id, name (or unique prefix), or 'all'"),
-		action: z.enum(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "status"]),
+		action: z.enum(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "status", "pause"]),
 		text: z
 			.string()
 			.optional()
 			.describe(
-				"prompt: the task. model: selector/@role. effort: off|minimal|low|medium|high|xhigh|max. subagents: 'auto' (automatic per-task tiering, always on) | 'auto-off' | 'auto-managed' (default: on only while a master exists) | 'clear' (drop manual overrides) | '<spec>' (pin all subagents) | 'agent=spec,agent2=spec2' where spec is a model selector (optionally ':high'), an @role, or a tier light|standard|heavy; manual pins beat auto and apply to subagents spawned afterwards. setting: mode get|set|clear|list (default get). rename: new name. tail: message count.",
+				"prompt: the task. model: selector/@role. effort: off|minimal|low|medium|high|xhigh|max. subagents: 'auto' (automatic per-task tiering, always on) | 'auto-off' | 'auto-managed' (default: on only while a master exists) | 'clear' (drop manual overrides) | '<spec>' (pin all subagents) | 'agent=spec,agent2=spec2' where spec is a model selector (optionally ':high'), an @role, or a tier light|standard|heavy; manual pins beat auto and apply to subagents spawned afterwards. setting: mode get|set|clear|list (default get). rename: new name. tail: message count. pause: optional reason, at most 120 characters (pause gates new wake-triggering messages and prompts only; use abort to stop a running turn).",
 			),
 		key: z.string().optional().describe("setting only: setting id, e.g. task.agentModelOverrides, modelRoles, retry.fallbackChains; for mode=list an id prefix"),
 		value: z.string().optional().describe("setting set only: JSON value, e.g. {\"task\":\"@smol\"} or \"high\" or true"),
@@ -952,7 +977,7 @@ export default function peers(pi: ExtensionAPI) {
 		name: "peers_control",
 		label: "Control Peer",
 		description:
-			"MASTER ONLY. Control other omp sessions (by id/name or 'all'): prompt (give the session a task as if the user typed it), abort, compact, model (text=model spec), rename (text=name), tail (read its last messages; text=count), shutdown, status. Fails unless this session is the master (claimed by the user with /peers master).",
+			"MASTER ONLY. Control other omp sessions (by id/name or 'all'): prompt (give the session a task as if the user typed it), abort, compact, model (text=model spec), rename (text=name), tail (read its last messages; text=count), shutdown, status, pause (refuse new wake-triggering messages/prompts; text=optional reason; only the paused session's own user can resume it with /peers resume). Fails unless this session is the master (claimed by the user with /peers master).",
 		parameters: controlParameters,
 		async execute(_id, p: typeof controlParameters.infer) {
 			if (p.action !== "status" && masterId() !== state.id) {
@@ -976,7 +1001,7 @@ export default function peers(pi: ExtensionAPI) {
 	});
 
 	// ---- /peers ----------------------------------------------------------------------------
-	const ACTIONS = ["message", "prompt", "tail", "abort", "compact", "rename", "model", "effort", "subagents", "shutdown"] as const;
+	const ACTIONS = ["message", "prompt", "tail", "abort", "compact", "rename", "model", "effort", "subagents", "shutdown", "pause"] as const;
 	pi.registerCommand("peers", {
 		description:
 			`Peer sessions: /peers [list|master|release|msg <peer> <text>|report <peer> <json-report>|do <peer|all> <action> [text]|set <peer|all> <get|set|clear|list> <key> [json]|route [on|off]|pin|unpin|accept|refuse|lock|unlock${FEATURES.map(f => `|${f.name} ...`).join("")}]`,
@@ -987,7 +1012,11 @@ export default function peers(pi: ExtensionAPI) {
 			const say = (s: string) => ctx.ui.notify(s, "info");
 			if (!state.sessionLock?.acquired) return say(state.identityError || "session identity unavailable");
 			const feature = FEATURES.find(f => f.name === sub);
-			if (feature) return say(await feature.command(rest, featureHost(ctx)));
+			if (feature) {
+				const out = await feature.command(rest, featureHost(ctx));
+				publish(pi); // a pause or resume must show in the registry now, not at the next 5 s refresh
+				return say(out);
+			}
 			switch (sub) {
 				case "list": {
 					return say((await listPeers()).map(p => fmt(p, m)).join("\n") || "(no peers)");
