@@ -518,7 +518,14 @@ async function settingOp(pi: ExtensionAPI, req: Req): Promise<Record<string, unk
 // Set by the extension factory: feature hooks that run from the receiver path need the same host the commands get.
 let featureHostFor: ((ctx: ExtensionContext) => FeatureHost) | undefined;
 
-async function handle(pi: ExtensionAPI, req: Req, trace: { masterChecked?: boolean } = {}): Promise<Record<string, unknown>> {
+/** What the receiver path learned that its audit record or the deferred follow-up needs. */
+interface HandleTrace {
+	masterChecked?: boolean;
+	/** Remote shutdown was accepted; `handleAudited` schedules it once the completed audit record is written. */
+	shutdown?: boolean;
+}
+
+async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Promise<Record<string, unknown>> {
 	const ctx = state.ctx;
 	if (!ctx) return { ok: false, error: "session not ready" };
 	if (state.inbound === "refuse") return { ok: false, error: "peer refuses inbound requests" };
@@ -641,7 +648,7 @@ async function handle(pi: ExtensionAPI, req: Req, trace: { masterChecked?: boole
 			return { ok: true, entries: rows };
 		}
 		case "shutdown":
-			ctx.setTimeout(() => ctx.shutdown(), 150);
+			trace.shutdown = true;
 			return { ok: true };
 		default:
 			return { ok: false, error: `unknown op "${req.op}"` };
@@ -664,9 +671,11 @@ async function handleAudited(pi: ExtensionAPI, req: Req): Promise<Record<string,
 		args: req,
 	};
 	await auditRecord({ ...base, phase: "attempted" });
-	const trace: { masterChecked?: boolean } = {};
+	const trace: HandleTrace = {};
 	const response = await handle(pi, req, trace).catch(e => ({ ok: false, error: String((e as Error)?.message ?? e) }));
 	await auditRecord({ ...base, phase: "completed", masterChecked: trace.masterChecked, result: classifyResponse(req.op, response) });
+	// Only now: the timer must not outrun the completed record (the audit write can wait for the lock) or the reply.
+	if (trace.shutdown) state.ctx?.setTimeout(() => state.ctx?.shutdown(), 150);
 	return response;
 }
 

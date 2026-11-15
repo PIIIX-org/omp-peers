@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 PIIIX-org contributors
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { FEATURES } from "../../lib/features";
 import type { FeatureHost } from "../../lib/features/host";
 import {
 	AuditLog, auditCommand, auditConfigFile, auditPaths, buildRecord, classifyResponse, describeParams, newRequestId, parseRecord,
-	validRequestId, MAX_LINE_BYTES, type AuditInput, type AuditRecord, type ControlArgs, type Outcome, type Reason,
+	validRequestId, MAX_LINE_BYTES, type AuditInput, type AuditRecord, type ControlArgs, type LineWriter, type Outcome, type Reason,
 } from "../../lib/features/audit";
 
 const MASTER = "p00000000000000aa";
@@ -175,6 +176,7 @@ describe("content policy", () => {
 			{ op: "rename", args: { text: `${SENTINEL} name` } },
 			{ op: "subagents", args: { text: `task=${SENTINEL}-model` } },
 			{ op: "tail", args: { text: SENTINEL, n: 6 } },
+			{ op: "pause", args: { text: `${SENTINEL} reason` } },
 			{ op: "abort", args: { text: SENTINEL } },
 			{ op: "compact", args: { text: SENTINEL } },
 			{ op: "shutdown", args: { text: SENTINEL } },
@@ -204,6 +206,9 @@ describe("content policy", () => {
 		expect(describeParams("subagents", { text: "task=provider/model" })).toEqual({ mode: "spec", textLength: 19 });
 		expect(describeParams("effort", { text: "high" })).toEqual({ effort: "high" });
 		expect(describeParams("effort", { text: "x".repeat(40) })).toEqual({ effort: "[redacted]" });
+		expect(describeParams("pause", { text: "waiting for review" })).toEqual({ textLength: 18 });
+		expect(describeParams("pause", { text: "" })).toBeUndefined();
+		expect(describeParams("pause", {})).toBeUndefined();
 		expect(describeParams("tail", { n: 6 })).toEqual({ n: 6 });
 		for (const n of [0, -1, 1.5, Number.NaN, "6", undefined]) expect(describeParams("tail", { n })).toBeUndefined();
 		expect(describeParams("tail", { n: 1e12 })).toEqual({ n: 1_000_000 });
@@ -252,6 +257,8 @@ describe("content policy", () => {
 			[{ ok: false, error: "sender is not the master session" }, "refused", "not-master"],
 			[{ ok: false, error: "peer refuses inbound requests" }, "refused", "inbound-refused"],
 			[{ ok: false, error: 'setting "auth.x" is protected and cannot be changed remotely' }, "refused", "protected-setting"],
+			[{ ok: false, status: "refused", paused: true, error: "session is paused" }, "refused", "paused"],
+			[{ ok: false, status: "deferred", paused: true, error: "session is paused" }, "refused", "paused"],
 			[{ ok: false, error: "session not ready" }, "failed", "not-ready"],
 			[{ ok: false, error: "unreachable (ECONNREFUSED)" }, "unreachable", "unreachable"],
 			[{ ok: false, error: "timeout" }, "unknown", "timeout"],
@@ -273,6 +280,7 @@ describe("content policy", () => {
 		expect(classifyResponse("compact", { ok: true, started: true })).toEqual({ outcome: "deferred" });
 		expect(classifyResponse("shutdown", { ok: true })).toEqual({ outcome: "deferred" });
 		expect(classifyResponse("abort", { ok: true })).toEqual({ outcome: "ok" });
+		expect(classifyResponse("pause", { ok: true, paused: true, pausedSince: "x" })).toEqual({ outcome: "ok" });
 		expect(classifyResponse("prompt", { ok: true, queued: false })).toEqual({ outcome: "ok" });
 	});
 });
@@ -286,7 +294,8 @@ describe("retention", () => {
 		const log = new AuditLog();
 		for (let i = 0; i < 500; i++) await record(log, T0 + i, i);
 		expect(log.lastError).toBeUndefined();
-		expect(fs.readdirSync(paths().dir).filter(name => name.startsWith("audit.jsonl")).sort()).toEqual(["audit.jsonl", "audit.jsonl.1", "audit.jsonl.lock"]);
+		// The kernel lock may or may not leave a `.lock` file, depending on the platform.
+		expect(fs.readdirSync(paths().dir).filter(name => name.startsWith("audit.jsonl") && !name.endsWith(".lock")).sort()).toEqual(["audit.jsonl", "audit.jsonl.1"]);
 		expect(fs.statSync(paths().live).size).toBeLessThanOrEqual(65536);
 		expect(fs.statSync(paths().prev).size).toBeLessThanOrEqual(65536);
 		expect(mode(paths().prev)).toBe(0o600);
@@ -316,18 +325,46 @@ describe("retention", () => {
 		expect(records().map(r => r.params!.selector)).toEqual(["provider/model-4", "provider/model-5"]);
 	});
 
-	test("a previous file whose last write is older than the cutoff is deleted at the next write", async () => {
+	const line = (ts: number, i: number) => `${JSON.stringify(buildRecord(input({ op: "model", args: { text: `provider/model-${i}` } }), ts))}\n`;
+
+	test("a wholly expired previous file is deleted at the next write, without a rotation", async () => {
 		await enable();
 		configure({ maxAgeDays: 10 });
 		const log = new AuditLog();
 		await record(log, T0, 1);
 		fs.renameSync(paths().live, paths().prev);
-		fs.utimesSync(paths().prev, new Date(T0), new Date(T0));
 		await record(log, T0 + 9 * DAY, 2);
 		expect(fs.existsSync(paths().prev)).toBe(true);
 		await record(log, T0 + 11 * DAY, 3);
 		expect(fs.existsSync(paths().prev)).toBe(false);
 		expect(records().map(r => r.params!.selector)).toEqual(["provider/model-2", "provider/model-3"]);
+	});
+
+	test("expired records are pruned out of a mixed-age previous file when no rotation happens, whatever its mtime", async () => {
+		await enable();
+		configure({ maxAgeDays: 30 });
+		// The previous file was touched just now (real clock), so only the record timestamps can expire it.
+		fs.mkdirSync(paths().dir, { recursive: true, mode: 0o700 });
+		fs.writeFileSync(paths().prev, line(T0, 1) + line(T0 + 5 * DAY, 2) + line(T0 + 25 * DAY, 3), { mode: 0o600 });
+		fs.writeFileSync(paths().live, line(T0 + 39 * DAY, 4), { mode: 0o600 });
+		const live = fs.statSync(paths().live).ino;
+		await record(new AuditLog(), T0 + 40 * DAY, 5); // cutoff is day 10: days 0 and 5 expired, day 25 not
+		expect(records(paths().prev).map(r => r.params!.selector)).toEqual(["provider/model-3"]);
+		expect(records().map(r => r.params!.selector)).toEqual(["provider/model-4", "provider/model-5"]);
+		expect(fs.statSync(paths().live).ino).toBe(live); // no rotation
+		await record(new AuditLog(), T0 + 40 * DAY, 6); // nothing more to prune: the file is left alone
+		expect(records(paths().prev)).toHaveLength(1);
+	});
+
+	test("an unreadable first line cannot keep expired records alive in the previous file", async () => {
+		await enable();
+		configure({ maxAgeDays: 30 });
+		fs.mkdirSync(paths().dir, { recursive: true, mode: 0o700 });
+		fs.writeFileSync(paths().prev, `torn\n${line(T0, 1)}${line(T0 + 39 * DAY, 2)}`, { mode: 0o600 });
+		fs.writeFileSync(paths().live, line(T0 + 39 * DAY, 3), { mode: 0o600 });
+		await record(new AuditLog(), T0 + 40 * DAY, 4);
+		expect(lines(paths().prev)).toHaveLength(1);
+		expect(records(paths().prev).map(r => r.params!.selector)).toEqual(["provider/model-2"]);
 	});
 
 	test("defaults, boundaries and invalid values for the limits", async () => {
@@ -434,6 +471,65 @@ describe("tamper and permission handling", () => {
 		fs.symlinkSync(victim, paths().prev);
 		expect(await cmd("status")).toContain("audit.jsonl.1: audit.jsonl.1 is a symlink; refusing to use it");
 		expect(await cmd("tail")).toContain("audit.jsonl.1 is a symlink");
+	});
+
+	test("a FIFO in place of the log, or of the previous log, is refused promptly instead of hanging", async () => {
+		await enable();
+		fs.mkdirSync(paths().dir, { recursive: true, mode: 0o700 });
+		execFileSync("mkfifo", [paths().live]);
+		const started = Date.now();
+		const log = new AuditLog();
+		await writeAs(log);
+		const refusal = "audit.jsonl is not a regular file; refusing to use it";
+		expect(log.lastError?.message).toBe(refusal);
+		expect(await cmd("tail")).toBe(`error: ${refusal}`);
+		expect(await cmd("status")).toContain(`records: unknown (audit.jsonl: ${refusal})`);
+		fs.rmSync(paths().live);
+		await writeAs(log);
+		execFileSync("mkfifo", [paths().prev]);
+		expect(await cmd("tail")).toBe("error: audit.jsonl.1 is not a regular file; refusing to use it");
+		await writeAs(log);
+		expect(log.lastError?.message).toBe("audit.jsonl.1 is not a regular file; refusing to use it");
+		expect(Date.now() - started).toBeLessThan(5000);
+		expect(await cmd("clear --yes")).toBe("audit log cleared: removed 2 file(s)");
+	});
+
+	test("a short or failed write is rolled back, so the next record neither merges with it nor is lost", async () => {
+		await enable();
+		await new AuditLog().record(home, T0, input());
+		const intact = fs.readFileSync(paths().live, "utf8");
+		const short: LineWriter = (fd, bytes) => fs.writeSync(fd, bytes.subarray(0, 40));
+		const broken: LineWriter = (fd, bytes) => {
+			fs.writeSync(fd, bytes.subarray(0, 40));
+			throw Object.assign(new Error("disk"), { code: "EIO" });
+		};
+		const shortLog = new AuditLog(short);
+		await shortLog.record(home, T0 + 1, input());
+		expect(shortLog.lastError?.message).toBe("short write to the audit log");
+		expect(fs.readFileSync(paths().live, "utf8")).toBe(intact);
+		const brokenLog = new AuditLog(broken);
+		await brokenLog.record(home, T0 + 2, input());
+		expect(brokenLog.lastError?.message).toBe("EIO: the audit file could not be written");
+		expect(fs.readFileSync(paths().live, "utf8")).toBe(intact);
+		await new AuditLog().record(home, T0 + 3, input());
+		expect(records().map(r => r.ts)).toEqual([T0, T0 + 3]);
+	});
+
+	test("an unterminated fragment left by a crash is cut off before the next append", async () => {
+		await enable();
+		const log = new AuditLog();
+		await log.record(home, T0, input());
+		for (const fragment of ['{"v":1,"ts":', "x".repeat(10_000), "\n"]) {
+			fs.appendFileSync(paths().live, fragment);
+			await log.record(home, T0 + 1, input());
+		}
+		// The "\n" fragment completed an empty line; the other two fragments were removed outright.
+		expect(lines().every(text => parseRecord(text))).toBe(true);
+		expect(lines()).toHaveLength(4);
+		fs.writeFileSync(paths().live, '{"only":"a fragment"');
+		await log.record(home, T0 + 2, input());
+		expect(records().map(r => r.ts)).toEqual([T0 + 2]);
+		expect(log.lastError).toBeUndefined();
 	});
 
 	test("writer failures never break the caller: warn once, stay in status, clear on the next success", async () => {

@@ -4,6 +4,7 @@
 import json
 import socket
 import stat
+import time
 
 from smoke import wait_for
 
@@ -179,3 +180,55 @@ def run(h):
     assert len(log.read_text().splitlines()) == 8
     print("PASS audit clear needs --yes and deletes the log; recording resumes while on and stops when off")
     print("PASS an unwritable log warns once, shows in status and tail, and never blocks the control op")
+
+    # Pause, a broadcast and a shutdown, on a fresh log. A third session joins; it is named while auditing is still off.
+    worker2 = h.start()
+    w2row = h.row(worker2)
+    w2id = w2row["id"]
+    assert h.say(master, f"/peers do {w2id} rename worker-c") == f"{w2row['name']} ({w2id}): ok"
+    wait_for(lambda: h.row(worker2)["name"] == "worker-c")
+    assert h.say(master, "/peers audit clear --yes") == "audit log cleared: removed 1 file(s)"
+    assert h.say(master, "/peers audit on").startswith("audit log on: ")
+
+    reason = "SENTINEL-PAUSE-REASON waiting for review"
+    assert h.say(master, f"/peers do {wid} pause {reason}") == f"worker-b ({wid}): ok (paused)"
+    not_delivered = f"not delivered: worker-b is paused; resend after its user resumes it ({wid})"
+    assert h.say(master, f"/peers do {wid} prompt run the suite").splitlines()[-1] == not_delivered
+    assert h.say(worker, "/peers resume") == f"resumed worker-b ({wid}): wake-triggering messages and prompts are accepted again"
+    wait_for(lambda: h.row(worker)["paused"] is False)
+
+    start = len(master.frames)
+    master.call("prompt", message="/peers do all compact")
+    wait_for(lambda: any(f.get("method") == "notify" for f in master.frames[start:]))
+    broadcast = next(f["message"] for f in master.frames[start:] if f.get("method") == "notify")
+    assert sorted(broadcast.splitlines()) == sorted([f"worker-b ({wid}): ok", f"worker-c ({w2id}): ok"]), broadcast
+
+    assert h.say(master, f"/peers do {w2id} shutdown") == f"worker-c ({w2id}): ok"
+    # In RPC mode the host acts on a requested shutdown when the next input frame arrives (after the 150 ms timer).
+    time.sleep(0.5)
+    worker2.proc.stdin.write(json.dumps({"type": "get_state", "id": "wake"}) + "\n")
+    worker2.proc.stdin.flush()
+    wait_for(lambda: worker2.proc.poll() is not None, seconds=30)
+
+    raw = log.read_text()
+    assert "SENTINEL" not in raw
+    records = [json.loads(line) for line in raw.splitlines()]
+    assert len(records) == 20, len(records)
+    groups = {}
+    for r in records:
+        groups.setdefault(r["request"], []).append(r)
+    assert len(groups) == 5 and all([(r["side"], r["phase"]) for r in g] == pair for g in groups.values()), groups
+    ordered = sorted(groups.values(), key=lambda g: g[0]["ts"])
+    assert [(g[0]["op"], g[0]["targetId"]) for g in ordered[:2]] == [("pause", wid), ("prompt", wid)]
+    assert [(g[3]["outcome"], g[3].get("reason")) for g in ordered[:2]] == [("ok", None), ("refused", "paused")]
+    assert [(g[2]["outcome"], g[2].get("reason"), g[2]["masterChecked"]) for g in ordered[:2]] == [("ok", None, True), ("refused", "paused", True)]
+    assert ordered[0][0]["params"] == {"textLength": len(reason.encode())} and ordered[1][0]["params"] == {"textLength": len("run the suite")}
+    broadcasts = ordered[2:4]
+    assert {g[0]["op"] for g in broadcasts} == {"compact"} and {g[0]["targetId"] for g in broadcasts} == {wid, w2id}
+    assert len({g[0]["request"] for g in broadcasts}) == 2
+    assert all(g[3]["outcome"] == "deferred" and "reason" not in g[3] for g in broadcasts)
+    final = ordered[4]
+    assert (final[0]["op"], final[0]["targetId"], final[0]["targetName"]) == ("shutdown", w2id, "worker-c")
+    assert [(r["outcome"] if r["phase"] == "completed" else None) for r in final] == [None, None, "deferred", "deferred"]
+    print("PASS a paused refusal is recorded as refused/paused; pause carries only its reason length")
+    print("PASS a broadcast compact records one pair per target with distinct request ids; shutdown is recorded before the session exits")

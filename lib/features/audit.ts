@@ -54,13 +54,13 @@ export type Outcome = "ok" | "refused" | "failed" | "unreachable" | "deferred" |
 /** The only reason texts that are ever stored. */
 export const REASONS = [
 	"not-master", "locked", "inbound-refused", "not-ready", "protected-setting", "invalid-argument", "unavailable-model",
-	"no-credentials", "busy", "error", "unreachable", "timeout", "connection-closed", "bad-response", "response-too-large",
+	"no-credentials", "busy", "paused", "error", "unreachable", "timeout", "connection-closed", "bad-response", "response-too-large",
 ] as const;
 export type Reason = (typeof REASONS)[number];
 
 /** What is kept about the arguments of a control op. Never bodies, values or transcript text. */
 export interface AuditParams {
-	/** UTF-8 bytes of the prompt / new name / subagent spec text. */
+	/** UTF-8 bytes of the prompt / new name / subagent spec / pause reason text. */
 	textLength?: number;
 	/** Requested model selector (screened, at most 80 characters). */
 	selector?: string;
@@ -183,6 +183,9 @@ export function describeParams(op: string, args: ControlArgs): AuditParams | und
 		case "rename":
 			params = { textLength: byteLength(text) };
 			break;
+		case "pause":
+			if (text) params = { textLength: byteLength(text) };
+			break;
 		case "subagents":
 			params = { mode: !text ? "clear" : SUBAGENT_MODES.includes(text) ? text : "spec", ...(text ? { textLength: byteLength(text) } : {}) };
 			break;
@@ -213,6 +216,8 @@ export function classifyResponse(op: string, response: Record<string, unknown>):
 	if (error.startsWith("peer is locked")) return { outcome: "refused", reason: "locked" };
 	if (error.startsWith("sender is not the master")) return { outcome: "refused", reason: "not-master" };
 	if (error.startsWith("peer refuses inbound")) return { outcome: "refused", reason: "inbound-refused" };
+	// A paused receiver refuses wake-triggering dispatches with a structured refusal (no free text is kept).
+	if (response.paused === true) return { outcome: "refused", reason: "paused" };
 	if (error.includes("is protected and cannot be changed remotely")) return { outcome: "refused", reason: "protected-setting" };
 	if (error.startsWith("session not ready")) return { outcome: "failed", reason: "not-ready" };
 	if (error.startsWith("unreachable")) return { outcome: "unreachable", reason: "unreachable" };
@@ -393,7 +398,8 @@ function openChecked(file: string, flags: number): number {
 	const name = path.basename(file);
 	let fd: number;
 	try {
-		fd = fs.openSync(file, flags | fs.constants.O_NOFOLLOW, 0o600);
+		// O_NONBLOCK: opening a FIFO planted at this path must not hang; the type check below then refuses it before any I/O.
+		fd = fs.openSync(file, flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
 	} catch (error) {
 		if (errno(error) === "ELOOP") throw new AuditError(`${name} is a symlink; refusing to use it`);
 		throw error;
@@ -487,25 +493,60 @@ function maintain(paths: AuditPaths, settings: AuditSettings, incoming: number, 
 		prunePrevious(paths, cutoff);
 		return;
 	}
-	// The previous file was last written when it was rotated, so an mtime older than the cutoff expires all of it.
+	// The previous file holds older records than the live one, in order: if its first record is still fresh, all of it is.
+	const prevFd = openIfPresent(paths.prev);
+	if (prevFd === undefined) return;
+	let oldest: number | undefined;
 	try {
-		if (fs.lstatSync(paths.prev).mtimeMs < cutoff) fs.rmSync(paths.prev, { force: true });
-	} catch (error) {
-		if (errno(error) !== "ENOENT") throw error;
+		oldest = firstTimestamp(prevFd);
+	} finally {
+		fs.closeSync(prevFd);
 	}
+	if (oldest === undefined || oldest < cutoff) prunePrevious(paths, cutoff);
 }
 
+/**
+ * Cut an unterminated trailing fragment (a crashed or short earlier write) back to the last newline, so the next
+ * record starts on its own line. Returns the file length after trimming.
+ */
+function trimTornTail(fd: number): number {
+	const size = fs.fstatSync(fd).size;
+	const chunk = Buffer.alloc(Math.min(size, MAX_LINE_BYTES + 1));
+	for (let end = size; end > 0; end -= chunk.length) {
+		const start = Math.max(0, end - chunk.length);
+		const read = fs.readSync(fd, chunk, 0, end - start, start);
+		const newline = chunk.subarray(0, read).lastIndexOf(0x0a);
+		if (newline < 0) continue;
+		const keep = start + newline + 1;
+		if (keep !== size) fs.ftruncateSync(fd, keep);
+		return keep;
+	}
+	if (size > 0) fs.ftruncateSync(fd, 0);
+	return 0;
+}
+
+export type LineWriter = (fd: number, line: Buffer) => number;
+
 /** Append one record. Takes the cross-process lock so appends never interleave with rotation. Throws on any problem. */
-export async function appendRecord(home: string, settings: AuditSettings, record: AuditRecord, now: number): Promise<void> {
+export async function appendRecord(home: string, settings: AuditSettings, record: AuditRecord, now: number, writeLine: LineWriter = fs.writeSync): Promise<void> {
 	const paths = auditPaths(home);
 	const line = serialize(record);
 	privateDir(paths.dir);
 	const lock = await acquire(`${paths.live}.lock`, LOCK_WAIT_MS);
 	try {
 		maintain(paths, settings, line.length, now);
-		const fd = openChecked(paths.live, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT);
+		const fd = openChecked(paths.live, fs.constants.O_RDWR | fs.constants.O_APPEND | fs.constants.O_CREAT);
 		try {
-			if (fs.writeSync(fd, line) !== line.length) throw new AuditError("short write to the audit log");
+			const length = trimTornTail(fd);
+			try {
+				if (writeLine(fd, line) !== line.length) throw new AuditError("short write to the audit log");
+			} catch (error) {
+				// Put the file back as it was; if even that fails, the next append cuts the fragment off.
+				try {
+					fs.ftruncateSync(fd, length);
+				} catch {}
+				throw error;
+			}
 			fs.fsyncSync(fd);
 		} finally {
 			fs.closeSync(fd);
@@ -532,12 +573,14 @@ export class AuditLog {
 	lastError: { at: number; message: string } | undefined;
 	private warned = false;
 
+	constructor(private readonly writeLine: LineWriter = fs.writeSync) {}
+
 	async record(home: string, now: number, input: AuditInput, warn?: (text: string) => void): Promise<void> {
 		try {
 			const config = readEnabled(home);
 			if (config.error) throw new AuditError(config.error);
 			if (!config.enabled) return;
-			await appendRecord(home, loadSettings(home), buildRecord(input, now), now);
+			await appendRecord(home, loadSettings(home), buildRecord(input, now), now, this.writeLine);
 			this.lastError = undefined;
 		} catch (error) {
 			const message = describeError(error);
