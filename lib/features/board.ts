@@ -14,7 +14,7 @@ import * as path from "node:path";
 import type { Report } from "../reports";
 import type { FeatureHost, PeerView } from "./host";
 import type { Feature } from "./index";
-import { screenText } from "./rules";
+import { looksLikeSecret as screenText } from "./secrets";
 import { readState, stateRoot, updateState } from "./store";
 
 export const STATUSES = ["assigned", "in-progress", "blocked", "waiting", "decision", "done", "unknown"] as const;
