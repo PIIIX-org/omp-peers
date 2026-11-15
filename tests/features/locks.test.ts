@@ -127,16 +127,26 @@ describe("capacity and contention", () => {
 		expect(stored().resources[0].capacity).toBe(2);
 	});
 
-	test("re-acquire by the same owner is idempotent: one slot, new expiry, note kept unless replaced, original acquire time and lease id kept", async () => {
-		await acquireLock(host(A), { name: "pool", capacity: 2, ttl: 100, note: "first" }, "inst-1");
+	test("a second acquire by the current holder is refused with the exact text and changes nothing, while another session still gets busy; renew extends", async () => {
+		await acquireLock(host(A), { name: "heavy-build", ttl: 100, note: "first" }, "inst-1");
 		clock += secs(40);
-		const again = await acquireLock(host(A), { name: "pool", ttl: 500 }, "inst-1");
-		expect(again).toMatchObject({ outcome: "acquired", renewed: true, held: 1, capacity: 2 });
+		const before = fs.readFileSync(locksFile(home), "utf8");
+		const again = await acquireLock(host(A), { name: "heavy-build", ttl: 500, note: "second" }, "inst-2");
+		expect(again).toEqual({ outcome: "refused", reason: "this session already holds heavy-build (lease l1), possibly via another of its agents; renew to extend it or release it when done" });
+		expect(await run("acquire heavy-build", A)).toBe("refused: this session already holds heavy-build (lease l1), possibly via another of its agents; renew to extend it or release it when done");
+		expect(fs.readFileSync(locksFile(home), "utf8")).toBe(before);
+		expect((await acquireLock(host(B), { name: "heavy-build" })).outcome).toBe("busy");
+		const renewed = await renewLock(host(A), { name: "heavy-build", ttl: 500 }, "inst-1");
+		expect(renewed.outcome).toBe("renewed");
 		expect(stored().resources[0].leases).toEqual([{ id: "l1", owner: A, name: "worker-a", instance: "inst-1", acquiredAt: T0, expiresAt: T0 + secs(540), note: "first" }]);
-		await acquireLock(host(A), { name: "pool", note: "second" }, "inst-1");
-		expect(stored().resources[0].leases[0].note).toBe("second");
-		expect(stored().resources[0].leases).toHaveLength(1);
 		expect(stored().nextId).toBe(2);
+	});
+
+	test("a capacity-2 resource still gives one slot per session: the holder is refused, a second session is admitted", async () => {
+		await acquireLock(host(A), { name: "pool", capacity: 2 });
+		expect((await acquireLock(host(A), { name: "pool" })).outcome).toBe("refused");
+		expect((await acquireLock(host(B), { name: "pool" })).outcome).toBe("acquired");
+		expect(stored().resources[0].leases.map(l => l.owner)).toEqual([A, B]);
 	});
 
 	test("the same owner may hold different names independently", async () => {
@@ -170,7 +180,7 @@ describe("ownership, expiry and renewal", () => {
 		// Expired but not yet reclaimed: still in the file until a mutation runs.
 		expect(stored().resources[0].leases[0].owner).toBe(A);
 		const taken = await acquireLock(host(B), { name: "heavy-build", ttl: 60 });
-		expect(taken).toMatchObject({ outcome: "acquired", renewed: false });
+		expect(taken.outcome).toBe("acquired");
 		expect(stored().resources[0].leases.map(l => [l.owner, l.id])).toEqual([[B, "l2"]]);
 	});
 
@@ -357,7 +367,6 @@ describe("validation and bounds", () => {
 		expect(stored().resources.reduce((sum, r) => sum + r.leases.length, 0)).toBe(256);
 		expect(await acquireLock(host(A), { name: "e" })).toEqual({ outcome: "refused", reason: "at most 256 leases may exist at once" });
 		// An existing lease can still renew when the table is full.
-		expect((await acquireLock(host(peerId(1)), { name: "a" })).outcome).toBe("acquired");
 		expect((await renewLock(host(peerId(2)), { name: "b" })).outcome).toBe("renewed");
 	});
 });

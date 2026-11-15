@@ -113,6 +113,9 @@ def run(h):
     one = h.start(resume=session_file)
     assert h.row(one)["id"] == a
     assert f"worker-a ({a}, this session, earlier instance)" in h.say(one, "/peers locks status heavy-build")
+    again = h.say(one, "/peers locks acquire heavy-build")
+    assert again == (f"refused: this session already holds heavy-build (lease l1), possibly via another of its agents; "
+                     "renew to extend it or release it when done"), again
     renewed = h.say(one, "/peers locks renew heavy-build --ttl 300")
     assert re.fullmatch(rf"renewed heavy-build: lease l1 now expires in (5m|4m 59s) \({TIME}\); 1 of 1 in use", renewed), renewed
     assert f"worker-a ({a}, this session)" in h.say(one, "/peers locks status heavy-build")

@@ -141,8 +141,8 @@ const displayName = (name: string): string => name.replace(/[\p{Cc}\p{Cf}]/gu, "
 // ---- Results -----------------------------------------------------------------------------------
 
 export type LockResult =
-	/** The lease was granted, or an existing own lease was renewed (`renewed`). */
-	| { outcome: "acquired"; name: string; lease: Lease; capacity: number; held: number; renewed: boolean }
+	/** A new lease was granted. */
+	| { outcome: "acquired"; name: string; lease: Lease; capacity: number; held: number }
 	/** An own lease got a new expiry (`renew`). */
 	| { outcome: "renewed"; name: string; lease: Lease; capacity: number; held: number }
 	/** The own lease was removed. */
@@ -185,8 +185,8 @@ export interface AcquireInput {
 }
 
 /**
- * Take one slot of `name`, or renew this session's own lease on it (idempotent: one slot per owner).
- * Never waits: a full resource returns `busy` naming the holders.
+ * Take one slot of `name`. A session that already holds a lease on it is refused (use `renewLock`), so one
+ * session never counts twice. Never waits: a full resource returns `busy` naming the holders.
  */
 export async function acquireLock(host: FeatureHost, input: AcquireInput, instance = PROCESS_INSTANCE): Promise<LockResult> {
 	const name = parseName(input.name);
@@ -206,13 +206,9 @@ export async function acquireLock(host: FeatureHost, input: AcquireInput, instan
 			return reply(refused(`capacity mismatch: ${name.value} was created with capacity ${resource.capacity} (requested ${capacity.value}); the capacity is fixed until every lease on it has ended`));
 		}
 		const mine = resource?.leases.find(lease => lease.owner === self.id);
-		if (resource && mine) {
-			mine.instance = instance;
-			mine.name = displayName(self.name);
-			mine.expiresAt = now + seconds * 1000;
-			if (note.value !== undefined) mine.note = note.value;
-			return reply({ outcome: "acquired", name: name.value!, lease: { ...mine }, capacity: resource.capacity, held: resource.leases.length, renewed: true }, true);
-		}
+		// Subagents act as their parent session, so a second acquire by the owner may come from another agent that
+		// would wrongly believe it holds the slot too. Extending is `renew`'s job, never `acquire`'s.
+		if (resource && mine) return reply(refused(`this session already holds ${name.value} (lease ${mine.id}), possibly via another of its agents; renew to extend it or release it when done`));
 		if (resource && resource.leases.length >= resource.capacity) {
 			const holders = resource.leases.slice().sort((a, b) => a.expiresAt - b.expiresAt || a.id.localeCompare(b.id, "en", { numeric: true }));
 			return reply({ outcome: "busy", name: name.value!, capacity: resource.capacity, holders, earliestExpiry: holders[0].expiresAt });
@@ -227,7 +223,7 @@ export async function acquireLock(host: FeatureHost, input: AcquireInput, instan
 		const lease: Lease = { id: `l${state.nextId++}`, owner: self.id, name: displayName(self.name), instance, acquiredAt: now, expiresAt: now + seconds * 1000 };
 		if (note.value !== undefined) lease.note = note.value;
 		resource.leases.push(lease);
-		return reply({ outcome: "acquired", name: name.value!, lease: { ...lease }, capacity: resource.capacity, held: resource.leases.length, renewed: false }, true);
+		return reply({ outcome: "acquired", name: name.value!, lease: { ...lease }, capacity: resource.capacity, held: resource.leases.length }, true);
 	});
 }
 
@@ -354,8 +350,7 @@ export function describeResult(result: LockResult, host: FeatureHost, instance =
 	switch (result.outcome) {
 		case "acquired": {
 			const { lease } = result;
-			const head = result.renewed ? `acquired ${result.name}: this session already held a slot; lease ${lease.id} renewed` : `acquired ${result.name}: lease ${lease.id}`;
-			return `${head}, expires in ${formatDuration(lease.expiresAt - now)} (${iso(lease.expiresAt)}); ${result.held} of ${result.capacity} slot${result.capacity === 1 ? "" : "s"} in use. Renew before it expires and release when done.`;
+			return `acquired ${result.name}: lease ${lease.id}, expires in ${formatDuration(lease.expiresAt - now)} (${iso(lease.expiresAt)}); ${result.held} of ${result.capacity} slot${result.capacity === 1 ? "" : "s"} in use. Renew before it expires and release when done.`;
 		}
 		case "renewed":
 			return `renewed ${result.name}: lease ${result.lease.id} now expires in ${formatDuration(result.lease.expiresAt - now)} (${iso(result.lease.expiresAt)}); ${result.held} of ${result.capacity} in use`;
