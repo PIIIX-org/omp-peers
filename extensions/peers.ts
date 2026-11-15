@@ -160,6 +160,8 @@ interface Req {
 	report?: Report;
 	/** Random id the sender attaches to a control op so both sides' audit records correlate. A claim, like `from`. */
 	request?: string;
+	/** Set by a sender whose report came from a subagent, not its main session; never feeds report-driven features. */
+	subagent?: boolean;
 }
 
 // Child agents share the main session's server; only one process may publish a logical session.
@@ -506,6 +508,9 @@ async function settingOp(pi: ExtensionAPI, req: Req): Promise<Record<string, unk
 	return { ok: true, key, value: s.get(scope), provenance: s.provenance(scope) };
 }
 
+// Set by the extension factory: feature hooks that run from the receiver path need the same host the commands get.
+let featureHostFor: ((ctx: ExtensionContext) => FeatureHost) | undefined;
+
 async function handle(pi: ExtensionAPI, req: Req, trace: { masterChecked?: boolean } = {}): Promise<Record<string, unknown>> {
 	const ctx = state.ctx;
 	if (!ctx) return { ok: false, error: "session not ready" };
@@ -522,13 +527,25 @@ async function handle(pi: ExtensionAPI, req: Req, trace: { masterChecked?: boole
 			return { ok: true, info: selfInfo(pi), sessionOwner: state.sessionLock?.acquired === true };
 		case "message": {
 			let text: string;
+			let report: Report | undefined;
 			try {
-				text = readMessage(req).text;
+				({ text, report } = readMessage(req));
 			} catch (error) {
 				return { ok: false, error: `invalid message/report: ${(error as Error).message}` };
 			}
 			const from = req.from ?? { id: "?", name: "unknown" };
 			if (!rateOk(from.id)) return { ok: false, error: "rate limited" };
+			if (report && req.from && featureHostFor && req.subagent !== true) {
+				// Only an explicit structured report feeds features; a failing hook never blocks delivery.
+				const host = featureHostFor(ctx);
+				for (const feature of FEATURES) {
+					try {
+						await feature.onReport?.(report, req.from, host);
+					} catch (error) {
+						ctx.ui.notify(`peers ${feature.name}: report not recorded: ${(error as Error).message}`, "warning");
+					}
+				}
+			}
 			pi.sendMessage(
 				{
 					customType: "peer-message",
@@ -786,6 +803,7 @@ export default function peers(pi: ExtensionAPI) {
 			acceptsRemote: () => state.inbound === "accept" && state.control,
 		};
 	};
+	featureHostFor = featureHost;
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		const host = featureHost(ctx);
@@ -865,7 +883,8 @@ export default function peers(pi: ExtensionAPI) {
 				const request = CONTROL_OPS.has(req.op) ? newRequestId() : undefined;
 				const audit = request && { request, side: "sender" as const, actor: senderInfo(), target: t, op: req.op, args: req };
 				if (audit) await auditRecord({ ...audit, phase: "attempted" });
-				const response = await call(t, { ...out, from: senderInfo(), request });
+				// A subagent's report must not stamp its parent's state: the receiver skips feature hooks for it.
+				const response = await call(t, { ...out, from: senderInfo(), request, ...(recordReport ? {} : { subagent: true }) });
 				if (audit) await auditRecord({ ...audit, phase: "completed", result: classifyResponse(req.op, response) });
 				if (req.op === "message" && req.report && recordReport && reportMaster === t.id && masterId() === t.id) {
 					notifications.reported(turn, req.report.kind, t, response);

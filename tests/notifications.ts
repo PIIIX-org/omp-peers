@@ -243,7 +243,9 @@ try {
 	await send(master, "legacy acknowledgement", "WAITING");
 	response = undefined;
 	const child = { ...ctx, agent: { kind: "subagent" } } as unknown as ExtensionContext;
+	assert(received.every(row => row.subagent === undefined), "main-session reports carry no subagent flag");
 	await send(master, "child report is not the main turn", "DONE", child);
+	assert.equal(received.at(-1)!.subagent, true, "a subagent's report is flagged so features never record it for its parent");
 	duringDelivery = () => claim(other, "other-session");
 	await send(master, "master changed while delivering", "DECISION");
 	claim(master, "master-session");
