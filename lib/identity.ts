@@ -146,7 +146,8 @@ export function resolvePeerTargets<T extends Registration & IdentityStatus>(
 /**
  * The live members of a group that may receive the request, plus every member that may not and why.
  * Nothing is dropped silently: a member is a recipient or has a `skipped` entry (not running, this
- * session, ambiguous logical session, or the caller's own reason). The sender is never a recipient.
+ * session, or the caller's own reason). The sender is never a recipient. A member whose logical session
+ * has duplicate registrations and no proven writer fails the whole send, like `all`: nothing is sent.
  */
 function resolveGroup<T extends Registration & IdentityStatus>(
 	name: string, members: string[], others: T[], selfRow: T | undefined, selfId: string, selfSessionId: string,
@@ -158,12 +159,13 @@ function resolveGroup<T extends Registration & IdentityStatus>(
 	const peers: T[] = [];
 	const skipped: Skipped[] = [];
 	const live = new Set<string>();
+	const unproven: T[] = [];
 	for (const { members: rows, owner } of logicalSessions(others)) {
 		const key = logicalId(rows[0]);
 		if (!wanted.has(key)) continue;
 		live.add(key);
 		if (rows.length > 1 && !owner) {
-			skipped.push({ name: rows[0].name, reason: `ambiguous: ${rows.length} registrations share this logical session and none is proven: ${choices(rows)}; use an explicit peer ID` });
+			unproven.push(...rows);
 			continue;
 		}
 		const target = owner ?? rows[0];
@@ -171,6 +173,7 @@ function resolveGroup<T extends Registration & IdentityStatus>(
 		if (reason) skipped.push({ name: target.name, reason });
 		else peers.push(target);
 	}
+	if (unproven.length) return { peers: [], error: `group "${name}" not sent: logical session has no proven writer: ${choices(unproven)}; use an explicit peer ID` };
 	if (wanted.has(selfKey)) skipped.push({ name: selfRow?.name ?? selfKey, reason: "this session" });
 	for (const id of members) if (!live.has(id) && id !== selfKey) skipped.push({ name: id, reason: "not running" });
 	skipped.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.reason < b.reason ? -1 : a.reason > b.reason ? 1 : 0));

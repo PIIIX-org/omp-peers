@@ -8,6 +8,7 @@ import {
 	addMember, CONTROL_OPS, deleteGroup, groups, groupsFile, groupsOf, groupTargeting, MAX_GROUPS, MAX_MEMBERS, membersOf, readGroups, removeMember, sendSkipReason, type GroupsState,
 } from "../../lib/features/groups";
 import type { FeatureHost } from "../../lib/features/host";
+import { NON_WAKE_OPS, wakeGate } from "../../lib/features/pause";
 import { addRule, agentContext, rules } from "../../lib/features/rules";
 import { identifyPeers, logicalId, resolvePeerTargets, stablePeerId, type Registration } from "../../lib/identity";
 
@@ -230,39 +231,47 @@ describe("preview and send filtering", () => {
 		for (const member of [MASTER, A, B, id("c"), id("d"), id("g"), OFFLINE]) await addMember(home, "frontend", member, master);
 	};
 
+	const unprovenError = () => `group "frontend" not sent: logical session has no proven writer: worker-g (${id("g")}), worker-g (p000001); use an explicit peer ID`;
+
+	test("a member with unproven duplicate writers fails the whole preview and send: nothing would be sent", async () => {
+		await seed();
+		expect(await say("preview frontend")).toBe(`preview group:frontend (message), 7 member(s)\nerror: ${unprovenError()}`);
+		expect(await host("master").resolveGroup("frontend", "message")).toEqual({ recipients: [], skipped: [], error: unprovenError() });
+	});
+
 	test("preview of a message names every excluded member with its reason", async () => {
 		await seed();
-		const choices = `worker-g (${id("g")}), worker-g (p000001)`;
+		proven = true;
 		expect(await say("preview frontend")).toBe([
 			"preview group:frontend (message), 7 member(s)",
-			`would receive: worker-a (${A}), worker-d (${id("d")})`,
+			`would receive: worker-a (${A}), worker-d (${id("d")}), worker-g (${id("g")})`,
 			"skipped: master (this session)",
 			`skipped: ${OFFLINE} (not running)`,
 			"skipped: worker-b (paused)",
 			"skipped: worker-c (refuses inbound requests)",
-			`skipped: worker-g (ambiguous: 2 registrations share this logical session and none is proven: ${choices}; use an explicit peer ID)`,
 		].join("\n"));
 	});
 
 	test("the op matters: control ops also skip locked sessions, status reaches a paused one", async () => {
 		await seed();
+		proven = true;
 		const out = (await say("preview frontend prompt")).split("\n");
 		expect(out[0]).toBe("preview group:frontend (prompt), 7 member(s)");
-		expect(out[1]).toBe(`would receive: worker-a (${A})`);
+		expect(out[1]).toBe(`would receive: worker-a (${A}), worker-g (${id("g")})`);
 		expect(out).toContain("skipped: worker-d (locked (control refused))");
 		expect(out).toContain("skipped: worker-b (paused)");
 		const status = (await say("preview frontend status")).split("\n");
-		expect(status[1]).toBe(`would receive: worker-a (${A}), worker-b (${B}), worker-d (${id("d")})`);
+		expect(status[1]).toBe(`would receive: worker-a (${A}), worker-b (${B}), worker-d (${id("d")}), worker-g (${id("g")})`);
 		expect(status).not.toContain("skipped: worker-b (paused)");
 		expect(status).toContain("skipped: worker-c (refuses inbound requests)");
 	});
 
-	test("with a proven writer the logical session is one recipient and nothing is ambiguous", async () => {
+	test("with a proven writer the logical session is one recipient and nothing fails", async () => {
 		await seed();
 		proven = true;
 		const plan = await host("master").resolveGroup("frontend", "message");
 		expect(plan.recipients.map(p => p.id)).toEqual([A, id("d"), id("g")]); // registry order; worker-g once, via its proven writer
-		expect(plan.skipped.some(s => s.reason.startsWith("ambiguous"))).toBe(false);
+		expect(plan.error).toBeUndefined();
 	});
 
 	test("preview errors mirror a real send: unknown, empty, no running members, no eligible recipients", async () => {
@@ -278,15 +287,19 @@ describe("preview and send filtering", () => {
 		expect(await say("preview idle")).toBe("preview group:idle (message), 1 member(s)\nerror: group \"idle\" has no eligible recipients right now\nskipped: worker-b (paused)");
 	});
 
-	test("the preview, the send resolution and the receiver gate use one decision", () => {
-		for (const op of ["message", "status", ...CONTROL_OPS]) {
-			for (const peer of [{}, { paused: true }, { inbound: "refuse" as const }, { control: false }, { paused: true, control: false }]) {
-				const reason = sendSkipReason(peer, op);
-				expect(groupTargeting(home, op).skip(peer)).toBe(reason);
+	test("the sender's pre-filter agrees with the receiver's decision for every op and state", () => {
+		const states = [{}, { paused: true }, { inbound: "refuse" as const }, { control: false }, { paused: true, control: false }];
+		for (const op of ["message", "status", "unheard-of", ...NON_WAKE_OPS, ...CONTROL_OPS]) {
+			for (const peer of states) {
+				// The receiver (handle() in extensions/peers.ts) checks in this order: inbound, control lock, pause gate.
+				const receiver = (peer as { inbound?: string }).inbound === "refuse" ? "refuses inbound requests"
+					: CONTROL_OPS.has(op) && (peer as { control?: boolean }).control === false ? "locked (control refused)"
+					: !wakeGate({ paused: (peer as { paused?: boolean }).paused === true }, op).allow ? "paused" : undefined;
+				expect(sendSkipReason(peer, op)).toBe(receiver);
+				expect(groupTargeting(home, op).skip(peer)).toBe(receiver);
 			}
 		}
-		expect(sendSkipReason({ paused: undefined, inbound: undefined, control: undefined }, "prompt")).toBeUndefined(); // unknown stays unknown
-		expect(sendSkipReason({ inbound: "refuse", control: false, paused: true }, "prompt")).toBe("refuses inbound requests"); // the receiver's own order
+		expect(sendSkipReason({}, "prompt")).toBeUndefined(); // unknown flags are never skipped; the receiver decides
 	});
 });
 

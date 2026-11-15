@@ -41,7 +41,6 @@ Every member of the group is either sent to or listed on a `skipped: <name> (<re
 | `locked (control refused)` | control actions only: the session ran `/peers lock` |
 | `not running` | the stored stable ID has no live session; shown by ID because the name is unknown |
 | `this session` | the sender is a member; a group target never includes the sending session |
-| `ambiguous: ...` | several registrations share the member's logical session and none is proven to be the writer; use an explicit peer ID |
 
 A member with several reasons shows the first in the receiver's own order: refusing inbound, then locked, then paused.
 
@@ -51,9 +50,10 @@ Errors (nothing is sent; skipped members are still listed after the error):
 - `group "<name>" is empty; add members with /peers groups add <name> <peer>`
 - `group "<name>" has no running members`
 - `group "<name>" has no eligible recipients right now`
+- `group "<name>" not sent: logical session has no proven writer: <names and IDs>; use an explicit peer ID` when a member's logical session has several registrations and none is proven to be the writer. Like `all`, the whole send fails and nothing is sent (preview shows the same error); send to an explicit peer ID, or wait until the writer is proven. Paused, refusing, locked and not-running members are not ambiguity: they are skipped and listed.
 - `"group:<name>" is ambiguous: it names a group and a peer: ...` when a running session is literally named `group:<name>` and the group exists; use that session's ID. When no such group exists, a session named `group:<name>` keeps its ordinary name meaning.
 
-A member that belongs to a logical session with duplicate registrations is addressed once, through its proven writer. Unlike `all`, an unprovable duplicate skips only that member instead of blocking the whole send.
+A member that belongs to a logical session with duplicate registrations is addressed once, through its proven writer.
 
 ## Pause and the receiver gate
 

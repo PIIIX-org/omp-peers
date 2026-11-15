@@ -4,7 +4,7 @@
 
 ### Session groups
 
-- Add `/peers groups list|add|remove|delete|members|preview` (private `groups.json`, keyed by stable session id, 64 groups of 64 members) and a `group:<name>` target for `/peers msg|report|do`, `peers_send` and `peers_control`: recipients that are paused (from the published registry flag; the receiver's wake gate stays authoritative), refusing inbound, locked (control ops) or ambiguous are skipped and listed as `skipped: <name> (<reason>)`; unknown, empty and no-recipient groups are explicit errors and `all` is unchanged. Group-scoped standing rules now match real membership.
+- Add `/peers groups list|add|remove|delete|members|preview` (private `groups.json`, keyed by stable session id, 64 groups of 64 members) and a `group:<name>` target for `/peers msg|report|do`, `peers_send` and `peers_control`: recipients that are paused (from the published registry flag; the receiver's wake gate stays authoritative), refusing inbound or locked (control ops) are skipped and listed as `skipped: <name> (<reason>)`; unknown, empty, no-recipient and unproven-duplicate-writer groups are explicit errors and `all` is unchanged. Group-scoped standing rules now match real membership.
 
 ### Decision inbox
 
