@@ -65,7 +65,7 @@ def run(h):
     explain = h.say(master, "/peers rules explain worker-b")
     for expected in ("precedence: session > group", "1. r2  session:" + worker_row["id"] + " (worker-b)  [key=tests]  run the suite with option beta",
                      "2. r3  global  be concise", "overridden: r1  global  [key=tests]  run the suite with option alpha  -- conflicts with r2",
-                     "injection: 2 rule(s)"):
+                     "injection: 2 of 2 rule(s)"):
         assert expected in explain, (expected, explain)
     assert "r1  global" in h.say(master, "/peers rules list") and "CONFLICT with r2" in h.say(master, "/peers rules list")
     print("PASS explain shows precedence, the winning rule and the overridden loser")
@@ -97,10 +97,13 @@ def run(h):
     print("PASS rules persist on disk and apply to the resumed session")
 
     # A locked session must not receive rules authored by others; its own rules still apply.
-    assert "locked" in h.say(worker, "/peers lock") or h.row(worker)["control"] is False
+    assert h.say(worker, "/peers lock") == "Control from master: refused"
     assert injected(h.ask(worker, "Reply with the word ok.")) is None
+    locked_view = h.say(worker, f"/peers rules explain {worker_row['id']}")
+    assert "only rules this session added itself are injected" in locked_view and "injection: none" in locked_view, locked_view
     assert h.say(worker, f"/peers rules add session:{worker_row['id']} own rule").startswith("added r5")
     assert injected(h.ask(worker, "Reply with the word ok.")) == ["- [r5 session] own rule"]
-    h.say(worker, "/peers unlock")
+    assert "injection: 1 of 1 rule(s)" in h.say(master, f"/peers rules explain {worker_row['id']}")
+    assert h.say(worker, "/peers unlock") == "Control from master: allowed"
     assert injected(h.ask(worker, "Reply with the word ok.")) == ["- [r5 session] own rule", "- [r4 global] survive restart"]
-    print("PASS a locked session is injected only its own rules")
+    print("PASS a locked session is injected only its own rules, and explain agrees")
