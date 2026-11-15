@@ -795,7 +795,7 @@ export default function peers(pi: ExtensionAPI) {
 			isMaster: () => masterId() === id,
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
-				.map(p => ({ id: p.id, name: p.name, acceptsRemote: p.inbound === "accept" && p.control })),
+				.map(p => ({ id: p.id, name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse" })),
 			groupsOf: () => [],
 			send: (to, req) => sendTo(to, req.text),
 			acceptsRemote: () => state.inbound === "accept" && state.control,

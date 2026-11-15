@@ -3,6 +3,7 @@
 import type { zod } from "@oh-my-pi/pi-coding-agent";
 import type { Report } from "../reports";
 import { board } from "./board";
+import { deps } from "./deps";
 import type { FeatureHost } from "./host";
 import { inbox } from "./inbox";
 import { pause, resume } from "./pause";
@@ -33,4 +34,4 @@ export interface Feature {
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox, board, pause, resume];
+export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, deps];

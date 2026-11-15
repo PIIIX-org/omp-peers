@@ -8,6 +8,8 @@ export interface PeerView {
 	name: string;
 	/** Whether the peer accepts requests from others (published inbound/control state); undefined when unknown. */
 	acceptsRemote?: boolean;
+	/** Whether the peer refuses all inbound requests (published state); undefined when unknown. A control lock alone is not a refusal: messages still arrive. */
+	refusesInbound?: boolean;
 }
 
 /** Outcome of delivering one message to one peer through the extension's normal send path. */
