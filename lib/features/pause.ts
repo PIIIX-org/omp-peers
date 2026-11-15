@@ -45,11 +45,11 @@ const PEER_ID_RE = /^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
 /**
  * Ops that never start an agent turn and stay available while paused. `compact` is here on purpose:
  * it makes one summarisation request over the session's own history and does not start a turn or
- * deliver any peer content. `pause` and `resume` are listed so the table is the whole truth; the
- * receiver still requires the master for them.
+ * deliver any peer content. `pause` is listed so the table is the whole truth; the receiver still
+ * requires the master for it. `resume` is deliberately not an op: it is only the local command.
  */
 export const NON_WAKE_OPS: readonly string[] = [
-	"status", "tail", "abort", "rename", "compact", "model", "effort", "subagents", "setting", "shutdown", "pause", "resume",
+	"status", "tail", "abort", "rename", "compact", "model", "effort", "subagents", "setting", "shutdown", "pause",
 ];
 
 export const PAUSED_ERROR = "session is paused";

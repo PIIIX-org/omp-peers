@@ -15,6 +15,7 @@ const host: FeatureHost = {
 	peers: async () => [],
 	groupsOf: () => [],
 	resolveGroup: async () => ({ recipients: [], skipped: [] }), // not exercised by this suite
+	send: async () => ({ status: "offline" }),
 };
 for (let i = 0; i < Number(count); i++) {
 	const result = await addRule(host, "global", `${tag} rule ${i}`);

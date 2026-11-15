@@ -6,13 +6,21 @@
 
 - Add `/peers groups list|add|remove|delete|members|preview` (private `groups.json`, keyed by stable session id, 64 groups of 64 members) and a `group:<name>` target for `/peers msg|report|do`, `peers_send` and `peers_control`: recipients that are paused (from the published registry flag; the receiver's wake gate stays authoritative), refusing inbound, locked (control ops) or ambiguous are skipped and listed as `skipped: <name> (<reason>)`; unknown, empty and no-recipient groups are explicit errors and `all` is unchanged. Group-scoped standing rules now match real membership.
 
+### Decision inbox
+
+- Add `/peers inbox` and the `peers_decision` tool: sessions queue deduplicated, credential-screened questions into a private cross-process-safe `inbox.json`; the master lists them grouped by source (read-only, never wakes a session) and answers, defers, reopens or retries them. An answer is sent once to the live asking session through the normal send path with the outcome recorded; otherwise it stays pending for `peers_decision check`. Extend the feature registry with `tools()` and the feature host with `send()`.
+
 ### Pause and resume
 
-- Add `/peers pause [reason]`, `/peers resume` and master-only `pause`/`resume` control ops: a persisted per-session state (`pause.json`, also published as `paused`/`pausedSince` in the registry) enforced by one receiver-side wake gate (`wakeGate`) that refuses `message` and `prompt` with a structured deferred/refused result while status, tail and the other non-wake ops stay available. Senders print `deferred: <name> is paused`; the completion watcher keeps its digest queued with bounded retries and delivers it once after resume.
+- Add `/peers pause [reason]`, `/peers resume` and a master-only `pause` control op. Resume is user-controlled: only the paused session's own `/peers resume` clears a pause, and no remote caller, including the master's agent, can. State is persisted per session (`pause.json`, also published as `paused`/`pausedSince` in the registry) and enforced by one receiver-side wake gate (`wakeGate`) that refuses `message` and `prompt` with a structured deferred/refused result while status, tail and the other non-wake ops stay available. Senders print `not delivered: <name> is paused; resend after its user resumes it`; the completion watcher keeps its digest queued with bounded retries and delivers it once after resume.
 
 ### Standing rules
 
 - Add `/peers rules` with global/group/session scopes, deterministic precedence, visible key conflicts, duplicate and credential rejection, master-gated changes, and a private cross-process-safe `rules.json`; matching rules are appended to the main session's system prompt at each agent start. Introduce the shared feature registry, private state store and real-OMP scenario runner (`npm run test:features`, `npm run test:features-smoke`).
+
+### Session task board
+
+- Add `/peers board` (`list`, `assign`, `set`, `clear`, `stale`): a persisted, private `board.json` with one entry per stable session ID, fed by explicit assignments and accepted structured reports via a new `Feature.onReport` hook; shows stale (configurable `board.staleHours`), unknown and not-running state honestly, never wakes sessions, and updates entries under a per-entry locked read-modify-write.
 
 ### Lifecycle cleanup
 

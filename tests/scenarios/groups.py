@@ -115,7 +115,7 @@ def run(h):
     assert "groups: backend, frontend" in h.say(master, "/peers rules explain worker-a")
     print("PASS a group-scoped rule starts applying to a session once it joins the group")
 
-    assert h.say(master, f"/peers do {bid} resume") == f"worker-b ({bid}): ok (resumed)"
+    assert h.say(b, "/peers resume").startswith(f"resumed worker-b ({bid})")
     wait_for(lambda: h.row(b)["paused"] is False)
     a_start, b_start = len(a.frames), len(b.frames)
     both = h.say(master, "/peers msg group:frontend after resume")

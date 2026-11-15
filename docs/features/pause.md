@@ -7,11 +7,10 @@ An explicit, persisted state that tells every automated coordinator not to wake 
 ```text
 /peers pause [reason]      pause THIS session (reason: one line, at most 120 characters)
 /peers resume              resume THIS session
-/peers do <peer|all> pause [reason]    master only: pause other sessions
-/peers do <peer|all> resume            master only: resume other sessions
+/peers do <peer|all> pause [reason]    master only: pause other sessions (resume is only the session's own /peers resume)
 ```
 
-`peers_control` accepts the same `pause` and `resume` actions, again master only. The session's own user typing `/peers pause` or `/peers resume` is the authorization for that session; nothing else can clear a pause (restart, the watcher, triggers, a master prompt or an incoming message do not). The master's `pause`/`resume` use the same master check and the same `/peers lock` rule as every other control operation, so a locked session refuses them and only its own user can resume it. A sender's claimed name is never authentication.
+`peers_control` accepts the `pause` action, master only; it has no `resume` action. Resuming is user-controlled: only the paused session's own user typing `/peers resume` clears a pause. Nothing else can (restart, the watcher, triggers, a master prompt or the master's agent, an incoming message). The master's `pause` uses the same master check and the same `/peers lock` rule as every other control operation. A sender's claimed name is never authentication.
 
 Pausing an already paused session changes nothing: the original start time and reason stay. Reasons are screened like standing-rule text (control characters and credential-looking text are rejected), stored locally and never published to the registry.
 
@@ -28,9 +27,10 @@ The gate runs in the receiving session, in the request handler, so every sender 
 | `abort`, `shutdown` | available |
 | `rename`, `model`, `effort`, `subagents`, `setting` | available (they change configuration only) |
 | `compact` | available: it makes one summarisation request over the session's own history; it does not start a turn or deliver any peer content |
-| `pause`, `resume` | available, master only for remote callers |
+| `pause` | available, master only for remote callers |
+| `resume` | not a remote operation: the socket refuses it from every caller (`resume is only available as /peers resume in the paused session itself`) |
 
-`deferred` marks informational traffic the sender may retry after resume; `refused` marks a dispatch that is not retained anywhere, so the master must send it again. Neither is queued by the paused session: nothing is stored on its behalf and no model request is made.
+`deferred` is the structured status for informational traffic (a retry after resume is reasonable); `refused` marks a dispatch. Neither is queued by the paused session: nothing is stored on its behalf and no model request is made, so the sender must resend after resume. Only the completion watcher retains its own digest and retries it.
 
 Refusals happen before any side effect: a refused `prompt` does not change the model, effort or tier either, and a refused `message` does not count against the sender's rate limit.
 
@@ -38,7 +38,7 @@ The decision is `wakeGate(state, op)` in `lib/features/pause.ts`, a pure functio
 
 ## What senders see
 
-- `/peers msg`, `/peers do ... prompt` and `peers_send`/`peers_control` print `deferred: <name> is paused (<id>)` or `refused: <name> is paused (<id>)` instead of `failed: ...`. A broadcast prints one line per target, so paused and working sessions are visible side by side.
+- `/peers msg`, `/peers do ... prompt` and `peers_send`/`peers_control` print `not delivered: <name> is paused; resend after its user resumes it (<id>)` instead of `failed: ...`. The structured result keeps `status: "deferred"` (message) or `"refused"` (prompt); the text says what actually happened: nothing was delivered or queued, so the sender must resend. A broadcast prints one line per target, so paused and working sessions are visible side by side.
 - `peers_list` and `/peers list` show `[paused]` in the flags, `status` reports `paused` and `pausedSince` (an ISO time) in the session's registry row `~/.omp/run/peers/<id>.json`, and the session's own status line shows `paused`. Reading any of these never wakes anything. Registrations from older versions have no `paused` field and are shown without a flag.
 - The completion watcher keeps its digest queued when the master is paused: it is not dropped and not marked delivered, it is retried after at most 30 seconds, and it logs one warning (`notification deferred: the master session is paused ...`) for the whole paused period instead of one per attempt. After the master resumes, the same digest, with the same event IDs, is delivered once.
 

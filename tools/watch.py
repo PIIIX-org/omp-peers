@@ -127,7 +127,7 @@ def peer_rpc(peer, request, *, stop=None):
 
 
 class Watcher:
-    def __init__(self, home, state_dir, interval=1, digest_interval=300, paused_retry=PAUSED_RETRY_SECONDS):
+    def __init__(self, home, state_dir, interval=1, digest_interval=300):
         self.home = Path(home).expanduser().absolute()
         self.registry = self.home / ".omp/run/peers"
         self.log_dir = self.home / ".omp/logs"
@@ -136,7 +136,6 @@ class Watcher:
         self.state = None  # Load only after acquiring the singleton lock.
         self.interval = interval
         self.digest_interval = digest_interval
-        self.paused_retry = paused_retry
         self.next_send = 0
         self.stopping = False
         self.last_error = None
@@ -517,7 +516,7 @@ class Watcher:
                              "text": text}, stop=self.is_stopping)
         except PeerPaused:
             # The master is paused: every digest stays queued, unacknowledged, and the retry is slow and quiet.
-            self.next_send = time.monotonic() + self.paused_retry
+            self.next_send = time.monotonic() + PAUSED_RETRY_SECONDS
             if not self.stopping:
                 self.report_error("notification deferred: the master session is paused; digests stay queued until it resumes")
             return

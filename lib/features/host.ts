@@ -19,6 +19,14 @@ export interface GroupPlan {
 	/** Set when nothing would be sent (empty or unknown group, no running or eligible member, ambiguity). */
 	error?: string;
 }
+/** Outcome of delivering one message to one peer through the extension's normal send path. */
+export type SendResult =
+	/** The peer accepted the message. */
+	| { status: "delivered" }
+	/** No live session has that stable id; nothing was sent. */
+	| { status: "offline" }
+	/** The peer is live but refused or could not be reached (inbound refuse, rate limit, socket error, ...). */
+	| { status: "failed"; reason: string };
 
 /**
  * What a feature may ask of the extension. Features take this instead of importing host runtime
@@ -39,4 +47,10 @@ export interface FeatureHost {
 	groupsOf(peerId: string): string[];
 	/** The recipients and skipped members of `op` sent to `group:<name>` now: the resolution a real send uses. Read-only. */
 	resolveGroup(name: string, op: string): Promise<GroupPlan>;
+	/**
+	 * Send an ordinary peer message to the live session with stable id `to`. It takes the same path as
+	 * `peers_send`, so the receiver's inbound refuse, lock and rate limit apply unchanged. Never resumes a
+	 * session that is not live.
+	 */
+	send(to: string, req: { text: string }): Promise<SendResult>;
 }
