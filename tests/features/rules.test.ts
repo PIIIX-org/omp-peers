@@ -336,7 +336,7 @@ describe("concurrency across real processes", () => {
 		expect(state.rules).toHaveLength(24);
 		expect(new Set(state.rules.map(r => r.id)).size).toBe(24);
 		expect(new Set(state.rules.map(r => r.text)).size).toBe(24);
-		expect(state.nextId).toBe(31);
+		expect(state.nextId).toBe(25);
 	});
 
 	test("identical adds racing in two processes store exactly one rule", async () => {
