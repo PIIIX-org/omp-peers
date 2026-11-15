@@ -15,7 +15,7 @@ Named sets of sessions, so a reusable subset can be addressed as `group:<name>` 
 
 - Group names are lower-case: `a-z`, `0-9`, `.`, `_`, `-`, 1 to 48 characters, starting with a letter or digit (the same names `rules` uses for `group:<name>` scopes). Input is lower-cased.
 - A group is created by its first `add`. Removing the last member leaves an empty group until `delete`.
-- `preview` takes the op a real send would use: `message` (default; what `/peers msg`, `/peers report` and `peers_send` send), `status`, or a control action (`prompt`, `abort`, `compact`, `model`, `effort`, `subagents`, `setting`, `rename`, `tail`, `shutdown`, `pause`, `resume`). It runs the same resolution as a real send, so its answer is what a send would do at that instant.
+- `preview` takes the op a real send would use: `message` (default; what `/peers msg`, `/peers report` and `peers_send` send), `status`, or a control action (`prompt`, `abort`, `compact`, `model`, `effort`, `subagents`, `setting`, `rename`, `tail`, `shutdown`, `pause`; `resume` is not a remote operation). It runs the same resolution as a real send, so its answer is what a send would do at that instant.
 - `list`, `members` and `preview` are read-only: they never send anything, never wake a session and never write state.
 
 ## Who may change groups
