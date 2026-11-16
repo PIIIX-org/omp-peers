@@ -70,15 +70,17 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 ### Optional features
 
 - Standing rules: `/peers rules add|remove|list|explain` stores scoped (global, group, session) instructions once and appends the matching ones at each main-agent start. See [docs/features/rules.md](docs/features/rules.md).
+- Session groups: `/peers groups add|remove|delete|members|list|preview` keeps named sets of sessions; `group:<name>` is a target for `msg`, `report`, `do`, `peers_send` and `peers_control` that skips and lists paused, refusing and locked members. See [docs/features/groups.md](docs/features/groups.md).
 - Decision inbox: sessions queue short user questions with `peers_decision` or `/peers inbox ask`; the master lists, answers or defers them with `/peers inbox`, and an answer is sent once to the live asking session. See [docs/features/inbox.md](docs/features/inbox.md).
 - Session task board: `/peers board list|assign|set|clear|stale` keeps a persisted board of each session's assigned task and last reported status (stable-ID keyed, honest about stale and unknown). See [docs/features/board.md](docs/features/board.md).
 - Pause and resume: `/peers pause [reason]` and `/peers resume` persistently stop automated wakes (master messages and prompts, watcher digests) of a session until you resume it; status and listing still work. See [docs/features/pause.md](docs/features/pause.md).
+- Shared locks: `/peers locks acquire|renew|release|status` and the `peers_lock` tool give sessions named locks and semaphores with capacity, owner-only release and TTL expiry; contention returns `busy` instead of waiting. See [docs/features/locks.md](docs/features/locks.md).
 - Report-driven dependencies: `/peers deps add|list|preview|pending|approve|reject|remove|enable|disable|ledger` turns a session's structured DONE report into a queued prompt for another session; confirm mode by default, `--auto` only when you add it, deduplicated across restarts, never to a paused session. See [docs/features/deps.md](docs/features/deps.md).
 
 ### Tools
 
 - `peers_list`: list sessions, models, effort, busy/idle state, background job/subagent counts, settled state, context usage, and the master.
-- `peers_send`: deliver an agent-attributed message to a peer or `all`. Supply either `text` for an ordinary message or `report` for a structured report, never both. Reports deliver immediately; successful same-turn main-session delivery to the current master can suppress a redundant watcher notice.
+- `peers_send`: deliver an agent-attributed message to a peer, `all` or `group:<name>`. Supply either `text` for an ordinary message or `report` for a structured report, never both. Reports deliver immediately; successful same-turn main-session delivery to the current master can suppress a redundant watcher notice.
 - `peers_control`: master-only prompt, abort, compact, model, effort, subagents, setting, rename, tail, shutdown, or pause. `status` does not require master ownership. There is no remote resume: only the paused session's own user can run `/peers resume`.
 
 A message to an idle peer can start a model turn and consume its provider quota. A master's `prompt` starts or queues user work. `abort`, `compact`, and `shutdown` affect running sessions; review your target before sending them. Status and tail inspect local state without asking a model.
