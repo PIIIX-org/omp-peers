@@ -20,6 +20,7 @@ const host: FeatureHost = {
 	acceptsRemote: () => true,
 	peers: async () => [{ id: MASTER, name: "master" }, { id: "p00000000000000a1", name: "worker-a" }, { id: "p00000000000000b2", name: "worker-b" }],
 	groupsOf: () => [],
+	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async (to, req) => {
 		await Bun.sleep(150);
 		fs.appendFileSync(path.join(home, "sent.log"), `${JSON.stringify({ to, text: req.text })}\n`);

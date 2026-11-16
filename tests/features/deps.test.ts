@@ -48,6 +48,7 @@ function host(self = MASTER, opts: { master?: boolean; accepts?: boolean } = {})
 		acceptsRemote: () => opts.accepts ?? true,
 		peers: async () => live,
 		groupsOf: () => [],
+		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		send: async (to, req) => {
 			sendCalls++;
 			sent.push({ to, text: req.text });
