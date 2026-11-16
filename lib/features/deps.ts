@@ -231,18 +231,23 @@ function chain(rules: DepRule[], start: string, goal: string): string[] | undefi
 
 // ---- Dispatch text and blockers ----------------------------------------------------------------
 
-/** The exact peer message a trigger delivers. The receiver adds its own "from the master session" header. */
-export function dispatchText(rule: DepRule, triggerId: string, live: PeerView[]): string {
+/**
+ * The exact peer message a trigger delivers. The receiver adds its own "[Message from peer session ...]" header. Only
+ * stable ids and the user-typed rule fields appear: a session's current name is attacker-controlled text and is
+ * never put into a message the master sends.
+ */
+export function dispatchText(rule: DepRule, triggerId: string): string {
 	return [
-		`Dependency trigger ${triggerId} (rule ${rule.id}, authorized by the user at the master session): ${label(rule.from, live)} reported DONE for unit "${rule.unit}" (the sender identity is claimed, not authenticated).`,
+		`Dependency trigger ${triggerId} (rule ${rule.id}, authorized by the user at the master session): session ${rule.from} reported DONE for unit "${rule.unit}" (the sender identity is claimed, not authenticated).`,
 		`Task: ${rule.prompt}`,
 	].join("\n");
 }
 
 /**
- * Why a dispatch to the rule's target is known to fail right now, from the same published state the receiver
- * enforces. Empty means an attempt would be made. A locked target still receives messages (the lock refuses
- * control operations only), and the receiver's per-sender rate limit cannot be seen from here.
+ * Why a dispatch to the rule's target is known to fail right now, from the published state the receiver enforces.
+ * Empty means an attempt would be made. A control-locked target is not messaged either: a dependency trigger is
+ * authorized work, so it respects the target's refusal of control. The receiver's per-sender rate limit cannot be
+ * seen from here.
  */
 function targetBlockers(host: FeatureHost, rule: DepRule, live: PeerView[]): string[] {
 	const reasons: string[] = [];
@@ -250,6 +255,7 @@ function targetBlockers(host: FeatureHost, rule: DepRule, live: PeerView[]): str
 	if (rule.to === host.self().id) reasons.push("target is the dispatching session itself");
 	else if (!peer) reasons.push("target is not running");
 	else if (peer.refusesInbound === true) reasons.push("peer refuses inbound requests");
+	else if (peer.acceptsRemote === false) reasons.push("target locked (control refused)");
 	const pause = readPause(host.home, rule.to);
 	if (pause.paused) reasons.push(pause.error ? `pause state unreadable (${pause.error})` : PAUSED_ERROR);
 	return reasons;
@@ -369,7 +375,7 @@ export async function dispatchTrigger(host: FeatureHost, triggerId: string): Pro
 			reason = reasonText(blockers.join("; "));
 		} else {
 			sending = true;
-			const sent = await host.send(rule.to, { text: dispatchText(rule, triggerId, live) });
+			const sent = await host.send(rule.to, { text: dispatchText(rule, triggerId) });
 			if (sent.status === "delivered") status = "delivered";
 			else {
 				reason = reasonText(sent.status === "offline" ? "target is not running" : sent.reason);
@@ -433,16 +439,21 @@ export async function onReport(report: Report, from: { id: string; name: string 
 		const rules = current.rules.map(rule => (rule.once && due.includes(rule) ? { ...rule, enabled: false } : rule));
 		return { state: { ...current, nextTriggerId: current.nextTriggerId + due.length, rules, ledger: [...ledger, ...triggers] }, result: triggers.map((trigger, i) => ({ trigger, rule: due[i] })) };
 	});
-	let failure: Error | undefined;
+	// Auto dispatch never runs inside the report hook: the reporter is acknowledged once the trigger is recorded, so
+	// a slow or hung target cannot make it time out and resend. The ledger claim makes the background attempt safe.
 	for (const { trigger, rule } of fired) {
 		if (rule.mode !== "auto") continue;
-		try {
-			await dispatchTrigger(host, trigger.id);
-		} catch (error) {
-			failure ??= error as Error;
-		}
+		const attempt = dispatchTrigger(host, trigger.id).then(() => undefined, () => undefined);
+		inflight.add(attempt);
+		void attempt.finally(() => inflight.delete(attempt));
 	}
-	if (failure) throw failure;
+}
+
+const inflight = new Set<Promise<void>>();
+
+/** Resolves once every auto dispatch started by a report has finished (tests and orderly shutdown). */
+export async function settled(): Promise<void> {
+	await Promise.all([...inflight]);
 }
 
 // ---- Presentation ------------------------------------------------------------------------------
@@ -495,6 +506,15 @@ function renderLedger(state: DepsState): string {
 }
 
 /**
+ * The trigger id this rule would get when a matching DONE report arrives: the hook numbers the triggers of all enabled
+ * rules matching one report in rule order, so a rule's id depends on its place among them.
+ */
+function nextTriggerFor(state: DepsState, rule: DepRule): string {
+	const due = state.rules.filter(r => r.enabled && r.from === rule.from && r.unit === rule.unit);
+	return `t${state.nextTriggerId + Math.max(0, due.indexOf(rule))}`;
+}
+
+/**
  * What dispatching `rule` as trigger `triggerId` would do, computed with the same text, blocker and approve checks as the
  * real dispatch. `entry` is set when previewing an existing trigger. Read-only: sends nothing and wakes nothing.
  */
@@ -512,7 +532,7 @@ function renderPreview(host: FeatureHost, rule: DepRule, triggerId: string, entr
 		`dispatcher: ${dispatcher}`,
 		`to: ${label(rule.to, live)}`,
 		`message (one peer message from the dispatching session, exactly):`,
-		...dispatchText(rule, triggerId, live).split("\n").map(line => `  | ${line}`),
+		...dispatchText(rule, triggerId).split("\n").map(line => `  | ${line}`),
 		approval
 			? `approve would refuse: ${approval}`
 			: blockers.length ? `delivery would be blocked: ${blockers.join("; ")} (outcome: not delivered: ${reasonText(blockers.join("; "))})` : "delivery would be attempted; the receiving session's own gates and rate limit still apply",
@@ -536,7 +556,7 @@ async function preview(host: FeatureHost, args: string[]): Promise<string> {
 		const ruleId = parseId(first, RULE_ID_RE);
 		if (!ruleId) return USAGE;
 		const rule = state.rules.find(r => r.id === ruleId);
-		return rule ? renderPreview(host, rule, `t${state.nextTriggerId}`, undefined, live) : `error: no dependency rule ${ruleId}`;
+		return rule ? renderPreview(host, rule, nextTriggerFor(state, rule), undefined, live) : `error: no dependency rule ${ruleId}`;
 	}
 	if (!first || !rest.length) return USAGE;
 	const from = resolveKnown(first, live);
@@ -544,7 +564,7 @@ async function preview(host: FeatureHost, args: string[]): Promise<string> {
 	const unit = normalize(rest.join(" "));
 	const found = state.rules.filter(rule => rule.from === from.id && rule.unit === unit);
 	if (!found.length) return `no dependency rule for ${label(from.id, live)} DONE "${unit}"`;
-	return found.map(rule => renderPreview(host, rule, `t${state.nextTriggerId}`, undefined, live)).join("\n\n");
+	return found.map(rule => renderPreview(host, rule, nextTriggerFor(state, rule), undefined, live)).join("\n\n");
 }
 
 function describeDispatch(result: DispatchResult & { status: "delivered" | "not delivered" | "unknown" }, live: PeerView[]): string {
@@ -574,7 +594,7 @@ async function add(host: FeatureHost, rest: string[]): Promise<string> {
 	if (!result.ok) return `error: ${result.error}`;
 	const { rule } = result;
 	const state = readDeps(host);
-	const shown = renderPreview(host, rule, `t${state.nextTriggerId}`, undefined, await livePeers(host));
+	const shown = renderPreview(host, rule, nextTriggerFor(state, rule), undefined, await livePeers(host));
 	return [`added ${rule.id}${rule.mode === "auto" ? ": AUTO mode, so a matching DONE report dispatches without asking" : ": confirm mode, so a matching DONE report only queues a trigger for your approval"}`, shown].join("\n");
 }
 

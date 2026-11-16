@@ -239,7 +239,7 @@ def run(h):
     assert "Offline checks passed" not in deps_file.read_text()
     print("PASS after the target's user resumes it, approve delivers t2 exactly once; reject closes t3 without sending")
 
-    # ---- refusing inbound blocks dispatch; a control lock alone does not (messages are not control operations) ----
+    # ---- refusing inbound and a control lock both block dispatch (authorized work respects the target's refusal) ----
     assert h.say(master, "/peers deps add worker-a Refuse check -> worker-b Never sent while refused").startswith("added d4: confirm mode")
     report(done("Refuse check"))
     requests = len(h.gateway.requests)
@@ -256,6 +256,16 @@ def run(h):
     assert h.say(target, "/peers accept") == "Inbound peer requests: accept"
     assert h.say(target, "/peers lock") == "Control from master: refused"
     wait_for(lambda: h.row(target)["inbound"] == "accept" and h.row(target)["control"] is False)
+    locked_reason = "target locked (control refused)"
+    locked_preview = h.say(master, "/peers deps preview t4")
+    assert locked_preview.split("\n")[-2] == f"delivery would be blocked: {locked_reason} (outcome: not delivered: {locked_reason})", locked_preview
+    target_start = len(target.frames)
+    locked = h.say(master, "/peers deps approve t4")
+    assert locked == (f"t4 not delivered: {locked_reason}; nothing reached worker-b ({tid}). "
+                      "Fix the cause and run /peers deps approve t4 again, or /peers deps reject t4"), locked
+    quiet(target, target_start, requests)
+    assert h.say(target, "/peers unlock") == "Control from master: allowed"
+    wait_for(lambda: h.row(target)["control"] is True)
     attempted_preview = h.say(master, "/peers deps preview t4")
     assert attempted_preview.split("\n")[-2] == attempted, attempted_preview
     start = len(target.frames)
@@ -263,4 +273,4 @@ def run(h):
     wait_for(lambda: any(f.get("type") == "agent_end" for f in target.frames[start:]), seconds=30)
     time.sleep(0.5)
     assert len(h.gateway.requests) == requests + 1 and json.dumps(h.gateway.requests[-1][1]).count("Task: Never sent while refused") == 1
-    print("PASS a target that refuses inbound requests is not delivered (and says so in the preview); a control-locked target still receives the message")
+    print("PASS a target that refuses inbound requests or is control-locked is not delivered (and the preview says so); after unlock the message arrives once")
