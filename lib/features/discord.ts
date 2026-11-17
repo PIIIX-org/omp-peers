@@ -21,7 +21,6 @@
  * - State is one cross-process-locked file. A send or a poll is CLAIMED under the lock before the network is
  *   touched, so two processes never both do the same work.
  */
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Report } from "../reports";
@@ -29,7 +28,7 @@ import type { FeatureHost } from "./host";
 import type { Feature } from "./index";
 import { readSecretFile } from "./secretfile";
 import { looksLikeSecret } from "./secrets";
-import { readState, stateRoot, updateState } from "./store";
+import { readRegularFile, readState, stateRoot, updateState } from "./store";
 
 // ---- Limits -----------------------------------------------------------------------------------
 
@@ -135,7 +134,7 @@ function agent(): string {
 	let version = "unknown";
 	try {
 		const file = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json");
-		const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { version?: unknown };
+		const parsed = JSON.parse(readRegularFile(file)) as { version?: unknown };
 		if (typeof parsed.version === "string" && /^[0-9A-Za-z.+-]{1,32}$/.test(parsed.version)) version = parsed.version;
 	} catch {
 		// the version is informational only
