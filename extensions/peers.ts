@@ -28,6 +28,7 @@ import { formatActivity, initializeActivityHost, readActivity, type PeerActivity
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, logicalId, matchesWriter, resolvePeerTargets, skippedLine, stablePeerId, type IdentityStatus, type Skipped } from "../lib/identity";
 import { FEATURES } from "../lib/features";
+import { openDashboard, parseOptions as parseDashboardOptions, readOnlyView } from "../lib/features/dashboard";
 import { autoCompactRuntime } from "../lib/features/autocompact";
 import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInput } from "../lib/features/audit";
 import type { FeatureHost, ModelApply, ModelCheck, SendResult } from "../lib/features/host";
@@ -931,7 +932,7 @@ export default function peers(pi: ExtensionAPI) {
 			notify: text => ctx.ui.notify(text, "info"),
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
-				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse", busy: p.busy, context: p.context, paused: p.paused, recentErrorTurns: p.recentErrorTurns, usage: p.usage, updatedAt: p.updatedAt })),
+				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse", busy: p.busy, context: p.context, paused: p.paused, recentErrorTurns: p.recentErrorTurns, usage: p.usage, updatedAt: p.updatedAt, cwd: p.cwd, activeJobs: p.activity?.activeJobs, activeSubagents: p.activity?.activeSubagents, isSettled: p.isSettled })),
 			groupsOf: peerId => groupsOf(os.homedir(), peerId),
 			resolveGroup: async (name, op) => {
 				const { peers, error, skipped } = await resolveTargets(`group:${name}`, op);
@@ -1178,6 +1179,15 @@ export default function peers(pi: ExtensionAPI) {
 			const m = masterId();
 			const say = (s: string) => ctx.ui.notify(s, "info");
 			if (!state.sessionLock?.acquired) return say(state.identityError || "session identity unavailable");
+			// The live overlay only in a terminal UI; `--once`, RPC and print get the same renderer as one plain-text snapshot below.
+			if (sub === "dashboard" && ctx.hasUI && ctx.mode === "tui") {
+				const parsed = parseDashboardOptions(rest);
+				if (!parsed.ok) return say(parsed.error);
+				if (!parsed.once) {
+					const timers = { setInterval: (callback: () => void, ms: number) => ctx.setInterval(callback, ms), clearTimer: (timer: unknown) => ctx.clearTimer(timer as never) };
+					return openDashboard(ctx.ui, readOnlyView(featureHost(ctx)), parsed.options, timers);
+				}
+			}
 			const feature = FEATURES.find(f => f.name === sub);
 			if (feature) {
 				const out = await feature.command(rest, featureHost(ctx));

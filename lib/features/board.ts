@@ -76,7 +76,7 @@ function validateState(value: unknown): BoardState {
 }
 
 /** The board as stored; a missing file is an empty board. Never writes. */
-export function readBoard(host: FeatureHost): BoardState {
+export function readBoard(host: Pick<FeatureHost, "home">): BoardState {
 	return readState(boardFile(host.home), emptyState, validateState);
 }
 

@@ -25,6 +25,14 @@ export interface PeerView {
 	recentErrorTurns?: number;
 	/** ISO time of the peer's last registry write; undefined when unknown. */
 	updatedAt?: string;
+	/** Project directory the session runs in, as published; the dashboard shows only its last path component. */
+	cwd?: string;
+	/** Running background jobs in the peer's agent tree; null when the peer could not observe them, undefined on versions that do not publish it. */
+	activeJobs?: number | null;
+	/** Streaming descendant subagents; null when unobserved, undefined on versions that do not publish it. */
+	activeSubagents?: number | null;
+	/** Whether the peer's whole agent tree was quiescent when it last published; null when it could not tell, undefined on versions that do not publish it. */
+	isSettled?: boolean | null;
 }
 
 /** Who a request addressed to `group:<name>` reaches right now; `skipped` lists every member left out and why. */
