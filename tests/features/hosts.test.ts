@@ -10,6 +10,7 @@ import {
 	runSsh, runtimeFile, setSshBinForTests, sshArgv, sshEnv, sshTargetError, type HostsDeps, type RunResult,
 } from "../../lib/features/hosts";
 import { BRIDGE_COMMAND, HOST_NAME_RE, MAX_HOSTS, MAX_NAME_BYTES, MAX_TEXT_BYTES, WITHHELD, cleanName, capBytes, ensureHostId, hasPeerMessageMarker, hostIdFile, hostLabel, readRemoteMessage, safeName } from "../../lib/features/hosts_wire";
+import { looksLikeSecret } from "../../lib/features/secrets";
 import { allFileText, tmpHome } from "./hosts_helpers";
 
 const SELF = "p00000000000000a1";
@@ -453,8 +454,27 @@ describe("msg", () => {
 			expect(hasPeerMessageMarker(variant), variant).toBe(true);
 			expect(await say(`msg alpha:${PEER} ${variant}`), variant).toBe("error: refusing to relay a peer message; type your own text");
 		}
-		for (const fine of ["Message from peer session", "message from a peer", "[note] from peer session"]) expect(hasPeerMessageMarker(fine), fine).toBe(false);
+		for (const fine of ["Message from peer session", "message from a peer", "[note] from peer session", "the peer session sent a message from me"]) expect(hasPeerMessageMarker(fine), fine).toBe(false);
 		expect(runs).toEqual([]);
+	});
+
+	test("the relay check sees through invisible, full-width, accented and look-alike characters, and sends the ORIGINAL text otherwise", async () => {
+		await pinned();
+		const disguised = [
+			"[Message from peer sess\u200Bion", "[Message from peer ses\u00ADsion", "[Mess\u2060age from peer session", "[Message\uFEFF from peer session",
+			"\uFF3BMessage from peer session", "［Ｍｅｓｓａｇｅ　ｆｒｏｍ　ｐｅｅｒ　ｓｅｓｓｉｏｎ", "[Méssagé from peer session", "[Messаge from peer sеssion", // Cyrillic а and е
+			"[Μessage from peer session", "[Мessage from peer session", // Greek and Cyrillic capital M
+			"[Message from peer session\u200B\u200B", "[M\u200De\u200Cssage fr\u200Bom p\u200Beer s\u200Bession",
+		];
+		for (const variant of disguised) {
+			expect(hasPeerMessageMarker(variant), JSON.stringify(variant)).toBe(true);
+			expect(await say(`msg alpha:${PEER} ${variant}`), JSON.stringify(variant)).toBe("error: refusing to relay a peer message; type your own text");
+		}
+		expect(runs).toEqual([]);
+		// Invisible characters in ordinary text are not refused and are delivered exactly as typed.
+		script.push(ok({ status: "delivered" }));
+		expect(await say(`msg alpha:${PEER} caf\u00e9 with a zero\u200Bwidth space`)).toBe(`delivered to alpha:${PEER}`);
+		expect(request(0).text).toBe("caf\u00e9 with a zero\u200Bwidth space");
 	});
 
 	test("the target must be <name>:<peer-id>", async () => {
@@ -759,6 +779,31 @@ describe("remote-origin messages at the receiving session", () => {
 		expect(safeName("n".repeat(MAX_NAME_BYTES + 1))).toBe("n".repeat(MAX_NAME_BYTES));
 		expect(safeName("€".repeat(14))).toBe("€".repeat(13));
 		expect(safeName("worker-a")).toBe("worker-a");
+	});
+
+	// The cleaned form turns `[` and `]` into quotes, which completes a credential pattern the raw form does not match.
+	const bracketed = "[tok" + "en]=" + "abcdefghijklmnop";
+
+	test("safeName also screens the fully cleaned name: '[token]=...' is withheld, and the placeholder maps to itself", () => {
+		expect(looksLikeSecret(bracketed)).toBe(false);
+		expect(looksLikeSecret(cleanName(bracketed))).toBe(true);
+		expect(safeName(bracketed)).toBe(WITHHELD);
+		expect(safeName("ok " + bracketed)).toBe(WITHHELD);
+		expect(safeName("n".repeat(30) + " " + bracketed)).toBe(WITHHELD); // the match straddles the 40-byte cut
+		expect(safeName(WITHHELD)).toBe(WITHHELD);
+		expect(safeName("[withheld] ")).not.toBe("withheld");
+		expect(safeName("[note] fine")).toBe("'note' fine");
+	});
+
+	test("a bracketed credential in a listed name or in the sender name is withheld by the client", async () => {
+		await pinned();
+		script.push(ok({ sessions: [{ id: PEER, name: bracketed }, { id: "p00000000000000c3", name: WITHHELD }] }));
+		expect((await say("sessions alpha")).split("\n").slice(1)).toEqual([`alpha:[withheld] (${PEER})`, "alpha:[withheld] (p00000000000000c3)"]);
+		selfName = bracketed;
+		script.push(ok({ status: "delivered" }));
+		await say(`msg alpha:${PEER} hi`);
+		expect((request(runs.length - 1).from as { name: string }).name).toBe(WITHHELD);
+		expect(runs.map(r => r.stdin).join("")).not.toContain("abcdefghijklmnop");
 	});
 
 	test("the client re-screens every listed name in full: a long reply name with a straddling secret is withheld", async () => {

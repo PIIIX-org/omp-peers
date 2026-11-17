@@ -77,29 +77,53 @@ export function capBytes(text: string, max: number): string {
 	return out;
 }
 
-/**
- * A display name from another machine: control/format characters become spaces, whitespace collapses, `"`, `[` and `]`
- * (which could fake the header a receiving session puts around a message) become `'`, at most MAX_NAME_BYTES bytes.
- */
+/** A name with control/format characters turned to spaces, `"`, `[` and `]` (which could fake a message header) turned to `'` and whitespace collapsed; not yet cut. */
+function normaliseName(raw: string): string {
+	return raw.replace(CONTROL_CHARS, " ").replace(/["[\]]/g, "'").replace(/\s+/g, " ").trim();
+}
+
+/** A display name from another machine: see `normaliseName`, then at most MAX_NAME_BYTES bytes. */
 export function cleanName(raw: string): string {
-	const collapsed = raw.replace(CONTROL_CHARS, " ").replace(/["[\]]/g, "'").replace(/\s+/g, " ").trim();
-	return capBytes(collapsed, MAX_NAME_BYTES).trim() || "unnamed";
+	return capBytes(normaliseName(raw), MAX_NAME_BYTES).trim() || "unnamed";
 }
 
 /** Shown instead of a name that looks like a credential. */
 export const WITHHELD = "[withheld]";
 
 /**
- * `cleanName`, except that a name which looks like a credential becomes WITHHELD. The credential screen sees the whole
- * raw name (and its whitespace-collapsed form) BEFORE the byte cap, so a secret that straddles the cut is still caught.
+ * `cleanName`, except that a name which looks like a credential becomes WITHHELD. The credential screen sees every form of the
+ * WHOLE name BEFORE the byte cap: the raw text, its whitespace-collapsed form and the fully cleaned form (cleaning turns `[`
+ * into `'`, which can complete a pattern such as `[token]=...`), so a secret that straddles the cut is still caught. The
+ * placeholder itself maps to itself.
  */
 export function safeName(raw: string): string {
-	return looksLikeSecret(raw) || looksLikeSecret(raw.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ")) ? WITHHELD : cleanName(raw);
+	if (raw === WITHHELD) return WITHHELD;
+	const cleaned = normaliseName(raw);
+	const forms = [raw, raw.replace(CONTROL_CHARS, " ").replace(/\s+/g, " "), cleaned];
+	if (forms.some(looksLikeSecret)) return WITHHELD;
+	const shown = cleanName(raw);
+	return looksLikeSecret(shown) ? WITHHELD : shown;
 }
 
-/** The header a receiving session puts on a peer message. Any text containing it (case, spacing variants too) is a forwarded message and is never relayed. */
-export const PEER_MESSAGE_MARKER = /\[\s*message\s+from\s+peer\s+session/i;
-export const hasPeerMessageMarker = (text: string): boolean => PEER_MESSAGE_MARKER.test(text);
+/** Look-alike letters (Cyrillic, Greek) folded to Latin; NFKD already folds full-width and accented forms. The events feature's reserved-text table plus a few letters of this phrase. */
+const CONFUSABLES: Record<string, string> = {
+	"а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "і": "i", "ј": "j", "у": "y", "х": "x", "ѕ": "s", "һ": "h", "ԁ": "d", "ԛ": "q", "ԝ": "w",
+	"α": "a", "ε": "e", "ο": "o", "ρ": "p", "ι": "i", "ν": "v", "υ": "u", "κ": "k", "τ": "t", "η": "n", "χ": "x", "β": "b", "ɡ": "g", "ӏ": "l",
+	// Extra letters of the phrase being matched that the events table does not carry.
+	"μ": "m", "м": "m", "ԍ": "g", "ɑ": "a", "г": "r",
+};
+/** Lower-case, strip accents, fold look-alikes and drop everything but letters, digits and `[`: spacing, punctuation, zero-width and soft-hyphen tricks vanish. */
+const fold = (text: string): string =>
+	[...text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()].map(char => CONFUSABLES[char] ?? char).join("").replace(/[^a-z0-9[]/g, "");
+const FOLDED_MARKER = fold("[Message from peer session");
+
+/**
+ * Whether `text` contains the header a receiving session puts on a peer message, however it is dressed: any case or spacing,
+ * zero-width, soft-hyphen or other format characters inside it, full-width forms, accents or Cyrillic/Greek look-alikes. The check
+ * runs on a folded copy; the text that is sent or delivered is always the original. Plain prose without the opening bracket is fine.
+ */
+export const hasPeerMessageMarker = (text: string): boolean => fold(text).includes(FOLDED_MARKER);
+
 /** The label a machine puts in front of its sessions' ids: derived from its host id, so the claimed label and id cannot disagree. */
 export const hostLabel = (hostId: string): string => `host-${hostId.slice(0, 8)}`;
 

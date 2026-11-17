@@ -15,8 +15,8 @@
  * Child processes: Bun.spawn and Bun.spawnSync are wrapped, and every node:child_process API (spawn, exec, execFile,
  * fork and their sync forms) funnels through them, including named imports. A program whose basename is ssh, scp, sftp,
  * rsync, curl, wget, nc, ncat, telnet or git (also when run via `sh -c "..."`) is refused, git outright since its network
- * subcommands are not told apart. The one exception: a program whose resolved real path is inside os.tmpdir(), /tmp or this
- * tests directory (a fake `ssh` script in a disposable fixture dir) is allowed. A child `bun` (process.execPath) without
+ * subcommands are not told apart. The only exceptions (see isFixtureProgram): a program inside this tests directory, one
+ * registered with `registerFakeProgram`, or a file named exactly `ssh` in a disposable `opf-*`/`opx-*` directory of the temp root. A child `bun` (process.execPath) without
  * `--preload` gets `--preload <this file>` so it is guarded too.
  *
  * Refusals are loud even when the caller swallows the error: see tests/netguard_policy.ts (violation log, stderr line).
@@ -39,7 +39,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
-import { isLoopback, refuse, takeViolations } from "./netguard_policy";
+import { isLoopback, isRegisteredFake, refuse, takeViolations } from "./netguard_policy";
 
 const GUARD = Symbol.for("omp-peers.netguard");
 const SELF = import.meta.path;
@@ -111,14 +111,25 @@ function inside(file: string, dir: string): boolean {
 	return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
+/** Disposable directories the test helpers and smoke harnesses create directly under the temp root (`opf-*`, `opx-*`). */
+const DISPOSABLE_DIR = /^(?:opf|opx)-[A-Za-z0-9_-]+$/;
+
 /**
- * Exception for fixtures: a program whose resolved real path lies in os.tmpdir(), /tmp (the short-path disposable homes of the
- * smoke harness; os.tmpdir() differs on macOS) or the tests dir may be named like a network tool.
+ * Exception for fixtures, deliberately narrow. A program may carry a network tool's name only when
+ *  - its real path is inside this tests directory, or
+ *  - it was registered with `registerFakeProgram` in this process, or
+ *  - it is a file named exactly `ssh` directly inside a disposable `opf-*` / `opx-*` directory (or its `tools` subdirectory)
+ *    of the temp root (os.tmpdir() or /tmp, real paths): the fake ssh a test helper writes and a child process runs.
+ * Anything else under /tmp (a copied `curl` or `git`, an `ssh` elsewhere, a symlink to a system program) is still refused.
  */
 function isFixtureProgram(resolved: string | undefined): boolean {
 	if (resolved === undefined) return false;
-	const roots = [os.tmpdir(), "/tmp", TESTS_DIR].map(dir => (existsSync(dir) ? realpathSync(dir) : dir));
-	return roots.some(root => inside(resolved, root));
+	const real = (dir: string) => (existsSync(dir) ? realpathSync(dir) : dir);
+	if (inside(resolved, real(TESTS_DIR)) || isRegisteredFake(resolved)) return true;
+	if (path.basename(resolved) !== "ssh") return false;
+	const dir = path.dirname(resolved);
+	const disposable = path.basename(dir) === "tools" ? path.dirname(dir) : dir;
+	return [os.tmpdir(), "/tmp"].some(root => path.dirname(disposable) === real(root) && DISPOSABLE_DIR.test(path.basename(disposable)));
 }
 
 function checkProgram(program: string, cwd: string, searchPath: string | undefined): void {

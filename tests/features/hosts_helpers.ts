@@ -8,9 +8,11 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { stablePeerId } from "../../lib/identity";
 import { sshArgv } from "../../lib/features/hosts";
+import { registerFakeProgram } from "../netguard_policy";
 
 export const REPO = path.resolve(import.meta.dir, "..", "..");
 export const BRIDGE_SCRIPT = path.join(REPO, "scripts", "omp-peers-remote.ts");
+const NETGUARD = path.join(REPO, "tests", "netguard.ts");
 
 export const tmpHome = (): string => fs.mkdtempSync(path.join("/tmp", "opf-"));
 
@@ -84,10 +86,12 @@ export function writeFakeSsh(dir: string, target: string, remoteHome: string, lo
 		`echo called >> '${log}'`,
 		`[ "$#" -eq ${expected.length} ] || { echo "fake ssh: bad argument count $#" >&2; exit 97; }`,
 		...checks,
-		`HOME='${remoteHome}' exec '${process.execPath}' '${BRIDGE_SCRIPT}'`,
+		// The bridge runs under the network guard: any attempt to reach a non-loopback host fails loudly.
+		`HOME='${remoteHome}' exec '${process.execPath}' --preload '${NETGUARD}' '${BRIDGE_SCRIPT}'`,
 		"",
 	].join("\n");
 	fs.writeFileSync(bin, script, { mode: 0o700 });
+	registerFakeProgram(bin);
 	return bin;
 }
 

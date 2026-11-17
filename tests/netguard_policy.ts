@@ -11,7 +11,8 @@
  * violation a test did not declare with `expectViolations`, and the smoke harnesses fail on that stderr line.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { writeSync } from "node:fs";
+import { realpathSync, writeSync } from "node:fs";
+import path from "node:path";
 
 interface ViolationState {
 	/** Refusals nobody declared as expected; the bun preload fails the run when this is non-empty. */
@@ -64,4 +65,22 @@ export async function expectViolations(fn: () => unknown): Promise<string[]> {
 	const collected: string[] = [];
 	await state().scope.run(collected, fn);
 	return collected;
+}
+
+const FAKES = Symbol.for("omp-peers.netguard.fakes");
+
+/**
+ * Declare `absPath` (an absolute path to an existing file) a known fake program: it may carry a network tool's name (a fake
+ * `ssh` script). Registration is per process; a child process finds its fake by the disposable-directory rule in tests/netguard.ts.
+ */
+export function registerFakeProgram(absPath: string): void {
+	if (!path.isAbsolute(absPath)) throw new Error("registerFakeProgram needs an absolute path");
+	const holder = globalThis as Record<symbol, unknown>;
+	const set = (holder[FAKES] ??= new Set<string>()) as Set<string>;
+	set.add(realpathSync(absPath));
+}
+
+/** Whether `realFile` (a resolved real path) was registered with `registerFakeProgram`. */
+export function isRegisteredFake(realFile: string): boolean {
+	return ((globalThis as Record<symbol, unknown>)[FAKES] as Set<string> | undefined)?.has(realFile) === true;
 }

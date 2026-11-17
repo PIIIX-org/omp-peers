@@ -34,7 +34,8 @@ def write_fake_ssh(tools, remote_home, log):
         for i, arg in enumerate(ARGV, 1))
     script = (f"#!/bin/sh\necho called >> '{log}'\n"
               f'[ "$#" -eq {len(ARGV)} ] || {{ echo "fake ssh: bad argument count" >&2; exit 97; }}\n{checks}\n'
-              f"HOME='{remote_home}' exec '{shutil.which('bun')}' '{REPO / 'scripts' / 'omp-peers-remote.ts'}'\n")
+              f"HOME='{remote_home}' exec '{shutil.which('bun')}' --preload '{REPO / 'tests' / 'netguard.ts'}' "
+              f"'{REPO / 'scripts' / 'omp-peers-remote.ts'}'\n")
     path = Path(tools) / "ssh"
     path.write_text(script)
     path.chmod(0o700)
