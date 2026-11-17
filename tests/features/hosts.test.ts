@@ -738,7 +738,7 @@ describe("remote-origin messages at the receiving session", () => {
 		const cases: Array<[string, Record<string, unknown>]> = [
 			["hops 0", { ...good, hops: 0 }], ["hops 2", { ...good, hops: 2 }], ["no hops", { ...good, hops: undefined }],
 			["a report", { ...good, report: { kind: "DONE" } }], ["a dependency flag", { ...good, dependency: true }], ["a dependency flag set to false", { ...good, dependency: false }],
-			["a subagent flag", { ...good, subagent: true }], ["an audit request id", { ...good, request: "a".repeat(32) }],
+			["a subagent flag", { ...good, subagent: true }], ["an audit request id", { ...good, request: "a".repeat(32) }], ["an events envelope", { ...good, event: { kind: "info" } }],
 			["a local-looking sender id", { ...good, from: { id: SELF, name: "n" } }], ["a sender id without the label", { ...good, from: { id: `:${SELF}`, name: "n" } }],
 			["a label with upper case", { ...good, from: { id: `host-0123ABCD:${SELF}`, name: "n" } }], ["a sender id with a newline", { ...good, from: { id: `host-0123abcd:${SELF}\n`, name: "n" } }],
 			["a name with a newline", { ...good, from: { id: good.from.id, name: "a\nb" } }], ["a name over 40 bytes", { ...good, from: { id: good.from.id, name: "n".repeat(41) } }],

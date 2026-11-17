@@ -145,10 +145,10 @@ export interface RemoteSender {
  * informational only: they carry `hops: 1`, a `<label>:<id>` sender and nothing that could trigger work
  * (no report, dependency flag, subagent flag or audit request id).
  */
-export function readRemoteMessage(req: { from?: unknown; hops?: unknown; report?: unknown; dependency?: unknown; subagent?: unknown; request?: unknown; text?: unknown }):
+export function readRemoteMessage(req: { from?: unknown; hops?: unknown; report?: unknown; dependency?: unknown; subagent?: unknown; request?: unknown; event?: unknown; text?: unknown }):
 	{ ok: true; from: RemoteSender } | { ok: false; error: string } {
 	if (req.hops !== 1) return { ok: false, error: "remote message must carry hops 1" };
-	if (req.report !== undefined || req.dependency !== undefined || req.subagent !== undefined || req.request !== undefined) {
+	if (req.report !== undefined || req.dependency !== undefined || req.subagent !== undefined || req.request !== undefined || req.event !== undefined) {
 		return { ok: false, error: "remote messages cannot be reports, dependency triggers or control requests" };
 	}
 	if (typeof req.text !== "string" || Buffer.byteLength(req.text) > MAX_TEXT_BYTES) return { ok: false, error: `remote message text is longer than ${MAX_TEXT_BYTES} bytes` };
