@@ -2,6 +2,7 @@
 // Copyright (c) 2026 PIIIX-org contributors
 
 import type { Skipped } from "../identity";
+import type { EventEnvelope } from "./events-wire";
 import type { UsageSource } from "./usage";
 
 /** A live logical peer session as features see it. */
@@ -87,10 +88,13 @@ export interface FeatureHost {
 	/**
 	 * Send an ordinary peer message to the live session with stable id `to`. It takes the same path as
 	 * `peers_send`, so the receiver's inbound refuse, lock and rate limit apply unchanged. Never resumes a
-	 * session that is not live. `dependency: true` marks authorized work (a dependency trigger): the RECEIVER then
-	 * also refuses it while its own control is locked, so a lock set after the sender's preflight still holds.
+	 * session that is not live. `dependency: true` marks a delivery the master initiated on its own authority (a dependency trigger, an external
+	 * event): the RECEIVER then also refuses it while its own control is locked, so a lock set after the sender's preflight still holds.
+	 * `event` (events feature only) is the structured delivery the receiver renders itself; the receiver honours it only with
+	 * `dependency: true` from the master. `guard`, when given, is evaluated immediately before the message call, after the
+	 * peer list and target resolution; when it returns false nothing is sent and the result is `failed` with reason `GUARD_CANCELLED`.
 	 */
-	send(to: string, req: { text: string; dependency?: boolean }): Promise<SendResult>;
+	send(to: string, req: { text: string; dependency?: boolean; event?: EventEnvelope; guard?: () => boolean }): Promise<SendResult>;
 	/**
 	 * Resolve `selector` (a model id, `provider/id` or role alias, no thinking-level suffix) against the available
 	 * models and check its credentials, the way a routed model change is validated. Read-only: never substitutes
