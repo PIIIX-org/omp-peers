@@ -150,7 +150,8 @@ def run(h):
         worker_start = len(worker.frames)
         worker.call("prompt", message="HOLD-OPEN please")
         wait_for(lambda: h.row(worker)["busy"] is True)
-        busy_alert = wait_for(lambda: next((a for a in state()["alerts"] if a["condition"] == "busy" and a["emitted"]), None), seconds=100)
+        # The alert is recorded as emitted first and the delivery outcome is written by a second state update after the send.
+        busy_alert = wait_for(lambda: next((a for a in state()["alerts"] if a["condition"] == "busy" and a["emitted"] and a["notified"]), None), seconds=100)
         assert busy_alert["session"] == wid and busy_alert["limit"] == 1 and busy_alert["value"] >= 1, busy_alert
         assert busy_alert["notified"] == {oid: NOT_DELIVERED}, busy_alert
         status = h.say(master, "/peers watchdog status")
