@@ -5,11 +5,10 @@
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 
-from smoke import OMP, Peer, REPO, wait_for
+from smoke import OMP, Peer, REPO, plugin_link, wait_for
 
 sys.path.insert(0, str(REPO / "tools"))
 from watch import peer_rpc
@@ -74,9 +73,7 @@ def main():
                "XDG_CONFIG_HOME": str(home / "config"), "XDG_DATA_HOME": str(home / "data"),
                "XDG_CACHE_HOME": str(home / "cache"), "XDG_STATE_HOME": str(home / "state")}
         try:
-            installed = subprocess.run([OMP, "plugin", "link", str(REPO)], env=env, cwd=root,
-                                       capture_output=True, text=True, timeout=60)
-            assert installed.returncode == 0, installed.stdout + installed.stderr
+            plugin_link(env, root)
             peer = Peer(env, root)
             peer.call("get_state")
             registry = home / ".omp/run/peers"
