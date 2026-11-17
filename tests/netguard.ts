@@ -15,7 +15,7 @@
  * Child processes: Bun.spawn and Bun.spawnSync are wrapped, and every node:child_process API (spawn, exec, execFile,
  * fork and their sync forms) funnels through them, including named imports. A program whose basename is ssh, scp, sftp,
  * rsync, curl, wget, nc, ncat, telnet or git (also when run via `sh -c "..."`) is refused, git outright since its network
- * subcommands are not told apart. The one exception: a program whose resolved real path is inside os.tmpdir() or this
+ * subcommands are not told apart. The one exception: a program whose resolved real path is inside os.tmpdir(), /tmp or this
  * tests directory (a fake `ssh` script in a disposable fixture dir) is allowed. A child `bun` (process.execPath) without
  * `--preload` gets `--preload <this file>` so it is guarded too.
  *
@@ -111,10 +111,13 @@ function inside(file: string, dir: string): boolean {
 	return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
-/** Exception for fixtures: a program whose resolved real path lies in os.tmpdir() or the tests dir may be named like a network tool. */
+/**
+ * Exception for fixtures: a program whose resolved real path lies in os.tmpdir(), /tmp (the short-path disposable homes of the
+ * smoke harness; os.tmpdir() differs on macOS) or the tests dir may be named like a network tool.
+ */
 function isFixtureProgram(resolved: string | undefined): boolean {
 	if (resolved === undefined) return false;
-	const roots = [os.tmpdir(), TESTS_DIR].map(dir => (existsSync(dir) ? realpathSync(dir) : dir));
+	const roots = [os.tmpdir(), "/tmp", TESTS_DIR].map(dir => (existsSync(dir) ? realpathSync(dir) : dir));
 	return roots.some(root => inside(resolved, root));
 }
 
