@@ -189,13 +189,9 @@ function validateState(value: unknown): EventsState {
 	const s = value as Partial<EventsState> | null;
 	if (!s || typeof s !== "object" || s.version !== 1) bad("unsupported version (expected 1)");
 	const state = s as EventsState;
-	const quiet = (state as Partial<EventsState>).quiet;
-	if (quiet === undefined) state.quiet = null;
-	else if (quiet !== null && !(typeof quiet === "object" && AT_RE.test(quiet.start) && AT_RE.test(quiet.end) && quiet.start !== quiet.end && typeof quiet.timezone === "string" && validateZone(quiet.timezone) === quiet.timezone)) bad("malformed quiet hours");
-	// A state file from before route generations: routes get the next gens in order; its queued items have none (0) and are dropped as `route changed`.
-	const rawGen = (state as Partial<EventsState>).nextRouteGen;
-	if (rawGen === undefined) state.nextRouteGen = 1;
-	else if (!Number.isInteger(rawGen) || rawGen < 1) bad("malformed fields");
+	const quiet = state.quiet;
+	if (quiet !== null && !(typeof quiet === "object" && AT_RE.test(quiet.start) && AT_RE.test(quiet.end) && quiet.start !== quiet.end && typeof quiet.timezone === "string" && validateZone(quiet.timezone) === quiet.timezone)) bad("malformed quiet hours");
+	if (!Number.isInteger(state.nextRouteGen) || state.nextRouteGen < 1) bad("malformed fields");
 	if (!isCount(state.nextItemId) || state.nextItemId < 1 || typeof state.cli !== "boolean" || !(state.webhookPort === null || (Number.isInteger(state.webhookPort) && state.webhookPort >= MIN_PORT && state.webhookPort <= 65535))) bad("malformed fields");
 	if (![state.sources, state.routes, state.seen, state.ingested, state.queue, state.log].every(Array.isArray) || typeof state.hits !== "object" || !state.hits || Array.isArray(state.hits)) bad("malformed fields");
 	if (state.sources.length > MAX_SOURCES || state.routes.length > MAX_ROUTES || state.seen.length > MAX_SEEN || state.queue.length > MAX_QUEUE || state.log.length > MAX_LOG || state.ingested.length > GLOBAL_PER_HOUR) bad("a list exceeds its limit");
@@ -209,7 +205,6 @@ function validateState(value: unknown): EventsState {
 	const routeNames = new Set<string>();
 	const gens = new Set<number>();
 	for (const route of state.routes) {
-		if (route && typeof route === "object" && route.gen === undefined) route.gen = state.nextRouteGen++;
 		const fields = route?.fields;
 		const ok = route && typeof route === "object" && Number.isInteger(route.gen) && route.gen >= 1 && route.gen < state.nextRouteGen && !gens.has(route.gen) && NAME_RE.test(route.name) && !routeNames.has(route.name) && names.has(route.source) && (route.type === undefined || TYPE_RE.test(route.type)) &&
 			fields && typeof fields === "object" && !Array.isArray(fields) && Object.keys(fields).length <= MAX_ROUTE_FIELDS && Object.entries(fields).every(([k, v]) => KEY_RE.test(k) && isText(v, MAX_FIELD_VALUE_BYTES)) &&
@@ -224,7 +219,6 @@ function validateState(value: unknown): EventsState {
 	for (const [name, times] of Object.entries(state.hits)) if (!routeNames.has(name) || !Array.isArray(times) || times.length > MAX_PER_HOUR || !times.every(isTime)) bad("malformed route hits");
 	const ids = new Set<string>();
 	for (const item of state.queue) {
-		if (item && typeof item === "object" && item.routeGen === undefined) item.routeGen = 0;
 		const fields = item?.fields;
 		const ok = item && typeof item === "object" && Number.isInteger(item.routeGen) && item.routeGen >= 0 && item.routeGen < state.nextRouteGen && ITEM_ID_RE.test(item.id) && Number(item.id.slice(1)) < state.nextItemId && !ids.has(item.id) && NAME_RE.test(item.route) && NAME_RE.test(item.source) &&
 			typeof item.eventId === "string" && ID_RE.test(item.eventId) && typeof item.type === "string" && TYPE_RE.test(item.type) && isText(item.summary, MAX_SUMMARY_BYTES) &&
@@ -409,7 +403,7 @@ async function attempt(host: FeatureHost, item: Item, budget: Budget): Promise<A
 	return out;
 }
 
-type Settled = "done" | "retry" | "exhausted" | "unknown" | "aborted" | "held";
+type Settled = "done" | "retry" | "exhausted" | "unknown" | "aborted" | "held" | "dropped";
 
 /** Record `result` for the claimed `item` (a draft inside the state lock) and decide whether it is finished, retried, put back or given up. */
 function settle(state: EventsState, item: Item, result: Attempt, now: number): Settled {
@@ -435,7 +429,8 @@ function settle(state: EventsState, item: Item, result: Attempt, now: number): S
 	};
 	if (unknown) {
 		note(state, now, { ...base, outcome: "failed: outcome unknown (may have been delivered)" });
-		if (result.held && route === "ok") return requeueHeld();
+		// Members not sent yet (deferred by the budget, or cut off by events stopping) are not lost with the one that ended unknown.
+		if ((result.held || result.aborted) && route === "ok") return requeueHeld();
 		remove();
 		return "unknown";
 	}
@@ -444,7 +439,7 @@ function settle(state: EventsState, item: Item, result: Attempt, now: number): S
 	if (!finished && route !== "ok") {
 		remove();
 		note(state, now, { ...base, outcome: droppedFor(route) });
-		return "done";
+		return "dropped";
 	}
 	if (putBack) {
 		item.delivered = [...item.delivered, ...result.delivered];
@@ -1069,6 +1064,7 @@ async function approve(host: FeatureHost, idSpec: string): Promise<string> {
 		case "retry": lines.push(`${id} is still awaiting approval (attempt ${item.attempts} of ${MAX_ATTEMPTS}); fix the cause and approve it again, or /peers events reject ${id}`); break;
 		case "exhausted": lines.push(`${id} used all ${MAX_ATTEMPTS} attempts and was dropped (failed: retries exhausted)`); break;
 		case "unknown": lines.push(`${id} outcome unknown: the send ended without proof either way, so it may have arrived and it is not retried (failed: outcome unknown)`); break;
+		case "dropped": lines.push(`${id} was not sent: route ${item.route} was removed or replaced while it was being dispatched; it was dropped`); break;
 		case "aborted": lines.push(`${id} was not sent: events were turned off, or this session stopped being the master, while it was being delivered; it is still awaiting approval`); break;
 		case undefined: lines.push(`${id}: the claim was taken over by another process; see /peers events log`); break;
 		default:

@@ -1334,16 +1334,12 @@ describe("quiet hours", () => {
 		expect(fs.statSync(eventsFile(home)).mtimeMs).toBe(before);
 	});
 
-	test("an invalid stored window is refused, and a state file from before quiet hours still loads", async () => {
+	test("an invalid stored window is refused", async () => {
 		const state = stored();
 		fs.writeFileSync(eventsFile(home), JSON.stringify({ ...state, quiet: { start: "22:00", end: "22:00", timezone: "UTC" } }));
 		expect(await run("status")).toContain("events.json is invalid: malformed quiet hours");
 		fs.writeFileSync(eventsFile(home), JSON.stringify({ ...state, quiet: { start: "22:00", end: "07:00", timezone: "europe/berlin" } }));
 		expect(await run("status")).toContain("malformed quiet hours");
-		const legacy: Partial<EventsState> = { ...state };
-		delete legacy.quiet;
-		fs.writeFileSync(eventsFile(home), JSON.stringify(legacy));
-		expect(await run("quiet status")).toBe("quiet hours: off");
 	});
 });
 
@@ -1659,6 +1655,26 @@ describe("route generations", () => {
 		expect(logOutcomes().at(-1)).toBe("ci/evt-1/r1: dropped: route changed");
 	});
 
+	test("approve says so when the route is removed or replaced while the dispatch is in flight", async () => {
+		await configuredWork();
+		await ingest();
+		afterResolve = async () => {
+			await run("route remove w1");
+		};
+		expect(await run("approve i1")).toBe("i1 was not sent: route w1 was removed or replaced while it was being dispatched; it was dropped");
+		expect(sent).toEqual([]);
+		expect(stored().queue).toEqual([]);
+		// Replaced by a route of the same name: the same message.
+		await run("route add w1 --source ci --to worker-a --mode work --task Run the integration tests");
+		await ingest({ ...good, id: "evt-2" });
+		afterResolve = async () => {
+			await run("route remove w1");
+			await run("route add w1 --source ci --to worker-a --mode work --task Something else");
+		};
+		expect(await run("approve i2")).toBe("i2 was not sent: route w1 was removed or replaced while it was being dispatched; it was dropped");
+		expect(sent).toEqual([]);
+	});
+
 	test("a queued item whose route was replaced is dropped at the next tick, and approve refuses it", async () => {
 		await configuredWork();
 		await ingest();
@@ -1667,26 +1683,6 @@ describe("route generations", () => {
 		expect(await run("approve i1")).toBe("error: route w1 was replaced by a new route of the same name; i1 was dropped and is not sent");
 		expect(sent).toEqual([]);
 		expect(stored().queue).toEqual([]);
-	});
-
-	test("a state file from before route generations still loads: routes are numbered, its queued items are dropped as changed", async () => {
-		await configured();
-		await ingest();
-		const state: Record<string, unknown> = { ...stored() };
-		delete state.nextRouteGen;
-		state.routes = stored().routes.map(({ gen: _gen, ...route }) => route);
-		state.queue = stored().queue.map(({ routeGen: _routeGen, ...item }) => item);
-		fs.writeFileSync(eventsFile(home), JSON.stringify(state));
-		expect(await run("routes")).toContain("r1  info");
-		await tick(host());
-		expect(sent).toEqual([]);
-		expect(stored().queue).toEqual([]);
-		expect(stored().routes[0].gen).toBe(1);
-		expect(logOutcomes()).toEqual(["ci/evt-1/r1: dropped: route changed"]);
-		// New events are delivered under the numbered route.
-		await ingest({ ...good, id: "evt-2" });
-		await tick(host());
-		expect(sent).toHaveLength(1);
 	});
 });
 
@@ -1712,6 +1708,27 @@ describe("held group members survive another member's unknown or exhausted outco
 		sendResult = () => ({ status: "delivered" });
 		await tick(host());
 		expect(sent.map(entry => entry.to)).toEqual([B, A, C, B]);
+		expect(stored().queue).toEqual([]);
+	});
+
+	test("unknown for one member, then events turned off before the next: the not-yet-sent member is requeued, not lost, and gets it once events are on again", async () => {
+		sendResult = to => (to === A ? { status: "failed", reason: "timeout" } : { status: "delivered" });
+		await run("route remove r1");
+		await ingest({ ...good, id: "evt-4", type: "single" });
+		afterResolve = async to => {
+			if (to === B) await run("off");
+		};
+		await tick(host());
+		// A: unknown (closed). B: events went off while its send path resolved the target, so it was not sent.
+		expect(sent.map(entry => entry.to)).toEqual([A]);
+		const [rest] = stored().queue;
+		expect(rest).toMatchObject({ route: "g", status: "queued", attempts: 0 });
+		expect(rest.delivered).toEqual([A]);
+		afterResolve = undefined;
+		sendResult = () => ({ status: "delivered" });
+		await run("on cli");
+		await tick(host());
+		expect(sent.map(entry => entry.to)).toEqual([A, B, C]);
 		expect(stored().queue).toEqual([]);
 	});
 

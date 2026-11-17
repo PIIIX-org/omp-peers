@@ -201,8 +201,9 @@ const pick = (...values: unknown[]): unknown => values.find(value => value !== u
 const GITHUB_KINDS: Array<[(body: Record<string, unknown>) => boolean, string]> = [
 	// Most specific first: a payload often carries the objects of the more general kinds (a deployment_status holds a
 	// deployment and often a workflow_run; a review thread holds a pull_request).
-	// `since` is required on every deployment_review and appears in no other event; `reviewers` is optional on approved/rejected.
-	[b => typeof b.since === "string" && isPlain(b.workflow_run), "deployment_review"],
+	// `since` is required on every deployment_review and appears in no other event. Keyed on it alone: GitHub documents
+	// `workflow_run` as an object or null there, and `reviewers` is optional on approved/rejected.
+	[b => typeof b.since === "string", "deployment_review"],
 	[b => isPlain(b.deployment_status), "deployment_status"],
 	// A workflow_job for a job that deploys carries a top-level `deployment`: it stays a workflow_job.
 	[b => isPlain(b.workflow_job), "workflow_job"],

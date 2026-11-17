@@ -557,6 +557,13 @@ describe("github event kinds", () => {
 		expect(kind({ action: "requested", workflow_run: obj, since: 5 })).toBe("github.workflow_run");
 	});
 
+	test("deployment_review is keyed on `since` alone: workflow_run may be null or absent", () => {
+		expect(kind({ action: "requested", since: "2026-01-01T00:00:00Z", workflow_run: null })).toBe("github.deployment_review");
+		expect(kind({ action: "requested", since: "2026-01-01T00:00:00Z" })).toBe("github.deployment_review");
+		expect(kind({ action: "requested", since: "2026-01-01T00:00:00Z", deployment: obj, workflow_run: null })).toBe("github.deployment_review");
+		expect(kind({ action: "requested", workflow_run: obj })).toBe("github.workflow_run");
+	});
+
 	test("the order is most specific first: deployment_review, deployment_status, workflow_job, deployment, workflow_run", () => {
 		expect(kind({ deployment_status: obj, deployment: obj, workflow_job: obj, workflow_run: obj })).toBe("github.deployment_status");
 		expect(kind({ deployment: obj, workflow_job: obj, workflow_run: obj })).toBe("github.workflow_job");
