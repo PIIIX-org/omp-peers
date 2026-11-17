@@ -1,3 +1,4 @@
-# Every `bun test` run refuses outbound connections to non-loopback addresses (see tests/netguard.ts).
+# Every `bun test` run refuses outbound connections to non-loopback addresses (see tests/netguard.ts) and fails on any
+# refusal a test did not declare (tests/netguard_bun_test.ts).
 [test]
-preload = ["./tests/netguard.ts"]
+preload = ["./tests/netguard.ts", "./tests/netguard_bun_test.ts"]

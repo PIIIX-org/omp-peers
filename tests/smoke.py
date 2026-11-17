@@ -37,6 +37,9 @@ export default function fixture(pi) {
 '''
 
 
+GUARD_REFUSAL = "network guard: refused"
+
+
 class Peer:
     def __init__(self, env, cwd, resume=None, extra_args=()):
         self.frames = []
@@ -60,6 +63,20 @@ class Peer:
         for reader in self.readers:
             reader.start()
         self.seq = 0
+        try:
+            self.probe_guard()
+        except BaseException:
+            self.close()
+            raise
+
+    def probe_guard(self):
+        """Prove `-e tests/netguard_ext.ts` is wired: the OMP process must refuse a non-loopback connection itself."""
+        self.call("get_state")
+        self.command("/netguard-probe", "netguard-probe:refused")
+
+    def refusals(self):
+        """Network-guard refusals the OMP process reported on stderr (the probe's own refusal is not reported)."""
+        return [line.rstrip() for line in self.errors if GUARD_REFUSAL in line]
 
     def read(self):
         for line in self.proc.stdout:
@@ -114,6 +131,20 @@ class Peer:
             reader.join(timeout=5)
         for stream in (self.proc.stdout, self.proc.stderr):
             stream.close()
+        refused = self.refusals()
+        assert not refused, "OMP process attempted outbound network access:\n" + "\n".join(refused)
+
+
+def close_peers(peers):
+    """Close every still-open peer, then raise if any attempted outbound network access or failed to close cleanly."""
+    failures = []
+    for peer in reversed(peers):
+        if not peer.proc.stdin.closed:
+            try:
+                peer.close()
+            except AssertionError as error:
+                failures.append(str(error))
+    assert not failures, "\n".join(failures)
 
 
 def wait_for(predicate, seconds=15):

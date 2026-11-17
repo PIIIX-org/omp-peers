@@ -21,7 +21,7 @@ from http.server import HTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from routing_smoke import FakeGateway
-from smoke import OMP, Peer, REPO, wait_for
+from smoke import OMP, Peer, REPO, close_peers, wait_for
 
 SCENARIOS = Path(__file__).resolve().parent / "scenarios"
 
@@ -92,12 +92,12 @@ class Harness:
         return self.gateway.requests[-1][1]
 
     def close(self):
-        for peer in reversed(self.peers):
-            if not peer.proc.stdin.closed:
-                peer.close()
-        self.gateway.shutdown()
-        self.serving.join(timeout=5)
-        self.gateway.server_close()
+        try:
+            close_peers(self.peers)  # also fails when a peer's stderr shows a refused outbound connection
+        finally:
+            self.gateway.shutdown()
+            self.serving.join(timeout=5)
+            self.gateway.server_close()
         assert not self.serving.is_alive(), "fake gateway thread survived cleanup"
         assert not list(self.registry.glob("p*.json")), "disposable registrations survived shutdown"
         assert not any(f.get("type") == "extension_error" for p in self.peers for f in p.frames), "extension error"
