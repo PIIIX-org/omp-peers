@@ -198,7 +198,7 @@ describe("routes", () => {
 			`added route r1 (info): source ci type build.finished branch=main ok=true -> worker-a (${A}), at most 5/hour`,
 			"a matching event is delivered automatically as an informational message (untrusted data, not an instruction); paused, refusing or locked targets are not messaged",
 		].join("\n"));
-		expect(stored().routes[0]).toEqual({ name: "r1", source: "ci", type: "build.finished", fields: { branch: "main", ok: "true" }, to: A, mode: "info", maxPerHour: 5, createdAt: T0 });
+		expect(stored().routes[0]).toEqual({ name: "r1", gen: 1, source: "ci", type: "build.finished", fields: { branch: "main", ok: "true" }, to: A, mode: "info", maxPerHour: 5, createdAt: T0 });
 		live = live.map(peer => (peer.id === A ? { ...peer, name: "renamed" } : peer));
 		expect(stored().routes[0].to).toBe(A);
 		expect(await run("routes")).toContain(`r1  info  source ci type build.finished branch=main ok=true -> ${A}`);
@@ -411,7 +411,7 @@ describe("rate caps", () => {
 
 describe("queue bound", () => {
 	const filler = (n: number, mode: "info" | "work"): Item => ({
-		id: `i${n}`, route: "r1", source: "ci", eventId: `old-${n}`, type: "t", summary: "s", fields: {}, mode, to: A, ...(mode === "work" ? { task: "Run it" } : {}),
+		id: `i${n}`, route: "r1", routeGen: 1, source: "ci", eventId: `old-${n}`, type: "t", summary: "s", fields: {}, mode, to: A, ...(mode === "work" ? { task: "Run it" } : {}),
 		status: mode === "work" ? "awaiting" : "queued", attempts: 0, nextAt: now + HOUR_MS, createdAt: now, delivered: [],
 	});
 
@@ -1579,6 +1579,155 @@ describe("per-target send budget across the whole tick", () => {
 		expect(sent).toHaveLength(10);
 		await tick(host());
 		expect(sent).toHaveLength(11);
+		expect(stored().queue).toEqual([]);
+	});
+});
+
+describe("route generations", () => {
+	const readd = () => run("route add r1 --source ci --to worker-a");
+
+	test("every route gets a unique, never reused generation and every item carries its route's", async () => {
+		await configured();
+		await run("route add r2 --source ci --to worker-b");
+		expect(stored().routes.map(route => [route.name, route.gen])).toEqual([["r1", 1], ["r2", 2]]);
+		await run("route remove r1");
+		await readd();
+		expect(stored().routes.map(route => [route.name, route.gen])).toEqual([["r2", 2], ["r1", 3]]);
+		expect(stored().nextRouteGen).toBe(4);
+		await ingest();
+		expect(stored().queue.map(item => [item.route, item.routeGen])).toEqual([["r2", 2], ["r1", 3]]);
+	});
+
+	test("an in-flight send does not go out once its route is removed: the guard checks the route right before the send", async () => {
+		await configured();
+		await ingest();
+		afterResolve = async () => {
+			await run("route remove r1");
+		};
+		await tick(host());
+		expect(sent).toEqual([]);
+		expect(stored().queue).toEqual([]);
+		expect(logOutcomes()).toEqual(["ci/evt-1/r1: dropped: route removed"]);
+	});
+
+	test("claim, remove the route, turn off, add a route with the SAME name: the old item is dropped, never requeued under the new route", async () => {
+		await configured();
+		await ingest();
+		afterResolve = async () => {
+			await run("route remove r1");
+			await run("off");
+			expect(await readd()).toContain("added route r1");
+		};
+		await tick(host());
+		expect(sent).toEqual([]);
+		expect(stored().queue).toEqual([]);
+		expect(logOutcomes()).toEqual(["ci/evt-1/r1: dropped: route changed"]);
+		afterResolve = undefined;
+		await run("on cli");
+		await tick(host());
+		expect(sent).toEqual([]);
+		expect(stored().queue).toEqual([]);
+	});
+
+	test("the same-name replacement while events stay on also drops the old item; an event ingested later uses the new route", async () => {
+		await configured();
+		await ingest();
+		afterResolve = async () => {
+			await run("route remove r1");
+			await readd();
+		};
+		await tick(host());
+		expect(sent).toEqual([]);
+		expect(logOutcomes()).toEqual(["ci/evt-1/r1: dropped: route changed"]);
+		afterResolve = undefined;
+		await ingest({ ...good, id: "evt-2" });
+		await tick(host());
+		expect(sent.map(entry => entry.to)).toEqual([A]);
+		expect(sent[0].text).toContain("event id: evt-2");
+	});
+
+	test("a send that fails after the route was replaced is dropped as changed, not retried", async () => {
+		await configured();
+		await ingest();
+		sendResult = async () => {
+			await run("route remove r1");
+			await readd();
+			return { status: "failed", reason: "rate limited" };
+		};
+		await tick(host());
+		expect(stored().queue).toEqual([]);
+		expect(logOutcomes().at(-1)).toBe("ci/evt-1/r1: dropped: route changed");
+	});
+
+	test("a queued item whose route was replaced is dropped at the next tick, and approve refuses it", async () => {
+		await configuredWork();
+		await ingest();
+		const state = stored();
+		fs.writeFileSync(eventsFile(home), JSON.stringify({ ...state, routes: state.routes.map(route => ({ ...route, gen: 9 })), nextRouteGen: 10 }));
+		expect(await run("approve i1")).toBe("error: route w1 was replaced by a new route of the same name; i1 was dropped and is not sent");
+		expect(sent).toEqual([]);
+		expect(stored().queue).toEqual([]);
+	});
+
+	test("a state file from before route generations still loads: routes are numbered, its queued items are dropped as changed", async () => {
+		await configured();
+		await ingest();
+		const state: Record<string, unknown> = { ...stored() };
+		delete state.nextRouteGen;
+		state.routes = stored().routes.map(({ gen: _gen, ...route }) => route);
+		state.queue = stored().queue.map(({ routeGen: _routeGen, ...item }) => item);
+		fs.writeFileSync(eventsFile(home), JSON.stringify(state));
+		expect(await run("routes")).toContain("r1  info");
+		await tick(host());
+		expect(sent).toEqual([]);
+		expect(stored().queue).toEqual([]);
+		expect(stored().routes[0].gen).toBe(1);
+		expect(logOutcomes()).toEqual(["ci/evt-1/r1: dropped: route changed"]);
+		// New events are delivered under the numbered route.
+		await ingest({ ...good, id: "evt-2" });
+		await tick(host());
+		expect(sent).toHaveLength(1);
+	});
+});
+
+describe("held group members survive another member's unknown or exhausted outcome", () => {
+	beforeEach(async () => {
+		for (const id of [A, B, C]) await addMember(home, "team", id, { self: MASTER, master: true });
+		await run("source add ci");
+		await run("route add r1 --source ci --type single --to worker-b");
+		await run("route add g --source ci --to group:team");
+		await run("on cli");
+	});
+
+	test("unknown for one member, another held for being served already: the held member is requeued uncharged and gets it next tick", async () => {
+		sendResult = to => (to === A ? { status: "failed", reason: "timeout" } : { status: "delivered" });
+		await ingest({ ...good, id: "evt-3", type: "single" });
+		await tick(host());
+		// B was served by the single item first; A is unknown; C delivered; B is held.
+		expect(sent.map(entry => entry.to)).toEqual([B, A, C]);
+		const [rest] = stored().queue;
+		expect(rest).toMatchObject({ route: "g", status: "queued", attempts: 0 });
+		expect([...rest.delivered].sort()).toEqual([A, C].sort());
+		expect(logOutcomes()).toContain("ci/evt-3/g: failed: outcome unknown (may have been delivered)");
+		sendResult = () => ({ status: "delivered" });
+		await tick(host());
+		expect(sent.map(entry => entry.to)).toEqual([B, A, C, B]);
+		expect(stored().queue).toEqual([]);
+	});
+
+	test("retries exhausted for one member, another held: the held member is requeued uncharged and delivered later, the exhausted one is not retried", async () => {
+		await ingest({ ...good, id: "evt-3", type: "single" });
+		seed({ queue: stored().queue.map(item => (item.route === "g" ? { ...item, attempts: 2 } : item)) });
+		sendResult = to => (to === A ? { status: "failed", reason: "rate limited" } : { status: "delivered" });
+		await tick(host());
+		expect(sent.map(entry => entry.to)).toEqual([B, A, C]);
+		const [rest] = stored().queue;
+		expect(rest).toMatchObject({ route: "g", status: "queued", attempts: 2 });
+		expect([...rest.delivered].sort()).toEqual([A, C].sort());
+		expect(logOutcomes()).toContain("ci/evt-3/g: failed: retries exhausted");
+		sendResult = () => ({ status: "delivered" });
+		await tick(host());
+		expect(sent.map(entry => entry.to)).toEqual([B, A, C, B]);
 		expect(stored().queue).toEqual([]);
 	});
 });

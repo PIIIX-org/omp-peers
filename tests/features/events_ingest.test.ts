@@ -489,6 +489,29 @@ describe("markdown and every emitted component", () => {
 	});
 });
 
+describe("deeply nested markdown", () => {
+	const nest = (levels: number, inner = "work") => `${"[".repeat(levels)}${inner}${"](x)".repeat(levels)}`;
+
+	test("12 and 50 levels of nested links flatten completely, and the reserved-phrase check sees the flattened text", () => {
+		for (const levels of [12, 50, 300]) {
+			const flat = neutralize(`event ${nest(levels)} dispatch`);
+			expect(flat).toBe("event work dispatch");
+			expect(neutralize(flat)).toBe(flat);
+		}
+		for (const levels of [12, 30]) {
+			expect(reason({ ...good, summary: `event ${nest(levels)} dispatch` })).toBe("reserved text");
+			expect(reason({ ...good, fields: { note: `authorized ${nest(Math.min(levels, 14), "by")} the user` } })).toBe("reserved text");
+		}
+		expect(neutralize(nest(60, "a").replace(/\]\(x\)/g, "]()"))).toBe("a");
+	});
+
+	test("an accepted event never contains link syntax, however deeply it was nested", () => {
+		const event = accepted({ ...good, summary: `see ${nest(25, "docs")} now` });
+		expect(event.summary).toBe("see docs now");
+		expect(event.summary).not.toMatch(/\]\(|\[/);
+	});
+});
+
 describe("github event kinds", () => {
 	const kind = (value: unknown) => {
 		const parsed = githubToEvent(value, Buffer.from(JSON.stringify(value)));
@@ -518,4 +541,23 @@ describe("github event kinds", () => {
 		["event", { unrelated: true }],
 	];
 	for (const [expected, body] of cases) test(`${expected}`, () => expect(kind(body)).toBe(`github.${expected}`));
+
+	test("a workflow_job payload that carries a top-level deployment is a deployment", () => {
+		expect(kind({ action: "completed", workflow_job: obj, deployment: obj })).toBe("github.deployment");
+		expect(kind({ action: "completed", workflow_job: obj })).toBe("github.workflow_job");
+	});
+
+	test("a workflow_run is a deployment_review only when it comes with a reviewers array", () => {
+		expect(kind({ action: "requested", workflow_run: obj, reviewers: [] })).toBe("github.deployment_review");
+		expect(kind({ action: "requested", workflow_run: obj })).toBe("github.workflow_run");
+		expect(kind({ action: "requested", workflow_run: obj, reviewers: "nobody" })).toBe("github.workflow_run");
+		expect(kind({ action: "requested", workflow_run: obj, reviewers: {} })).toBe("github.workflow_run");
+	});
+
+	test("the order is most specific first: deployment_status over deployment over workflow_job over workflow_run", () => {
+		expect(kind({ deployment_status: obj, deployment: obj, workflow_job: obj, workflow_run: obj })).toBe("github.deployment_status");
+		expect(kind({ deployment: obj, workflow_job: obj, workflow_run: obj })).toBe("github.deployment");
+		expect(kind({ workflow_job: obj, workflow_run: obj })).toBe("github.workflow_run");
+		expect(kind({ reviewers: [], deployment: obj, workflow_run: obj })).toBe("github.deployment_review");
+	});
 });

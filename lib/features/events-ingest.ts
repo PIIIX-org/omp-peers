@@ -112,12 +112,14 @@ const containsReserved = (text: string): boolean => {
  * Render markdown and HTML structure as plain text, so event content can neither hide a reserved phrase behind link
  * syntax nor reach the receiving model as a clickable link, image, code fence or emphasis: `[text](url)` and
  * `[text][ref]` become `text`, HTML tags and comments vanish, backslash escapes are resolved, and backticks, `*`, `~` and
- * emphasis underscores at word edges are removed (snake_case words keep theirs). Repeated until stable, so nested
- * constructs cannot reassemble; applying it to its own output changes nothing.
+ * emphasis underscores at word edges are removed (snake_case words keep theirs). It repeats until nothing changes any
+ * more, however deeply the constructs are nested. That terminates: every round that changes the text removes
+ * characters (whitespace is already collapsed on input), so a text of n characters takes at most n + 1 rounds; the loop
+ * is bounded by exactly that. Applying it to its own output changes nothing.
  */
 export function neutralize(text: string): string {
 	let current = text;
-	for (let round = 0; round < 10; round++) {
+	for (let round = 0; round <= text.length + 1; round++) {
 		const next = current
 			.replace(/<[^>\n]*>/g, "")
 			.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")

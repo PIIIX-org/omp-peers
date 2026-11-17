@@ -72,6 +72,8 @@ export interface Source {
 
 export interface Route {
 	name: string;
+	/** Unique, never reused, assigned at `route add`. Names alone never identify a route: a removed route and a new one with the same name differ. */
+	gen: number;
 	source: string;
 	/** Exact event type to match; any type when absent. */
 	type?: string;
@@ -90,6 +92,8 @@ export interface Item {
 	/** `i<number>`, never reused. */
 	id: string;
 	route: string;
+	/** The `gen` of the route that created it. The item only ever goes out while that exact route still exists. */
+	routeGen: number;
 	source: string;
 	eventId: string;
 	type: string;
@@ -142,6 +146,8 @@ export interface Quiet {
 export interface EventsState {
 	version: 1;
 	nextItemId: number;
+	/** The next route `gen`. */
+	nextRouteGen: number;
 	/** The spool reader is on. */
 	cli: boolean;
 	/** The loopback listener port, when the listener is on. */
@@ -164,7 +170,7 @@ export interface EventsState {
 export const eventsFile = (home: string) => path.join(stateRoot(home), "events.json");
 
 const emptyState = (): EventsState => ({
-	version: 1, nextItemId: 1, cli: false, webhookPort: null, quiet: null, sources: [], routes: [], seen: [], ingested: [], hits: {}, queue: [], log: [],
+	version: 1, nextItemId: 1, nextRouteGen: 1, cli: false, webhookPort: null, quiet: null, sources: [], routes: [], seen: [], ingested: [], hits: {}, queue: [], log: [],
 	counters: { accepted: 0, delivered: 0, duplicate: 0, rejected: 0, dropped: 0, failed: 0 },
 });
 
@@ -186,6 +192,10 @@ function validateState(value: unknown): EventsState {
 	const quiet = (state as Partial<EventsState>).quiet;
 	if (quiet === undefined) state.quiet = null;
 	else if (quiet !== null && !(typeof quiet === "object" && AT_RE.test(quiet.start) && AT_RE.test(quiet.end) && quiet.start !== quiet.end && typeof quiet.timezone === "string" && validateZone(quiet.timezone) === quiet.timezone)) bad("malformed quiet hours");
+	// A state file from before route generations: routes get the next gens in order; its queued items have none (0) and are dropped as `route changed`.
+	const rawGen = (state as Partial<EventsState>).nextRouteGen;
+	if (rawGen === undefined) state.nextRouteGen = 1;
+	else if (!Number.isInteger(rawGen) || rawGen < 1) bad("malformed fields");
 	if (!isCount(state.nextItemId) || state.nextItemId < 1 || typeof state.cli !== "boolean" || !(state.webhookPort === null || (Number.isInteger(state.webhookPort) && state.webhookPort >= MIN_PORT && state.webhookPort <= 65535))) bad("malformed fields");
 	if (![state.sources, state.routes, state.seen, state.ingested, state.queue, state.log].every(Array.isArray) || typeof state.hits !== "object" || !state.hits || Array.isArray(state.hits)) bad("malformed fields");
 	if (state.sources.length > MAX_SOURCES || state.routes.length > MAX_ROUTES || state.seen.length > MAX_SEEN || state.queue.length > MAX_QUEUE || state.log.length > MAX_LOG || state.ingested.length > GLOBAL_PER_HOUR) bad("a list exceeds its limit");
@@ -197,22 +207,26 @@ function validateState(value: unknown): EventsState {
 		names.add(source.name);
 	}
 	const routeNames = new Set<string>();
+	const gens = new Set<number>();
 	for (const route of state.routes) {
+		if (route && typeof route === "object" && route.gen === undefined) route.gen = state.nextRouteGen++;
 		const fields = route?.fields;
-		const ok = route && typeof route === "object" && NAME_RE.test(route.name) && !routeNames.has(route.name) && names.has(route.source) && (route.type === undefined || TYPE_RE.test(route.type)) &&
+		const ok = route && typeof route === "object" && Number.isInteger(route.gen) && route.gen >= 1 && route.gen < state.nextRouteGen && !gens.has(route.gen) && NAME_RE.test(route.name) && !routeNames.has(route.name) && names.has(route.source) && (route.type === undefined || TYPE_RE.test(route.type)) &&
 			fields && typeof fields === "object" && !Array.isArray(fields) && Object.keys(fields).length <= MAX_ROUTE_FIELDS && Object.entries(fields).every(([k, v]) => KEY_RE.test(k) && isText(v, MAX_FIELD_VALUE_BYTES)) &&
 			isTarget(route.to) && (route.mode === "info" || route.mode === "work") && (route.mode === "work" ? isText(route.task, MAX_TASK) && PEER_ID_RE.test(route.to) : route.task === undefined) &&
 			Number.isInteger(route.maxPerHour) && route.maxPerHour >= 1 && route.maxPerHour <= MAX_PER_HOUR && isTime(route.createdAt);
 		if (!ok) bad("malformed route");
 		routeNames.add(route.name);
+		gens.add(route.gen);
 	}
 	for (const entry of state.seen) if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string" || !/^[0-9a-f]{32}$/.test(entry[0]) || !isTime(entry[1])) bad("malformed dedupe entry");
 	if (!state.ingested.every(isTime)) bad("malformed ingest times");
 	for (const [name, times] of Object.entries(state.hits)) if (!routeNames.has(name) || !Array.isArray(times) || times.length > MAX_PER_HOUR || !times.every(isTime)) bad("malformed route hits");
 	const ids = new Set<string>();
 	for (const item of state.queue) {
+		if (item && typeof item === "object" && item.routeGen === undefined) item.routeGen = 0;
 		const fields = item?.fields;
-		const ok = item && typeof item === "object" && ITEM_ID_RE.test(item.id) && Number(item.id.slice(1)) < state.nextItemId && !ids.has(item.id) && NAME_RE.test(item.route) && NAME_RE.test(item.source) &&
+		const ok = item && typeof item === "object" && Number.isInteger(item.routeGen) && item.routeGen >= 0 && item.routeGen < state.nextRouteGen && ITEM_ID_RE.test(item.id) && Number(item.id.slice(1)) < state.nextItemId && !ids.has(item.id) && NAME_RE.test(item.route) && NAME_RE.test(item.source) &&
 			typeof item.eventId === "string" && ID_RE.test(item.eventId) && typeof item.type === "string" && TYPE_RE.test(item.type) && isText(item.summary, MAX_SUMMARY_BYTES) &&
 			fields && typeof fields === "object" && !Array.isArray(fields) && Object.keys(fields).length <= MAX_FIELDS && Object.entries(fields).every(([k, v]) => KEY_RE.test(k) && isFieldValue(v)) &&
 			(item.mode === "info" || item.mode === "work") && isTarget(item.to) && (item.mode === "work" ? isText(item.task, MAX_TASK) : item.task === undefined) &&
@@ -302,14 +316,21 @@ function blocker(host: FeatureHost, peers: PeerView[], id: string): string | und
 	return undefined;
 }
 
+/** Whether the route that created `item` still exists as the same route: `changed` is a route of the same name added after the original was removed. */
+const routeStatus = (state: EventsState, item: Pick<Item, "route" | "routeGen">): "ok" | "removed" | "changed" => {
+	const named = state.routes.find(route => route.name === item.route);
+	return !named ? "removed" : named.gen === item.routeGen ? "ok" : "changed";
+};
+const droppedFor = (status: "removed" | "changed"): string => `dropped: route ${status}`;
+
 interface Attempt {
 	delivered: string[];
 	/** Failures worth retrying. */
 	failed: Array<{ to: string; reason: string }>;
 	/** Group members left out (paused, refusing, locked): listed, never retried. */
 	final: Array<{ to: string; reason: string }>;
-	/** A send ended without proof either way; the item is closed rather than retried. */
-	unknown: boolean;
+	/** Members whose send ended without proof either way: they may have it and are never retried. */
+	unknownTo: string[];
 	/** Events were turned off, this session stopped being the master (or quiet hours began) before a send: the rest was not sent and the item is put back unchanged. */
 	aborted: boolean;
 	/** Some members were left for a later tick: already served this tick (the per-target budget) or past the per-tick send cap. Not attempted, not charged. */
@@ -322,19 +343,19 @@ interface Budget {
 	sends: number;
 }
 
-/** Whether delivering `mode` items is still allowed right now: master, events on and, for info, outside quiet hours. Read fresh. */
-function mayDeliver(host: FeatureHost, mode: Item["mode"]): boolean {
+/** Whether delivering `item` is still allowed right now: master, events on, the item's own route still there (same generation) and, for info, outside quiet hours. Read fresh. */
+function mayDeliver(host: FeatureHost, item: Item): boolean {
 	try {
 		if (!host.isMaster()) return false;
 		const state = readEvents(host);
-		return isOn(state) && (mode === "work" || !inQuiet(state.quiet, host.now()));
+		return isOn(state) && routeStatus(state, item) === "ok" && (item.mode === "work" || !inQuiet(state.quiet, host.now()));
 	} catch {
 		return false;
 	}
 }
 
 async function attempt(host: FeatureHost, item: Item, budget: Budget): Promise<Attempt> {
-	const out: Attempt = { delivered: [], failed: [], final: [], unknown: false, aborted: false, held: false };
+	const out: Attempt = { delivered: [], failed: [], final: [], unknownTo: [], aborted: false, held: false };
 	const group = item.to.startsWith("group:");
 	let peers: PeerView[];
 	let targets: string[];
@@ -361,7 +382,7 @@ async function attempt(host: FeatureHost, item: Item, budget: Budget): Promise<A
 			continue;
 		}
 		// Checked again before EVERY send: `off`, a master handoff or the start of quiet hours stops the rest of a batch or group.
-		if (!mayDeliver(host, item.mode)) {
+		if (!mayDeliver(host, item)) {
 			out.aborted = true;
 			break;
 		}
@@ -370,7 +391,7 @@ async function attempt(host: FeatureHost, item: Item, budget: Budget): Promise<A
 		try {
 			// `dependency: true` for info too: the receiver then also refuses while its own control is locked, even if the lock was set after our check.
 			// `event` lets the receiver render the trusted frame itself; `guard` is evaluated by the send path after it resolved the target, right before the call.
-			const sent = await host.send(id, { text: frameFor(envelope), dependency: true, event: envelope, guard: () => mayDeliver(host, item.mode) });
+			const sent = await host.send(id, { text: frameFor(envelope), dependency: true, event: envelope, guard: () => mayDeliver(host, item) });
 			if (sent.status === "failed" && sent.reason === GUARD_CANCELLED) {
 				out.aborted = true;
 				break;
@@ -378,11 +399,11 @@ async function attempt(host: FeatureHost, item: Item, budget: Budget): Promise<A
 			if (sent.status === "delivered") out.delivered.push(id);
 			else {
 				const reason = sent.status === "offline" ? "not running" : sent.reason === PAUSED_ERROR ? "paused" : oneLine(sent.reason);
-				if (sent.status === "failed" && ambiguous(reason)) out.unknown = true;
+				if (sent.status === "failed" && ambiguous(reason)) out.unknownTo.push(id);
 				else out.failed.push({ to: id, reason });
 			}
 		} catch {
-			out.unknown = true;
+			out.unknownTo.push(id);
 		}
 	}
 	return out;
@@ -393,23 +414,36 @@ type Settled = "done" | "retry" | "exhausted" | "unknown" | "aborted" | "held";
 /** Record `result` for the claimed `item` (a draft inside the state lock) and decide whether it is finished, retried, put back or given up. */
 function settle(state: EventsState, item: Item, result: Attempt, now: number): Settled {
 	const base = { source: item.source, id: item.eventId, route: item.route };
+	const unknown = result.unknownTo.length > 0;
 	// Put back uncharged: events stopped mid-send, or the only thing left is members the per-tick budget deferred.
-	const putBack = result.aborted || (result.held && !result.failed.length && !result.unknown);
+	const putBack = result.aborted || (result.held && !result.failed.length && !unknown);
 	for (const to of result.delivered) note(state, now, { ...base, to, outcome: "delivered" });
 	for (const entry of result.failed) note(state, now, { ...base, to: entry.to, outcome: `not delivered: ${entry.reason}` });
 	// Skipped members are listed once, by the attempt that finishes the item.
 	if (!putBack) for (const entry of result.final) note(state, now, { ...base, to: entry.to, outcome: `not delivered: ${entry.reason}` });
 	const remove = () => state.queue.splice(state.queue.indexOf(item), 1);
-	if (result.unknown) {
-		remove();
+	const route = routeStatus(state, item);
+	// The members this attempt gave up on (failed or unknown) are closed; members it only deferred (held) go back to the queue uncharged.
+	const closed = [...result.unknownTo, ...result.failed.map(entry => entry.to)].filter(id => PEER_ID_RE.test(id));
+	const requeueHeld = (): Settled => {
+		item.delivered = [...new Set([...item.delivered, ...result.delivered, ...closed])];
+		item.status = item.mode === "work" ? "awaiting" : "queued";
+		item.attempts = Math.max(0, item.attempts - 1);
+		item.nextAt = now;
+		delete item.claimedAt;
+		return "held";
+	};
+	if (unknown) {
 		note(state, now, { ...base, outcome: "failed: outcome unknown (may have been delivered)" });
+		if (result.held && route === "ok") return requeueHeld();
+		remove();
 		return "unknown";
 	}
 	const finished = !putBack && !result.failed.length;
-	// A removed route cancels what is left of its item, whatever else happened (checked before the put-back path).
-	if (!finished && !state.routes.some(route => route.name === item.route)) {
+	// A removed or replaced route cancels what is left of its item, whatever else happened (checked before the put-back path).
+	if (!finished && route !== "ok") {
 		remove();
-		note(state, now, { ...base, outcome: "dropped: route removed" });
+		note(state, now, { ...base, outcome: droppedFor(route) });
 		return "done";
 	}
 	if (putBack) {
@@ -425,8 +459,9 @@ function settle(state: EventsState, item: Item, result: Attempt, now: number): S
 		return "done";
 	}
 	if (item.attempts >= MAX_ATTEMPTS) {
-		remove();
 		note(state, now, { ...base, outcome: "failed: retries exhausted" });
+		if (result.held) return requeueHeld();
+		remove();
 		return "exhausted";
 	}
 	item.delivered = [...item.delivered, ...result.delivered];
@@ -449,9 +484,9 @@ function sweep(state: EventsState, now: number): boolean {
 			state.queue.splice(state.queue.indexOf(item), 1);
 			note(state, now, { ...base, outcome: "dropped: expired" });
 			changed = true;
-		} else if (item.status !== "sending" && !state.routes.some(route => route.name === item.route)) {
+		} else if (item.status !== "sending" && routeStatus(state, item) !== "ok") {
 			state.queue.splice(state.queue.indexOf(item), 1);
-			note(state, now, { ...base, outcome: "dropped: route removed" });
+			note(state, now, { ...base, outcome: droppedFor(routeStatus(state, item) as "removed" | "changed") });
 			changed = true;
 		}
 	}
@@ -460,7 +495,7 @@ function sweep(state: EventsState, now: number): boolean {
 
 const isDue = (item: Item, now: number): boolean => item.status === "queued" && item.nextAt <= now;
 const needsSweep = (state: EventsState, now: number): boolean =>
-	state.queue.some(item => (item.status === "sending" ? now - (item.claimedAt ?? 0) >= SENDING_TTL_MS : now - item.createdAt >= WINDOW_MS || !state.routes.some(route => route.name === item.route)));
+	state.queue.some(item => (item.status === "sending" ? now - (item.claimedAt ?? 0) >= SENDING_TTL_MS : now - item.createdAt >= WINDOW_MS || routeStatus(state, item) !== "ok"));
 
 /** Claim the next due info item (not one in `skip`: an item already tried this tick, or one aimed at a session already served) under the lock, so two processes never send the same one. */
 async function claimNext(host: FeatureHost, skip: { targets: Set<string>; items: Set<string> }): Promise<Item | undefined> {
@@ -497,7 +532,7 @@ const sourceLabel = (name: string | undefined): string => (name !== undefined &&
 
 function makeItem(route: Route, source: string, event: EventPayload, id: string, now: number): Item {
 	return {
-		id, route: route.name, source, eventId: event.id, type: event.type, summary: event.summary, fields: event.fields, mode: route.mode, to: route.to,
+		id, route: route.name, routeGen: route.gen, source, eventId: event.id, type: event.type, summary: event.summary, fields: event.fields, mode: route.mode, to: route.to,
 		...(route.task ? { task: route.task } : {}), status: route.mode === "work" ? "awaiting" : "queued", attempts: 0, nextAt: now, createdAt: now, delivered: [],
 	};
 }
@@ -962,11 +997,12 @@ async function routeAdd(host: FeatureHost, words: string[]): Promise<string> {
 		to = resolved.id;
 	}
 	const createdAt = host.now();
-	const route: Route = { name, source: sourceName, ...(type ? { type } : {}), fields, to, mode, ...(task ? { task } : {}), maxPerHour: perHour, createdAt };
+	const route: Route = { name, gen: 0, source: sourceName, ...(type ? { type } : {}), fields, to, mode, ...(task ? { task } : {}), maxPerHour: perHour, createdAt };
 	const stored = await update<string | undefined>(host, state => {
 		if (state.routes.length >= MAX_ROUTES) return { changed: false, result: `error: route limit reached (${MAX_ROUTES}); remove a route first` };
 		if (state.routes.some(existing => existing.name === name)) return { changed: false, result: `error: route "${name}" already exists; remove it first to change it` };
 		if (!state.sources.some(source => source.name === sourceName)) return { changed: false, result: `error: no source "${sourceName.slice(0, 48)}"; add it with /peers events source add` };
+		route.gen = state.nextRouteGen++;
 		state.routes.push(route);
 		return { changed: true, result: undefined };
 	});
@@ -1003,10 +1039,11 @@ async function approve(host: FeatureHost, idSpec: string): Promise<string> {
 	const now = host.now();
 	const claim = await update<{ error: string } | { item: Item }>(host, state => {
 		if (!isOn(state)) return { changed: false, result: { error: "events are off, so pending items cannot be approved; turn them on with /peers events on first" } };
-		const orphan = state.queue.find(candidate => candidate.id === id && candidate.status !== "sending" && !state.routes.some(route => route.name === candidate.route));
+		const orphan = state.queue.find(candidate => candidate.id === id && candidate.status !== "sending" && routeStatus(state, candidate) !== "ok");
 		if (orphan) {
+			const why = routeStatus(state, orphan) === "changed" ? "was replaced by a new route of the same name" : "was removed";
 			sweep(state, now);
-			return { changed: true, result: { error: `route ${orphan.route} was removed; ${id} was dropped and is not sent` } };
+			return { changed: true, result: { error: `route ${orphan.route} ${why}; ${id} was dropped and is not sent` } };
 		}
 		const swept = sweep(state, now);
 		const item = state.queue.find(candidate => candidate.id === id);
