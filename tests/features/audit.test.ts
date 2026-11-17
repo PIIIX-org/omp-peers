@@ -494,6 +494,28 @@ describe("tamper and permission handling", () => {
 		expect(await cmd("clear --yes")).toBe("audit log cleared: removed 2 file(s)");
 	});
 
+	test("a FIFO as audit-config.json cannot hang a control op, status or tail, and audit stays off", async () => {
+		fs.mkdirSync(paths().dir, { recursive: true, mode: 0o700 });
+		execFileSync("mkfifo", [auditConfigFile(home)]);
+		const started = Date.now();
+		const log = new AuditLog();
+		await writeAs(log); // recording with an unreadable config must neither hang nor write
+		expect(fs.existsSync(paths().live)).toBe(false);
+		const status = await cmd("status");
+		expect(status).toContain("audit-config.json is not a regular file; refusing to read it");
+		expect(Date.now() - started).toBeLessThan(5000);
+	});
+
+	test("a malformed first live line cannot keep expired records alive: the live file rotates and is pruned", async () => {
+		await enable();
+		configure({ maxAgeDays: 30 });
+		fs.mkdirSync(paths().dir, { recursive: true, mode: 0o700 });
+		fs.writeFileSync(paths().live, `not json\n${line(T0, 1)}${line(T0 + 39 * DAY, 2)}`, { mode: 0o600 });
+		await record(new AuditLog(), T0 + 40 * DAY, 3);
+		expect(records(paths().prev).map(r => r.params!.selector)).toEqual(["provider/model-2"]);
+		expect(records().map(r => r.params!.selector)).toEqual(["provider/model-3"]);
+	});
+
 	test("a short or failed write is rolled back, so the next record neither merges with it nor is lost", async () => {
 		await enable();
 		await new AuditLog().record(home, T0, input());

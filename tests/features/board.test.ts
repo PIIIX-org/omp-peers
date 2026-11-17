@@ -41,6 +41,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 			return live;
 		},
 		groupsOf: () => [],
+		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		send: async () => ({ status: "offline" }),
 	};
 }

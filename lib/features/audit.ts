@@ -488,7 +488,8 @@ function maintain(paths: AuditPaths, settings: AuditSettings, incoming: number, 
 			fs.closeSync(fd);
 		}
 	}
-	if (size > 0 && (size + incoming > settings.maxBytes || (first !== undefined && first < cutoff))) {
+	// An unreadable first line (first undefined) must not pin expired records in the live file: rotate and prune it too.
+	if (size > 0 && (size + incoming > settings.maxBytes || first === undefined || first < cutoff)) {
 		fs.renameSync(paths.live, paths.prev);
 		prunePrevious(paths, cutoff);
 		return;

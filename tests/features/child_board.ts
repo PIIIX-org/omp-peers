@@ -14,6 +14,7 @@ const host: FeatureHost = {
 	acceptsRemote: () => true,
 	peers: async () => [],
 	groupsOf: () => [],
+	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async () => ({ status: "offline" }),
 };
 for (const round of ["first", "second"]) {

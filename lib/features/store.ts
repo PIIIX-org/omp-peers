@@ -35,8 +35,10 @@ export function privateDir(dir: string): string {
 export function readState<T>(file: string, fallback: () => T, validate: (value: unknown) => T): T {
 	let text: string;
 	try {
-		const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		// O_NONBLOCK: opening a same-user FIFO must fail fast instead of blocking every caller. Only regular files are read.
+		const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
 		try {
+			if (!fs.fstatSync(fd).isFile()) throw new Error(`${path.basename(file)} is not a regular file; refusing to read it`);
 			text = fs.readFileSync(fd, "utf8");
 		} finally {
 			fs.closeSync(fd);
