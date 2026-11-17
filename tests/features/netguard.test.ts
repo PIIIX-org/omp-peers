@@ -2,7 +2,7 @@
 // Copyright (c) 2026 PIIIX-org contributors
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync, execSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import https, * as httpsNamespace from "node:https";
 import { request as namedRequest } from "node:https";
@@ -255,8 +255,12 @@ describe("child processes", () => {
 		const bare = path.join(plain, "curl");
 		const copies: string[] = [path.join(fixtures, "curl"), path.join(fixtures, "git"), path.join(disposable, "curl"), path.join(disposable, "git"), path.join(disposable, "wget"), bare];
 		try {
+			const bytes = readFileSync(realCurl!);
 			for (const copy of copies) {
-				copyFileSync(realCurl!, copy); // the real curl under every network name: the name, not the content, is what the guard keys on
+				// A fresh file each time (an earlier read-only copy at the same path would make an overwrite fail with EACCES on Linux);
+				// the real curl under every network name: the name, not the content, is what the guard keys on.
+				rmSync(copy, { force: true });
+				writeFileSync(copy, bytes, { mode: 0o755 });
 				chmodSync(copy, 0o755);
 			}
 			for (const copy of copies) {
