@@ -15,6 +15,7 @@ const host: FeatureHost = {
 	self: () => ({ id: "p00000000000000aa", name: `master-${tag}` }),
 	isMaster: () => true,
 	notify: text => fs.appendFileSync(path.join(home, "notified.log"), `${tag}: ${text.split("\n")[0]}\n`),
+	usageNow: () => undefined,
 	acceptsRemote: () => true,
 	peers: async () => [],
 	groupsOf: () => [],

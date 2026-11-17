@@ -33,7 +33,8 @@ class FakeGateway(BaseHTTPRequestHandler):
             {**common, "choices": [{"index": 0, "delta": {
                 "role": "assistant", "content": "Offline proof."}, "finish_reason": None}]},
             {**common, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+             "usage": getattr(self.server, "usage", None)
+             or {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
         ]
         payload = "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
         payload = (payload + "data: [DONE]\n\n").encode()
