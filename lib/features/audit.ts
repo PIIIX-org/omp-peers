@@ -17,7 +17,7 @@ import { randomBytes } from "node:crypto";
 import type { FeatureHost } from "./host";
 import type { Feature } from "./index";
 import { screenText } from "./rules";
-import { acquire, privateDir, readState, stateRoot, updateState } from "./store";
+import { acquire, privateDir, readRegularFile, readState, stateRoot, updateState } from "./store";
 
 export const MAX_LINE_BYTES = 4096;
 export const DEFAULT_MAX_BYTES = 1024 * 1024;
@@ -319,17 +319,6 @@ export interface AuditSettings {
 }
 
 export const peersConfigFile = (home: string) => path.join(home, ".omp", "agent", "peers.json");
-
-/** Read a user config file without ever blocking: O_NONBLOCK open, then only a regular file is read (a FIFO is refused). */
-function readRegularFile(file: string): string {
-	const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
-	try {
-		if (!fs.fstatSync(fd).isFile()) throw Object.assign(new Error("not a regular file"), { code: "NOT_REGULAR" });
-		return fs.readFileSync(fd, "utf8");
-	} finally {
-		fs.closeSync(fd);
-	}
-}
 
 /** Retention limits from `~/.omp/agent/peers.json` `audit`; invalid values fall back to the default and are reported. Never throws. */
 export function loadSettings(home: string): AuditSettings {
