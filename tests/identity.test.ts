@@ -158,12 +158,13 @@ describe("group targets", () => {
 		delete reasons["Worker-A"];
 	});
 
-	test("a logical session without a proven writer is skipped as ambiguous, not guessed, and does not block the others", async () => {
+	test("a member whose logical session has no proven writer fails the whole group send; nothing is sent or guessed", async () => {
+		reasons["Worker-C"] = "paused";
 		const first = registration("s", "Shared", "p000001");
 		const second = registration("s", "Shared", "p000002");
-		const result = await resolve("group:frontend", [a, first, second], { frontend: [a.id, stablePeerId("s")] }, false);
-		expect(result.peers.map(p => p.id)).toEqual([a.id]);
-		expect(result.skipped).toEqual([{ name: "Shared", reason: `ambiguous: 2 registrations share this logical session and none is proven: Shared (p000001), Shared (p000002); use an explicit peer ID` }]);
+		const result = await resolve("group:frontend", [a, c, first, second], { frontend: [a.id, c.id, stablePeerId("s")] }, false);
+		expect(result).toEqual({ peers: [], error: 'group "frontend" not sent: logical session has no proven writer: Shared (p000001), Shared (p000002); use an explicit peer ID' });
+		delete reasons["Worker-C"];
 		// With a proven writer the same session is one recipient.
 		const owner = registration("s", "Shared");
 		expect((await resolve("group:frontend", [a, owner, first], { frontend: [stablePeerId("s")] })).peers).toEqual([expect.objectContaining({ id: owner.id })]);
