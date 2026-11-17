@@ -29,10 +29,12 @@ NO_HOSTS = "no hosts configured (local-only); add one with /peers hosts add <nam
 
 
 def write_fake_ssh(tools, remote_home, log):
+    """The fake ssh. The network guard lets a program named like a network tool run only when it is a text script carrying the
+    exact marker line `# omp-peers netguard fake` near its top (tests/netguard_policy.ts), so a copied real ssh never passes."""
     checks = "\n".join(
         f'[ "${{{i}}}" = \'{arg}\' ] || {{ echo "fake ssh: argument {i} differs" >&2; exit 97; }}'
         for i, arg in enumerate(ARGV, 1))
-    script = (f"#!/bin/sh\necho called >> '{log}'\n"
+    script = (f"#!/bin/sh\n# omp-peers netguard fake\necho called >> '{log}'\n"
               f'[ "$#" -eq {len(ARGV)} ] || {{ echo "fake ssh: bad argument count" >&2; exit 97; }}\n{checks}\n'
               f"HOME='{remote_home}' exec '{shutil.which('bun')}' --preload '{REPO / 'tests' / 'netguard.ts'}' "
               f"'{REPO / 'scripts' / 'omp-peers-remote.ts'}'\n")

@@ -8,7 +8,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { stablePeerId } from "../../lib/identity";
 import { sshArgv } from "../../lib/features/hosts";
-import { registerFakeProgram } from "../netguard_policy";
+import { fakeScript } from "../netguard_policy";
 
 export const REPO = path.resolve(import.meta.dir, "..", "..");
 export const BRIDGE_SCRIPT = path.join(REPO, "scripts", "omp-peers-remote.ts");
@@ -81,17 +81,14 @@ export function writeFakeSsh(dir: string, target: string, remoteHome: string, lo
 	const bin = path.join(dir, "ssh");
 	const expected = sshArgv(bin, target).slice(1);
 	const checks = expected.map((arg, index) => `[ "\${${index + 1}}" = '${arg}' ] || { echo "fake ssh: argument ${index + 1} differs" >&2; exit 97; }`);
-	const script = [
-		"#!/bin/sh",
+	const script = fakeScript([
 		`echo called >> '${log}'`,
 		`[ "$#" -eq ${expected.length} ] || { echo "fake ssh: bad argument count $#" >&2; exit 97; }`,
 		...checks,
 		// The bridge runs under the network guard: any attempt to reach a non-loopback host fails loudly.
 		`HOME='${remoteHome}' exec '${process.execPath}' --preload '${NETGUARD}' '${BRIDGE_SCRIPT}'`,
-		"",
-	].join("\n");
+	].join("\n"));
 	fs.writeFileSync(bin, script, { mode: 0o700 });
-	registerFakeProgram(bin);
 	return bin;
 }
 

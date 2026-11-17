@@ -11,7 +11,7 @@
  * violation a test did not declare with `expectViolations`, and the smoke harnesses fail on that stderr line.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { realpathSync, writeSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, realpathSync, writeSync } from "node:fs";
 import path from "node:path";
 
 interface ViolationState {
@@ -67,20 +67,43 @@ export async function expectViolations(fn: () => unknown): Promise<string[]> {
 	return collected;
 }
 
-const FAKES = Symbol.for("omp-peers.netguard.fakes");
+// ---- Fake programs (a fake `ssh` script a test writes) ----------------------------------------------------------------
 
-/**
- * Declare `absPath` (an absolute path to an existing file) a known fake program: it may carry a network tool's name (a fake
- * `ssh` script). Registration is per process; a child process finds its fake by the disposable-directory rule in tests/netguard.ts.
- */
-export function registerFakeProgram(absPath: string): void {
-	if (!path.isAbsolute(absPath)) throw new Error("registerFakeProgram needs an absolute path");
-	const holder = globalThis as Record<symbol, unknown>;
-	const set = (holder[FAKES] ??= new Set<string>()) as Set<string>;
-	set.add(realpathSync(absPath));
+const TESTS_DIR = import.meta.dir;
+/** The line a test-written fake script carries near its top; the guard looks for exactly this line. */
+export const FAKE_MARKER = "# omp-peers netguard fake";
+/** How much of a program the guard reads to decide whether it is a fake script. */
+const FAKE_HEAD_BYTES = 512;
+
+/** A fake script: `#!/bin/sh`, the marker line, then `body`. Write only scripts that make no network call. */
+export const fakeScript = (body: string): string => `#!/bin/sh\n${FAKE_MARKER}\n${body.endsWith("\n") ? body : `${body}\n`}`;
+
+/** Whether `file` is a text script (`#!`, no NUL byte) with the marker line among its first FAKE_HEAD_BYTES bytes. A binary never is. */
+function isFakeScript(file: string): boolean {
+	let head: Buffer;
+	try {
+		const fd = openSync(file, "r");
+		try {
+			const buffer = Buffer.alloc(FAKE_HEAD_BYTES);
+			head = buffer.subarray(0, readSync(fd, buffer, 0, FAKE_HEAD_BYTES, 0));
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		return false;
+	}
+	if (head.includes(0) || head.subarray(0, 2).toString("latin1") !== "#!") return false;
+	return head.toString("latin1").split("\n").slice(1).includes(FAKE_MARKER);
 }
 
-/** Whether `realFile` (a resolved real path) was registered with `registerFakeProgram`. */
-export function isRegisteredFake(realFile: string): boolean {
-	return ((globalThis as Record<symbol, unknown>)[FAKES] as Set<string> | undefined)?.has(realFile) === true;
+/**
+ * Whether the guard lets `real` (a resolved real path) carry a network tool's name: a program inside this tests directory, or a
+ * text script that carries the marker line. A copied real binary (ssh, curl, git, ...) has no `#!` start or contains NUL bytes,
+ * and a symlink to one resolves to that binary, so none of them passes wherever it is placed.
+ */
+export function isAllowedFake(real: string): boolean {
+	const tests = existsSync(TESTS_DIR) ? realpathSync(TESTS_DIR) : TESTS_DIR;
+	const relative = path.relative(tests, real);
+	if (relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative)) return true;
+	return isFakeScript(real);
 }

@@ -7,6 +7,7 @@
  */
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
+import { foldAll, foldTokens, neutralize } from "./events-ingest";
 import { looksLikeSecret } from "./secrets";
 import { stateRoot, updateState } from "./store";
 
@@ -105,24 +106,32 @@ export function safeName(raw: string): string {
 	return looksLikeSecret(shown) ? WITHHELD : shown;
 }
 
-/** Look-alike letters (Cyrillic, Greek) folded to Latin; NFKD already folds full-width and accented forms. The events feature's reserved-text table plus a few letters of this phrase. */
-const CONFUSABLES: Record<string, string> = {
-	"а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "і": "i", "ј": "j", "у": "y", "х": "x", "ѕ": "s", "һ": "h", "ԁ": "d", "ԛ": "q", "ԝ": "w",
-	"α": "a", "ε": "e", "ο": "o", "ρ": "p", "ι": "i", "ν": "v", "υ": "u", "κ": "k", "τ": "t", "η": "n", "χ": "x", "β": "b", "ɡ": "g", "ӏ": "l",
-	// Extra letters of the phrase being matched that the events table does not carry.
-	"μ": "m", "м": "m", "ԍ": "g", "ɑ": "a", "г": "r",
-};
-/** Lower-case, strip accents, fold look-alikes and drop everything but letters, digits and `[`: spacing, punctuation, zero-width and soft-hyphen tricks vanish. */
-const fold = (text: string): string =>
-	[...text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()].map(char => CONFUSABLES[char] ?? char).join("").replace(/[^a-z0-9[]/g, "");
-const FOLDED_MARKER = fold("[Message from peer session");
+const HEADER_WORDS = ["message", "from", "peer", "session"];
+const hasHeaderWords = (tokens: string[]): boolean => tokens.some((_, i) => HEADER_WORDS.every((word, k) => tokens[i + k] === word));
+/** `[external event`, the delivery prefix of the events feature, with any run of `[` allowed between its letters (squashed text keeps only `[`, letters and digits). */
+const EVENT_PREFIX = new RegExp(`\\[${[..."externalevent"].join("\\[*")}`);
 
 /**
- * Whether `text` contains the header a receiving session puts on a peer message, however it is dressed: any case or spacing,
- * zero-width, soft-hyphen or other format characters inside it, full-width forms, accents or Cyrillic/Greek look-alikes. The check
- * runs on a folded copy; the text that is sent or delivered is always the original. Plain prose without the opening bracket is fine.
+ * Whether `text` contains a header a receiving session puts on a message it delivers, however it is dressed: the peer-message
+ * header's words `Message from peer session` in order, or the events delivery prefix `[external event`. Tolerated: any case,
+ * spacing, punctuation; zero-width, soft-hyphen and other format characters; full-width forms, accents and look-alike letters
+ * (Cyrillic, Greek, dotless i); markdown or HTML that renders to the words (`p[e]()er`, `[peer](url)`, `pe<i></i>er`); and stray
+ * brackets anywhere inside or between the words (`[Mes[sage from peer session`). The text is folded in several ways: as written,
+ * with markdown rendered as plain text, and with format characters deleted (they join letters) or turned to spaces (they separate
+ * words), brackets kept, deleted or turned to spaces. Words are matched whole, so identifiers such as
+ * `message_from_peer_session_count` or `messageFromPeerSession` are not the header; prose that contains the four words in a row is
+ * refused too. The text that is sent or delivered is always the original.
  */
-export const hasPeerMessageMarker = (text: string): boolean => fold(text).includes(FOLDED_MARKER);
+export function hasPeerMessageMarker(text: string): boolean {
+	const bare = text.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, " ");
+	for (const variant of [bare.replace(/\p{Cf}/gu, ""), bare.replace(/\p{Cf}/gu, " ")]) {
+		for (const base of [variant, neutralize(variant)]) {
+			if (EVENT_PREFIX.test(foldAll(base))) return true;
+			for (const form of [base, base.replace(/[[\]］［]/g, ""), base.replace(/[[\]］［]/g, " ")]) if (hasHeaderWords(foldTokens(form))) return true;
+		}
+	}
+	return false;
+}
 
 /** The label a machine puts in front of its sessions' ids: derived from its host id, so the claimed label and id cannot disagree. */
 export const hostLabel = (hostId: string): string => `host-${hostId.slice(0, 8)}`;

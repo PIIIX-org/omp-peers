@@ -88,15 +88,28 @@ export function capBytes(text: string, max: number): string {
 	return out;
 }
 
-/** Look-alike letters (Cyrillic, Greek) folded to Latin; NFKD already folds full-width and accented forms. */
-const CONFUSABLES: Record<string, string> = {
+/**
+ * Look-alike letters (Cyrillic, Greek, dotless/dotted i and a few more) folded to Latin; NFKD already folds full-width and accented
+ * forms. Shared by every reserved-text check (events content, peer-message headers relayed through `/peers hosts`).
+ */
+export const CONFUSABLES: Record<string, string> = {
 	"а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "і": "i", "ј": "j", "у": "y", "х": "x", "ѕ": "s", "һ": "h", "ԁ": "d", "ԛ": "q", "ԝ": "w",
 	"α": "a", "ε": "e", "ο": "o", "ρ": "p", "ι": "i", "ν": "v", "υ": "u", "κ": "k", "τ": "t", "η": "n", "χ": "x", "β": "b", "ɡ": "g", "ӏ": "l",
+	"μ": "m", "м": "m", "ԍ": "g", "ɑ": "a", "г": "r",
+	// Dotless and other i look-alikes (a capital dotted İ decomposes to I plus a mark, which is stripped).
+	"ı": "i", "ɩ": "i", "ɪ": "i", "ǐ": "i", "ⅰ": "i", "ꭵ": "i",
 };
+/** Lower-case, strip accents and fold look-alikes. */
+const foldLetters = (text: string): string => [...text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()].map(char => CONFUSABLES[char] ?? char).join("");
+/**
+ * The words of `text` as lower-case Latin tokens: accents stripped, look-alikes folded, anything but letters, digits and `_`
+ * a separator. Underscores keep identifiers whole, so `message_from_peer_session_count` and `messageFromPeerSession` are one
+ * token each and never read as the four words `message from peer session`.
+ */
+export const foldTokens = (text: string): string[] => foldLetters(text).split(/[^a-z0-9_]+/).filter(Boolean);
 const RESERVED_PHRASES = [DELIVERY_PREFIX, "event work dispatch", "authorized by the user"];
 /** Lower-case, strip accents, fold look-alikes and drop everything but letters and digits: spacing, punctuation and zero-width tricks vanish. */
-const foldAll = (text: string): string =>
-	[...text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()].map(char => CONFUSABLES[char] ?? char).join("").replace(/[^a-z0-9[]/g, "");
+export const foldAll = (text: string): string => foldLetters(text).replace(/[^a-z0-9[]/g, "");
 /** Same, without the opening bracket: brackets inside a phrase must not break its match. */
 const foldPlain = (text: string): string => foldAll(text).replace(/\[/g, "");
 // The delivery prefix keeps its `[` (plain "external event" is ordinary text); the other phrases ignore brackets altogether.

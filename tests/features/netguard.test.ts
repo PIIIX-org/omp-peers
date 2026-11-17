@@ -12,7 +12,7 @@ import path from "node:path";
 import tls from "node:tls";
 // ONLY the side-effect-free policy module is imported: the refusals below pass solely because the bunfig preload
 // (tests/netguard.ts) installed the guard before this file loaded.
-import { expectViolations, isLoopback, registerFakeProgram, takeViolations } from "../netguard_policy";
+import { expectViolations, fakeScript, isLoopback, takeViolations } from "../netguard_policy";
 
 // Address literals are built here so the repository leak scan, which flags non-loopback IPs, stays quiet.
 const OUTSIDE_IP = ["203", "0", "113", "7"].join(".");
@@ -198,9 +198,8 @@ describe("child processes", () => {
 	const fakeSsh = path.join(fixtures, "ssh");
 	const linkedSsh = path.join(fixtures, "git");
 	beforeAll(() => {
-		writeFileSync(fakeSsh, "#!/bin/sh\necho fake-ssh\n");
+		writeFileSync(fakeSsh, fakeScript("echo fake-ssh"));
 		chmodSync(fakeSsh, 0o755);
-		registerFakeProgram(fakeSsh);
 		symlinkSync(Bun.which("true") ?? "/usr/bin/true", linkedSsh);
 	});
 	afterAll(() => rmSync(fixtures, { recursive: true, force: true }));
@@ -238,7 +237,7 @@ describe("child processes", () => {
 		expect(violations).toEqual([]);
 	});
 
-	test("exception: a fake registered with registerFakeProgram may carry a network name", async () => {
+	test("exception: a text script carrying the marker line may carry a network name, wherever it sits", async () => {
 		const violations = await expectViolations(() => {
 			expect(Bun.spawnSync([fakeSsh]).stdout.toString().trim()).toBe("fake-ssh");
 			expect(spawnSync("ssh", { env: { PATH: fixtures } }).stdout.toString().trim()).toBe("fake-ssh");
@@ -247,64 +246,68 @@ describe("child processes", () => {
 		expect(violations).toEqual([]);
 	});
 
-	test("a copy of a real network program under /tmp is refused, whatever the directory or the name it is given", async () => {
+	/** A fresh directory for one test: every file the test writes goes here, never into the shared fixtures. */
+	const freshDir = (prefix: string) => mkdtempSync(prefix);
+
+	test("a copy of a real network program is refused wherever it is written and whatever it is named", async () => {
 		const realCurl = Bun.which("curl");
 		expect(realCurl).toBeTruthy();
-		const disposable = mkdtempSync("/tmp/opf-");
-		const plain = mkdtempSync("/tmp/netguard-"); // a /tmp directory that is not an opf-*/opx-* one
-		const bare = path.join(plain, "curl");
-		const copies: string[] = [path.join(fixtures, "curl"), path.join(fixtures, "git"), path.join(disposable, "curl"), path.join(disposable, "git"), path.join(disposable, "wget"), bare];
+		const bytes = readFileSync(realCurl!);
+		const dirs = [freshDir(path.join(os.tmpdir(), "netguard-copy-")), freshDir("/tmp/opf-"), freshDir("/tmp/opx-"), freshDir("/tmp/netguard-")];
 		try {
-			const bytes = readFileSync(realCurl!);
-			for (const copy of copies) {
-				// A fresh file each time (an earlier read-only copy at the same path would make an overwrite fail with EACCES on Linux);
-				// the real curl under every network name: the name, not the content, is what the guard keys on.
-				rmSync(copy, { force: true });
-				writeFileSync(copy, bytes, { mode: 0o755 });
-				chmodSync(copy, 0o755);
+			const copies: string[] = [];
+			for (const dir of dirs) {
+				mkdirSync(path.join(dir, "tools"));
+				for (const name of ["curl", "git", "wget", "ssh", "scp"]) {
+					for (const sub of ["", "tools"]) {
+						// One new file per copy in a directory this test just created; an existing file or symlink is never written through.
+						const file = path.join(dir, sub, name);
+						writeFileSync(file, bytes, { mode: 0o755, flag: "wx" });
+						chmodSync(file, 0o755);
+						copies.push(file);
+					}
+				}
 			}
 			for (const copy of copies) {
 				expect(await refusedOnce(() => Bun.spawnSync([copy, "--version"])), copy).toMatch(REFUSED_PROGRAM);
 				expect(await refusedOnce(() => spawnSync(path.basename(copy), ["--version"], { env: { PATH: path.dirname(copy) } })), `via PATH: ${copy}`).toMatch(REFUSED_PROGRAM);
 			}
 		} finally {
-			rmSync(disposable, { recursive: true, force: true });
-			rmSync(plain, { recursive: true, force: true });
+			for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
-	test("an unregistered ssh outside a disposable opf-*/opx-* directory is refused; one named exactly ssh inside one is allowed", async () => {
-		const stray = path.join(fixtures, "other");
-		mkdirSync(stray);
-		const disposable = mkdtempSync("/tmp/opx-");
+	test("a script is a fake only with the exact marker line near its top and a #! start; the genuine fake is allowed", async () => {
+		const dir = freshDir("/tmp/opx-");
 		try {
-			const strayFake = path.join(stray, "ssh");
-			writeFileSync(strayFake, "#!/bin/sh\necho stray\n");
-			chmodSync(strayFake, 0o755);
-			expect(await refusedOnce(() => Bun.spawnSync([strayFake]))).toMatch(REFUSED_PROGRAM);
-			const inDisposable = path.join(disposable, "ssh");
-			writeFileSync(inDisposable, "#!/bin/sh\necho disposable\n");
-			chmodSync(inDisposable, 0o755);
-			mkdirSync(path.join(disposable, "tools"));
-			const inTools = path.join(disposable, "tools", "ssh");
-			writeFileSync(inTools, "#!/bin/sh\necho tools\n");
-			chmodSync(inTools, 0o755);
-			const deep = path.join(disposable, "tools", "x");
-			mkdirSync(deep);
-			writeFileSync(path.join(deep, "ssh"), "#!/bin/sh\necho deep\n");
-			chmodSync(path.join(deep, "ssh"), 0o755);
+			const write = (name: string, text: string | Buffer) => {
+				const file = path.join(dir, name, "ssh");
+				mkdirSync(path.dirname(file));
+				writeFileSync(file, text, { mode: 0o755, flag: "wx" });
+				chmodSync(file, 0o755);
+				return file;
+			};
+			const genuine = write("genuine", fakeScript("echo genuine"));
 			const violations = await expectViolations(() => {
-				expect(Bun.spawnSync([inDisposable]).stdout.toString().trim()).toBe("disposable");
-				expect(Bun.spawnSync([inTools]).stdout.toString().trim()).toBe("tools");
+				expect(Bun.spawnSync([genuine]).stdout.toString().trim()).toBe("genuine");
 			});
 			expect(violations).toEqual([]);
-			// A different tool name, or a deeper directory, in the same disposable tree is still refused.
-			writeFileSync(path.join(disposable, "scp"), "#!/bin/sh\necho scp\n");
-			chmodSync(path.join(disposable, "scp"), 0o755);
-			expect(await refusedOnce(() => Bun.spawnSync([path.join(disposable, "scp")]))).toMatch(REFUSED_PROGRAM);
-			expect(await refusedOnce(() => Bun.spawnSync([path.join(deep, "ssh")]))).toMatch(REFUSED_PROGRAM);
+			const refused: Record<string, string | Buffer> = {
+				noMarker: "#!/bin/sh\necho nothing\n",
+				similarMarker: "#!/bin/sh\n# omp-peers netguard fake2\necho x\n",
+				markerWithSuffix: "#!/bin/sh\n# omp-peers netguard fake \necho x\n",
+				markerOnShebangLine: "#!/bin/sh # omp-peers netguard fake\necho x\n",
+				noShebang: "# omp-peers netguard fake\necho x\n",
+				markerTooLate: `#!/bin/sh\n${"#".repeat(600)}\n# omp-peers netguard fake\necho x\n`,
+				binaryWithMarker: Buffer.concat([Buffer.from("#!/bin/sh\n# omp-peers netguard fake\n"), Buffer.from([0, 1, 2]), Buffer.from("echo x\n")]),
+				realBinaryPlusMarker: Buffer.concat([readFileSync(Bun.which("curl")!).subarray(0, 64), Buffer.from("\n# omp-peers netguard fake\n")]),
+			};
+			for (const [name, text] of Object.entries(refused)) {
+				const file = write(name, text);
+				expect(await refusedOnce(() => Bun.spawnSync([file])), name).toMatch(REFUSED_PROGRAM);
+			}
 		} finally {
-			rmSync(disposable, { recursive: true, force: true });
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { hostLabel, ensureHostId } from "../../lib/features/hosts_wire";
+import { fakeScript } from "../netguard_policy";
 import { BRIDGE_SCRIPT, allFileText, startSession, tmpHome, writeFakeSsh, type FakeSession } from "./hosts_helpers";
 
 // Two disposable homes stand in for two machines. The "ssh" is a script that checks its exact argv and then runs the
@@ -149,7 +150,7 @@ describe("through a fake ssh to the real remote bridge", () => {
 		const stand = tmpHome();
 		try {
 			const standLog = path.join(stand, "stand-in.log");
-			fs.writeFileSync(path.join(stand, "ssh"), `#!/bin/sh\necho called >> '${standLog}'\necho 'Permission denied (publickey).' >&2\nexit 255\n`, { mode: 0o700 });
+			fs.writeFileSync(path.join(stand, "ssh"), fakeScript(`echo called >> '${standLog}'\necho 'Permission denied (publickey).' >&2\nexit 255`), { mode: 0o700 });
 			expect(await hosts("add", "alpha", TARGET)).toStartWith("added host alpha");
 			const out = await hostsWith({ PATH: stand, OMP_PEERS_SSH_BIN: fake }, "test", "alpha");
 			expect(out).toBe("error: alpha: permission denied");

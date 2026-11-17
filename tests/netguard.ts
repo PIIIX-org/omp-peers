@@ -15,8 +15,9 @@
  * Child processes: Bun.spawn and Bun.spawnSync are wrapped, and every node:child_process API (spawn, exec, execFile,
  * fork and their sync forms) funnels through them, including named imports. A program whose basename is ssh, scp, sftp,
  * rsync, curl, wget, nc, ncat, telnet or git (also when run via `sh -c "..."`) is refused, git outright since its network
- * subcommands are not told apart. The only exceptions (see isFixtureProgram): a program inside this tests directory, one
- * registered with `registerFakeProgram`, or a file named exactly `ssh` in a disposable `opf-*`/`opx-*` directory of the temp root. A child `bun` (process.execPath) without
+ * subcommands are not told apart. The only exceptions (see isFixtureProgram): a program inside this tests directory, or a text
+ * script (`#!`, no NUL byte) with the exact line `# omp-peers netguard fake` in its first 512 bytes, which the test helpers write
+ * into their fake `ssh`. A copied real binary never passes, wherever it sits. A child `bun` (process.execPath) without
  * `--preload` gets `--preload <this file>` so it is guarded too.
  *
  * Refusals are loud even when the caller swallows the error: see tests/netguard_policy.ts (violation log, stderr line).
@@ -32,18 +33,16 @@
  * It is preloaded for every `bun test` run (bunfig.toml) and loaded into every OMP process the smoke harnesses start
  * (tests/netguard_ext.ts, `omp -e`). It is never imported by plugin code and is not shipped.
  */
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
-import { isLoopback, isRegisteredFake, refuse, takeViolations } from "./netguard_policy";
+import { isAllowedFake, isLoopback, refuse, takeViolations } from "./netguard_policy";
 
 const GUARD = Symbol.for("omp-peers.netguard");
 const SELF = import.meta.path;
-const TESTS_DIR = import.meta.dir;
 
 const NETWORK_PROGRAMS = new Set(["ssh", "scp", "sftp", "rsync", "curl", "wget", "nc", "ncat", "telnet", "git"]);
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
@@ -106,30 +105,9 @@ function resolveProgram(program: string, cwd: string, searchPath: string | undef
 	return undefined;
 }
 
-function inside(file: string, dir: string): boolean {
-	const relative = path.relative(dir, file);
-	return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
-}
-
-/** Disposable directories the test helpers and smoke harnesses create directly under the temp root (`opf-*`, `opx-*`). */
-const DISPOSABLE_DIR = /^(?:opf|opx)-[A-Za-z0-9_-]+$/;
-
-/**
- * Exception for fixtures, deliberately narrow. A program may carry a network tool's name only when
- *  - its real path is inside this tests directory, or
- *  - it was registered with `registerFakeProgram` in this process, or
- *  - it is a file named exactly `ssh` directly inside a disposable `opf-*` / `opx-*` directory (or its `tools` subdirectory)
- *    of the temp root (os.tmpdir() or /tmp, real paths): the fake ssh a test helper writes and a child process runs.
- * Anything else under /tmp (a copied `curl` or `git`, an `ssh` elsewhere, a symlink to a system program) is still refused.
- */
+/** Exception for fixtures (tests/netguard_policy.ts `isAllowedFake`): a program inside the tests directory or a marked fake script. */
 function isFixtureProgram(resolved: string | undefined): boolean {
-	if (resolved === undefined) return false;
-	const real = (dir: string) => (existsSync(dir) ? realpathSync(dir) : dir);
-	if (inside(resolved, real(TESTS_DIR)) || isRegisteredFake(resolved)) return true;
-	if (path.basename(resolved) !== "ssh") return false;
-	const dir = path.dirname(resolved);
-	const disposable = path.basename(dir) === "tools" ? path.dirname(dir) : dir;
-	return [os.tmpdir(), "/tmp"].some(root => path.dirname(disposable) === real(root) && DISPOSABLE_DIR.test(path.basename(disposable)));
+	return resolved !== undefined && isAllowedFake(resolved);
 }
 
 function checkProgram(program: string, cwd: string, searchPath: string | undefined): void {
