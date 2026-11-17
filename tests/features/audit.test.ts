@@ -30,6 +30,7 @@ const host = (): FeatureHost => ({
 	acceptsRemote: () => true,
 	peers: async () => [],
 	groupsOf: () => [],
+	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async () => ({ status: "offline" }),
 });
 const cmd = (args: string, log = new AuditLog()) => auditCommand(args.split(/\s+/).filter(Boolean), host(), log);
@@ -356,6 +357,16 @@ describe("retention", () => {
 		expect(records(paths().prev)).toHaveLength(1);
 	});
 
+	test("a malformed first live line cannot keep expired records alive: the live file rotates and is pruned", async () => {
+		await enable();
+		configure({ maxAgeDays: 30 });
+		fs.mkdirSync(paths().dir, { recursive: true, mode: 0o700 });
+		fs.writeFileSync(paths().live, `not json\n${line(T0, 1)}${line(T0 + 39 * DAY, 2)}`, { mode: 0o600 });
+		await record(new AuditLog(), T0 + 40 * DAY, 3);
+		expect(records(paths().prev).map(r => r.params!.selector)).toEqual(["provider/model-2"]);
+		expect(records().map(r => r.params!.selector)).toEqual(["provider/model-3"]);
+	});
+
 	test("an unreadable first line cannot keep expired records alive in the previous file", async () => {
 		await enable();
 		configure({ maxAgeDays: 30 });
@@ -504,16 +515,6 @@ describe("tamper and permission handling", () => {
 		const status = await cmd("status");
 		expect(status).toContain("audit-config.json is not a regular file; refusing to read it");
 		expect(Date.now() - started).toBeLessThan(5000);
-	});
-
-	test("a malformed first live line cannot keep expired records alive: the live file rotates and is pruned", async () => {
-		await enable();
-		configure({ maxAgeDays: 30 });
-		fs.mkdirSync(paths().dir, { recursive: true, mode: 0o700 });
-		fs.writeFileSync(paths().live, `not json\n${line(T0, 1)}${line(T0 + 39 * DAY, 2)}`, { mode: 0o600 });
-		await record(new AuditLog(), T0 + 40 * DAY, 3);
-		expect(records(paths().prev).map(r => r.params!.selector)).toEqual(["provider/model-2"]);
-		expect(records().map(r => r.params!.selector)).toEqual(["provider/model-3"]);
 	});
 
 	test("a short or failed write is rolled back, so the next record neither merges with it nor is lost", async () => {
