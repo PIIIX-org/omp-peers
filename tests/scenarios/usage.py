@@ -161,13 +161,14 @@ def run(h):
     assert len(h.gateway.requests) == requests, "no provider request was made after the one turn"
     print("PASS /peers usage off removes the figures from the registry row and the master lists the session as unknown again")
 
-    # Nothing remote can enable publishing: an unknown op is refused, and a peer message carrying the command text is only text.
+    # Nothing remote can enable publishing: an unknown op is refused, and a remote prompt (a real op that does reach the model) carrying
+    # the command text is only text, never run as a command.
     state_bytes = (h.state / "usage.json").read_bytes()
     row = h.row(worker)
     assert rpc(row, {"op": "usage", "text": "on", "from": {"id": "completion-watcher", "name": "Completion watcher"}}) == {"ok": False, "error": 'unknown op "usage"'}
-    sent = rpc(row, {"op": "message", "text": "/peers usage on", "from": {"id": mid, "name": "master"}})
+    sent = rpc(row, {"op": "prompt", "text": "/peers usage on", "from": {"id": mid, "name": "master"}})
     assert sent.get("ok") is True, sent
-    wait_for(lambda: len(h.gateway.requests) > requests)  # the text is delivered to the model as a message, not run as a command
+    wait_for(lambda: len(h.gateway.requests) > requests)  # it reaches the model as a prompt; had it run as a command there would be no request
     assert (h.state / "usage.json").read_bytes() == state_bytes and json.loads(state_bytes)["publishers"] == []
     assert "usage" not in h.row(worker)
-    print("PASS no remote op or peer message can switch publishing on")
+    print("PASS no remote op or remote prompt can switch publishing on")

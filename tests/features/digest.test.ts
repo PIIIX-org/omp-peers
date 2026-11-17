@@ -53,6 +53,7 @@ function host(self = MASTER, master = self === MASTER): FeatureHost {
 		now: () => clock,
 		self: () => ({ id: self, name: NAMES[self] }),
 		isMaster: () => master,
+		usageNow: () => undefined,
 		notify: text => {
 			if (notifyError) throw new Error(notifyError);
 			notes.push(text);

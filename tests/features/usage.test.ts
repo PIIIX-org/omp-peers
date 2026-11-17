@@ -41,6 +41,7 @@ function host(self = MASTER, master = self === MASTER, now = NOW, source?: Usage
 		peers: async () => peers,
 		groupsOf: id => groupMap[id] ?? [],
 		usageNow: () => source,
+		notify: () => {},
 		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
@@ -459,6 +460,13 @@ describe("scope and visibility", () => {
 });
 
 describe("status", () => {
+	test("a zero host cost beside spent tokens is flagged as possibly unpriced; with nothing spent it is a plain zero", async () => {
+		const spent = await say("status", host(A, false, NOW, { stats: { input: 5, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
+		expect(spent).toContain("input 5 output 0 cacheRead 0 cacheWrite 0; catalog cost 0.0000 USD (no catalog price?)");
+		const idle = await say("status", host(A, false, NOW, { stats: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
+		expect(idle).toContain("cacheWrite 0; catalog cost 0.0000 USD\n");
+	});
+
 	test("shows whether this session publishes, the live host counters, the configuration and that billed is unknown", async () => {
 		const source = { stats: { input: 11, output: 22, cacheRead: 33, cacheWrite: 44, cost: 0.5 }, subscription: true };
 		expect(await say("status", host(A, false, NOW, source))).toBe([

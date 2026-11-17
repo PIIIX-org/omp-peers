@@ -518,7 +518,7 @@ async function status(host: FeatureHost): Promise<string> {
 	return [
 		`usage: this session (${safeText(self.name, MAX_NAME)}, ${self.id}) ${publishing ? "publishes its counters to the registry (/peers usage off stops it)" : "publishes nothing (private; /peers usage on publishes its counters)"}`,
 		live
-			? `host counters now (not shared unless publishing): ${counterText(Object.fromEntries(COUNTERS.map(c => [c, live[c]])))}${live.catalogCost === undefined ? "" : `; catalog cost ${fmtMoney(live.catalogCost * (config.rate ?? 1), config.currency)}`}${live.subscription === true ? "; subscription login (no per-token bill)" : ""}`
+			? `host counters now (not shared unless publishing): ${counterText(Object.fromEntries(COUNTERS.map(c => [c, live[c]])))}${live.catalogCost === undefined ? "" : `; catalog cost ${fmtMoney(live.catalogCost * (config.rate ?? 1), config.currency)}${live.catalogCost === 0 && COUNTERS.some(c => (live[c] ?? 0) > 0) ? " (no catalog price?)" : ""}`}${live.subscription === true ? "; subscription login (no per-token bill)" : ""}`
 			: "host counters now: unknown (the host reported none)",
 		`pricing ${config.pricing}; currency ${config.currency}${config.rate === undefined ? "" : ` (rate ${config.rate} per USD)`}; scope ${scopeText(config)}; ${config.publishers.length} session(s) have publishing on`,
 		BILLED,
