@@ -103,7 +103,7 @@ function validateState(value: unknown): LocksState {
 }
 
 /** The lock table as stored; a missing file is empty. Never writes and never reclaims. */
-export function readLocks(host: FeatureHost): LocksState {
+export function readLocks(host: Pick<FeatureHost, "home">): LocksState {
 	return readState(locksFile(host.home), emptyState, validateState);
 }
 
@@ -154,7 +154,7 @@ export type LockResult =
 
 const refused = (reason: string): LockResult => ({ outcome: "refused", reason });
 
-const live = (lease: Lease, now: number): boolean => lease.expiresAt > now;
+export const live = (lease: Lease, now: number): boolean => lease.expiresAt > now;
 
 /** Drop every expired lease and any resource left empty. Returns whether anything was removed. */
 function reclaim(state: LocksState, now: number): boolean {
@@ -171,7 +171,7 @@ function reclaim(state: LocksState, now: number): boolean {
 }
 
 const totalLeases = (state: LocksState): number => state.resources.reduce((sum, resource) => sum + resource.leases.length, 0);
-const countLive = (resource: Resource, now: number): number => resource.leases.filter(lease => live(lease, now)).length;
+export const countLive = (resource: Resource, now: number): number => resource.leases.filter(lease => live(lease, now)).length;
 
 // ---- Operations --------------------------------------------------------------------------------
 
