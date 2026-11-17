@@ -91,7 +91,7 @@ def run(h):
 
     a_start, requests = len(a.frames), len(h.gateway.requests)
     everyone = h.say(master, "/peers msg all unscoped")
-    assert everyone == f"worker-a ({aid}): ok\nnot delivered: worker-b is paused; resend after its user resumes it ({bid})", everyone
+    assert everyone == f"worker-a ({aid}): ok\nnot delivered: worker-b is paused; resend after it is resumed (paused by the master: the master or its user can resume it) ({bid})", everyone
     turn(a, a_start)
     print("PASS unscoped 'all' still addresses every session; the receiver gate answers for the paused one")
 

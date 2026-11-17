@@ -16,7 +16,7 @@
 import * as path from "node:path";
 import type { FeatureHost, PeerView } from "./host";
 import type { Feature } from "./index";
-import { readPause } from "./pause";
+import { readPause, resumeHintFor } from "./pause";
 import { resolvePeer } from "./rules";
 import { looksLikeSecret } from "./secrets";
 import { readState, stateRoot, updateState } from "./store";
@@ -408,7 +408,7 @@ function recipientsOf(config: Config, peers: PeerView[], selfId: string, except:
 function refusalOf(host: FeatureHost, peer: PeerView): string | undefined {
 	const pause = readPause(host.home, peer.id);
 	if (pause.error) return "not delivered: pause state cannot be read, so the session is treated as paused";
-	if (pause.paused || peer.paused) return `not delivered: ${safeName(peer.name)} is paused (only its user can resume it)`;
+	if (pause.paused || peer.paused) return `not delivered: ${safeName(peer.name)} is paused (${resumeHintFor(pause.by)})`;
 	if (peer.refusesInbound === true) return `not delivered: ${safeName(peer.name)} refuses inbound requests`;
 	if (peer.acceptsRemote === false) return `not delivered: ${safeName(peer.name)} does not accept remote requests`;
 	return undefined;

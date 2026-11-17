@@ -47,7 +47,7 @@ The result is stored in `delivery`:
 
 - `delivered`: the session accepted the message.
 - `pending`: the session is not live (or is the master itself). It is never resumed. The asker reads the answer with `peers_decision check`, or the master re-attempts with `/peers inbox retry <id>`.
-- `undeliverable: <reason>`: the session is live but refused or could not be reached (for example refusing inbound requests, rate limited, unreachable, or `session is paused`: a paused session refuses wake-triggering messages, and only that session's own user can `/peers resume`; the master cannot). Fix the cause and `retry`, or the session can still use `check`.
+- `undeliverable: <reason>`: the session is live but refused or could not be reached (for example refusing inbound requests, rate limited, unreachable, or `session is paused`: a paused session refuses wake-triggering messages, and the line names who may resume it, for example `paused by its user: only its user can resume it`, `paused by the master: the master or its user can resume it` or `paused after a restart: only its user can resume it`). Fix the cause and `retry`, or the session can still use `check`.
 
 `defer` never sends anything. `retry` only applies to answered questions that are not yet delivered; a delivered answer is never sent twice by `retry`.
 

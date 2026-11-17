@@ -33,7 +33,7 @@ import { autoCompactRuntime } from "../lib/features/autocompact";
 import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInput } from "../lib/features/audit";
 import type { FeatureHost, ModelApply, ModelCheck, SendResult } from "../lib/features/host";
 import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
-import { pauseAfterRestart, pauseSession, readPause, restartDecision, restartNotice, resumeSession, SUBAGENT_RESUME_ERROR, wakeGate, type PauseBy, type SavedRun } from "../lib/features/pause";
+import { NEUTRAL_RESUME_HINT, pauseAfterRestart, pauseSession, readPause, resumeHint, restartDecision, restartNotice, RESTART_REASON, RESUME_REFUSED, resumeSession, SUBAGENT_RESUME_ERROR, wakeGate, type PauseBy, type PauseView, type SavedRun } from "../lib/features/pause";
 import { startupTemplate } from "../lib/features/templates";
 import { usageForRegistry, type PublishedUsage, type UsageSource } from "../lib/features/usage";
 
@@ -213,9 +213,11 @@ const state = {
 	managedTurn: false,
 	/** The record saveSession wrote last, so an unchanged record is not rewritten every refresh. */
 	persisted: "",
-	/** The restart rule decided at bind that this session must be paused before it serves anything. */
+	/** The restart rule decided at bind that this session is paused, and that pause is not recorded yet: until it is (or the user resumes), the receiver and the registry row treat the session as paused. */
 	restartPending: false,
 	restartSettling: undefined as Promise<void> | undefined,
+	/** The last reason the restart pause could not be recorded; the warning is shown once per distinct reason. */
+	restartWarned: "",
 };
 let exitHooked = false;
 const sockPath = () => path.join(ROOT, `${state.id}.sock`);
@@ -354,7 +356,7 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 	const ctx = state.ctx;
 	const usage = ctx?.getContextUsage?.() as { tokens?: number; percent?: number } | undefined;
 	const model = ctx?.models.current();
-	const pause = readPause(os.homedir(), state.id);
+	const pause = pauseView();
 	return {
 		id: state.id,
 		instance: state.instance,
@@ -604,34 +606,49 @@ interface HandleTrace {
 }
 
 /**
- * A message or prompt from the master starts or joins work "under the master's management": remembered until the
- * agent run ends and saved, so the restart rule can leave such a session running. The sender's id is a claim, like
- * every `from` here; a false claim can only make the restart rule skip the automatic pause.
+ * Provenance of a turn is fixed when it starts: a master prompt or message that arrives while the session is idle starts
+ * a turn "under the master's management" (remembered until the agent run ends and saved, so the restart rule can leave
+ * such a session running). A master message that arrives while a turn is already running does not change that turn, and
+ * a user message that joins a managed turn does not either. The sender's id is a claim, like every `from` here; a false
+ * claim can only make the restart rule skip the automatic pause.
  */
 function noteManaged(req: Req): void {
 	if (!req.from?.id || masterId() !== req.from.id) return;
-	if (state.ctx && !state.ctx.isIdle()) state.managedTurn = true;
-	else state.pendingManaged = true;
+	if (state.ctx?.isIdle() !== false) state.pendingManaged = true;
+}
+
+/** The pause as the receiver and the registry row see it: an unrecorded restart pause counts as a pause by the restart rule. */
+function pauseView(): PauseView {
+	const view = readPause(os.homedir(), state.id);
+	return state.restartPending && !view.paused ? { paused: true, by: "restart", reason: RESTART_REASON } : view;
 }
 
 /**
- * Apply the restart rule decided at bind: record the pause (`by: restart`) and tell this session's user, before the
- * server starts (refresh waits for this), so nothing automatic can wake the session first. Never throws.
+ * Apply the restart rule decided at bind: record the pause (`by: restart`) and tell this session's user. A failed write
+ * keeps `restartPending` set, so the session stays gated (see `pauseView`); the warning is shown once per reason and
+ * every refresh retries, until it is recorded or the user runs /peers resume. Never throws.
  */
 function settleRestart(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
 	if (!state.restartPending) return Promise.resolve();
 	const { sessionId, id } = state;
 	state.restartSettling ??= (async () => {
-		const warn = (why: string) => ctx.ui.notify(`peers: restart pause not recorded: ${why}`, "warning");
+		const name = pi.getSessionName() || state.saved.name || path.basename(ctx.cwd);
+		let failure = "";
 		try {
 			const result = await pauseAfterRestart(os.homedir(), id, Date.now());
-			if (result.ok) ctx.ui.notify(restartNotice(pi.getSessionName() || state.saved.name || path.basename(ctx.cwd), id), "warning");
-			else warn(result.error);
+			if (!result.ok) failure = result.error;
+			else if (!result.already && state.sessionId === sessionId && state.restartPending) ctx.ui.notify(restartNotice(name, id), "warning");
 		} catch (error) {
-			warn((error as Error).message);
+			failure = (error as Error).message;
 		} finally {
 			if (state.sessionId === sessionId) {
-				state.restartPending = false;
+				if (!failure) {
+					state.restartPending = false;
+					state.restartWarned = "";
+				} else if (failure !== state.restartWarned) {
+					state.restartWarned = failure;
+					ctx.ui.notify(`peers: ${name} (${id}) is treated as paused after a restart, but the pause could not be recorded: ${failure}. Retrying on every refresh; /peers resume cancels it`, "warning");
+				}
 				state.restartSettling = undefined;
 			}
 		}
@@ -654,12 +671,14 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 	// it clears only a pause the master set itself (see resumeSession); the session's own user always has `/peers resume`.
 	// The one wake gate: every sender (master dispatch, peers_send, the watcher, future digests and triggers) reaches
 	// this receiver, so a paused session refuses wake-triggering ops here regardless of who asks.
-	const gate = wakeGate(readPause(os.homedir(), state.id), req.op);
+	const gate = wakeGate(pauseView(), req.op);
 	if (!gate.allow) return gate.result;
 	switch (req.op) {
 		case "status":
 			return { ok: true, info: selfInfo(pi), sessionOwner: state.sessionLock?.acquired === true };
 		case "pause": {
+			// An unrecorded restart pause already holds the session; writing a master entry now would replace its provenance.
+			if (state.restartPending) return { ok: true, paused: true };
 			const paused = await pauseSession(os.homedir(), state.id, "master", Date.now(), text);
 			if (!paused.ok) return { ok: false, error: paused.error };
 			publish(pi);
@@ -667,7 +686,15 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 		}
 		case "resume": {
 			if (req.subagent === true) return { ok: false, error: SUBAGENT_RESUME_ERROR };
-			const resumed = await resumeSession(os.homedir(), state.id, "master");
+			if (state.restartPending) return { ok: false, error: RESUME_REFUSED.restart };
+			const senderId = req.from?.id;
+			// Checked again inside the locked update: the master handoff or `/peers lock` may land while this call waits for the lock.
+			const stillAuthorized = () => {
+				if (state.inbound === "refuse") return "peer refuses inbound requests";
+				if (!state.control) return "peer is locked (control refused)";
+				return senderId && masterId() === senderId ? undefined : "sender is not the master session";
+			};
+			const resumed = await resumeSession(os.homedir(), state.id, { stillAuthorized });
 			if (!resumed.ok) return { ok: false, error: resumed.error };
 			publish(pi);
 			return { ok: true, paused: false, cleared: resumed.cleared !== undefined };
@@ -844,7 +871,8 @@ function startServer(pi: ExtensionAPI): void {
 	state.server = server;
 }
 
-function teardown(): void {
+/** `clean` is false for an exit that is not a normal one (a nonzero process exit code): the next start then sees a blackout. */
+function teardown(clean = true): void {
 	releaseMaster();
 	if (state.server) {
 		state.server.close();
@@ -852,7 +880,7 @@ function teardown(): void {
 		fs.rmSync(sockPath(), { force: true });
 		fs.rmSync(infoPath(state.id), { force: true });
 	}
-	if (state.sessionLock?.acquired) {
+	if (state.sessionLock?.acquired && clean) {
 		// A clean exit: the next start of this session is a normal reopen, not a blackout.
 		state.clean = true;
 		state.pendingManaged = false;
@@ -874,9 +902,9 @@ function fmt(p: PeerInfo & Partial<IdentityStatus>, master: string | undefined):
 }
 
 /** `name` labels a paused refusal: the sender sees who is paused and that the request was deferred, not that it failed. */
-function summarize(res: Record<string, unknown>, name = "peer"): string {
+function summarize(res: Record<string, unknown>, name = "peer", hint = NEUTRAL_RESUME_HINT): string {
 	if (!res.ok) {
-		if (res.paused === true && (res.status === "deferred" || res.status === "refused")) return `not delivered: ${name} is paused; resend after its user resumes it`;
+		if (res.paused === true && (res.status === "deferred" || res.status === "refused")) return `not delivered: ${name} is paused; resend after it is resumed (${hint})`;
 		return `failed: ${String(res.error)}`;
 	}
 	if (Array.isArray(res.entries)) {
@@ -895,7 +923,7 @@ export default function peers(pi: ExtensionAPI) {
 	// One process-level cleanup hook, however many times the identity rebinds.
 	if (!exitHooked) {
 		exitHooked = true;
-		process.on("exit", teardown);
+		process.on("exit", code => teardown(code === 0));
 	}
 
 	// ACP can host several sessions in one process, each with its own session manager. The first bound manager owns this
@@ -916,18 +944,15 @@ export default function peers(pi: ExtensionAPI) {
 			ctx.ui.setStatus("peers", state.identityError);
 			return;
 		}
-		if (state.restartPending) {
-			// The restart pause is written before the server exists, so nothing can reach the session first.
-			void settleRestart(pi, ctx).then(() => refresh(ctx));
-			return;
-		}
+		// A restart pause that could not be written yet is retried here; until then the receiver and the registry treat the session as paused.
+		if (state.restartPending) void settleRestart(pi, ctx).then(() => publish(pi));
 		startServer(pi);
 		publish(pi);
 		if (state.masterLock && masterId() !== state.id) releaseMaster();
 		if (state.saved.restoreMaster && state.server?.listening) claimMaster();
 		const n = scanPeers().filter(p => p.id !== state.id).length;
 		const m = masterId();
-		ctx.ui.setStatus("peers", `peers:${n}${m === state.id ? " ★master" : m ? ` master:${m}` : ""}${readPause(os.homedir(), state.id).paused ? " paused" : ""}`);
+		ctx.ui.setStatus("peers", `peers:${n}${m === state.id ? " ★master" : m ? ` master:${m}` : ""}${pauseView().paused ? " paused" : ""}`);
 	};
 
 	// Periodic feature work (the watchdog) rides the 5 s refresh, runs only in the master session and never overlaps itself.
@@ -1141,7 +1166,7 @@ export default function peers(pi: ExtensionAPI) {
 				if (req.op === "message" && req.report && recordReport && reportMaster === t.id && masterId() === t.id) {
 					notifications.reported(turn, req.report.kind, t, response);
 				}
-				const summary = summarize(response, t.name);
+				const summary = summarize(response, t.name, resumeHint(os.homedir(), t.id));
 				return response.ok === false && response.paused === true ? `${summary} (${t.id})` : `${t.name} (${t.id}): ${summary}`;
 			}),
 		);
@@ -1284,6 +1309,19 @@ export default function peers(pi: ExtensionAPI) {
 			}
 			const feature = FEATURES.find(f => f.name === sub);
 			if (feature) {
+				if (sub === "resume" && rest.length === 0) {
+					// The user's own resume also cancels a restart pause that could not be recorded.
+					await state.restartSettling;
+					if (state.restartPending) {
+						state.restartPending = false;
+						state.restartWarned = "";
+						publish(pi);
+						return say(`resumed ${selfInfo(pi).name} (${state.id}) (the restart pause could not be recorded and is cancelled): wake-triggering messages and prompts are accepted again`);
+					}
+				}
+				if (sub === "pause" && rest[0] === "status" && state.restartPending) {
+					return say(`${selfInfo(pi).name} (${state.id}) is treated as paused by the restart rule (${RESTART_REASON}), but the pause could not be recorded yet (${state.restartWarned || "write pending"}); retried on every refresh; resumable by only its user (/peers resume)`);
+				}
 				const out = await feature.command(rest, featureHost(ctx));
 				publish(pi); // a pause or resume must show in the registry now, not at the next 5 s refresh
 				return say(out);

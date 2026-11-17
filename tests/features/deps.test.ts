@@ -465,7 +465,7 @@ describe("blocked targets", () => {
 		await pauseSession(home, B, "user", T0, "reviewing");
 		const preview = await run("preview t1");
 		expect(preview).toContain("delivery would be blocked: session is paused (outcome: not delivered: session is paused)");
-		expect(await run("approve t1")).toBe(`t1 not delivered: session is paused; nothing reached worker-b (${B}) (only that session's own user can /peers resume). Fix the cause and run /peers deps approve t1 again, or /peers deps reject t1`);
+		expect(await run("approve t1")).toBe(`t1 not delivered: session is paused; nothing reached worker-b (${B}) (paused by its user: only its user can resume it). Fix the cause and run /peers deps approve t1 again, or /peers deps reject t1`);
 		expect(sendCalls).toBe(0);
 		expect(outcomes()).toEqual(["t1:not delivered: session is paused"]);
 		expect(JSON.parse(fs.readFileSync(path.join(stateRoot(home), "pause.json"), "utf8")).sessions[B]).toBeDefined();

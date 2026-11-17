@@ -15,7 +15,7 @@ from smoke import wait_for
 
 CLOCK = ["-e", str(Path(__file__).with_name("_clock_ext.ts"))]
 
-NOT_DELIVERED = "not delivered: worker-b is paused (only its user can resume it)"
+NOT_DELIVERED = "not delivered: worker-b is paused (paused by its user: only its user can resume it)"
 
 
 class ScriptedGateway(BaseHTTPRequestHandler):

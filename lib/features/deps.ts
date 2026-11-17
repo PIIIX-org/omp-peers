@@ -17,7 +17,7 @@ import * as path from "node:path";
 import type { Report } from "../reports";
 import type { FeatureHost, PeerView } from "./host";
 import type { Feature } from "./index";
-import { PAUSED_ERROR, readPause } from "./pause";
+import { PAUSED_ERROR, readPause, resumeHint } from "./pause";
 import { looksLikeSecret } from "./secrets";
 import { readState, stateRoot, updateState } from "./store";
 
@@ -571,13 +571,13 @@ async function preview(host: FeatureHost, args: string[]): Promise<string> {
 	return found.map(rule => renderPreview(host, rule, nextTriggerFor(state, rule), undefined, live)).join("\n\n");
 }
 
-function describeDispatch(result: DispatchResult & { status: "delivered" | "not delivered" | "unknown" }, live: PeerView[]): string {
+function describeDispatch(result: DispatchResult & { status: "delivered" | "not delivered" | "unknown" }, live: PeerView[], home: string): string {
 	const { trigger, rule, reason } = result;
 	const target = label(rule.to, live);
 	switch (result.status) {
 		case "delivered": return `${trigger.id} delivered to ${target}: one peer message from this session carrying rule ${rule.id}'s prompt`;
 		case "unknown": return `${trigger.id} outcome unknown: ${reason}; the message may have reached ${target}, so it is not retried. Check the target, then /peers deps reject ${trigger.id} to close it`;
-		default: return `${trigger.id} not delivered: ${reason}; nothing reached ${target}${reason?.includes(PAUSED_ERROR) ? " (only that session's own user can /peers resume)" : ""}. Fix the cause and run /peers deps approve ${trigger.id} again, or /peers deps reject ${trigger.id}`;
+		default: return `${trigger.id} not delivered: ${reason}; nothing reached ${target}${reason?.includes(PAUSED_ERROR) ? ` (${resumeHint(home, rule.to)})` : ""}. Fix the cause and run /peers deps approve ${trigger.id} again, or /peers deps reject ${trigger.id}`;
 	}
 }
 
@@ -635,7 +635,7 @@ async function command(args: string[], host: FeatureHost): Promise<string> {
 				const id = parseId(rest[0], TRIGGER_ID_RE);
 				if (!id) return `error: "${rest[0]}" is not a trigger id (t<number>)`;
 				const result = await dispatchTrigger(host, id);
-				return result.status === "refused" ? `error: ${result.error}` : describeDispatch(result, await livePeers(host));
+				return result.status === "refused" ? `error: ${result.error}` : describeDispatch(result, await livePeers(host), host.home);
 			}
 			case "reject": {
 				if (rest.length !== 1) return USAGE;

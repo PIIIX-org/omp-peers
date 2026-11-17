@@ -1,6 +1,6 @@
 # Pause and resume
 
-An explicit, persisted state that tells every automated coordinator not to wake a session. Nothing is paused until you pause it, or until the restart rule below pauses a session that was idle when OMP died.
+An explicit, persisted state that tells every automated coordinator not to wake a session. Nothing is paused until you pause it, or until the restart rule below pauses a session that was not working for the master when OMP died.
 
 ## Commands
 
@@ -24,7 +24,7 @@ Every pause records why it exists (`by` in `pause.json`, `pausedBy` in the regis
 | `master` | the master's `pause` op | the master (`resume` op) or its user |
 | `restart` | the restart rule below | only its user (`/peers resume`) |
 
-The receiving session decides, under the pause file's cross-process lock. The master's `resume` clears a pause only when the stored `by` is `master`. For any other pause the receiver refuses with a fixed error and changes nothing:
+The receiving session decides, under the pause file's cross-process lock. The master's `resume` clears a pause only when the stored `by` is `master`, and only while the sender is still the current master and the session still allows control: both are checked again inside the locked update, after any wait for the lock, so a master handoff or a `/peers lock` that lands in between refuses the request (`sender is not the master session`, `peer is locked (control refused)`, `peer refuses inbound requests`) and the pause stays. For any other pause the receiver refuses with a fixed error and changes nothing:
 
 - `paused by its user: only that user can resume it with /peers resume`
 - `paused after a restart because it was idle: only its user can resume it`
@@ -41,10 +41,10 @@ Pausing an already paused session changes nothing otherwise: the original start 
 
 ## The restart rule
 
-A session that was idle before a blackout stays idle until its own user resumes it. The extension records, in the session's saved metadata (`~/.omp/agent/peer-sessions/<session id>.json`, `0600`), whether the previous process shut down cleanly (`clean`) and whether it was actively working under the master's management (`managed`):
+A session that was not working for the master before a blackout stays paused until its own user resumes it. The extension records, in the session's saved metadata (`~/.omp/agent/peer-sessions/<session id>.json`, `0600`), whether the previous process shut down cleanly (`clean`) and whether it was actively working under the master's management (`managed`):
 
-- `clean` is `false` from the moment a session starts and becomes `true` only when its process shuts down through the extension's teardown (a normal OMP exit, `session_shutdown`, or a switch to another session in the same process). Anything else (kill -9, a crash, a power cut, a signal that skips Node's exit handlers) leaves `false` behind.
-- `managed` is `true` while a turn that a master request started is running: a `prompt` from the master, or a `message` whose sender claims the master's id. It is set when that request is accepted (or at once, when the session is already busy) and cleared when the agent run ends. A turn the session's own user started is never managed. The sender's id is a claim, like every `from`: a false claim can only make the rule skip the automatic pause.
+- `clean` is `false` from the moment a session starts and becomes `true` only when the session shuts down through the extension's teardown: `session_shutdown`, a switch to another session in the same process, or a process exit with code 0. A nonzero exit code, kill -9, a crash, a power cut, or a signal that skips Node's exit handlers leaves `false` behind.
+- `managed` is `true` while a turn that a master request started is running: a `prompt` from the master, or a `message` whose sender claims the master's id, accepted while the session is idle. A turn's provenance is fixed when it starts: a master message that joins a turn already running (for example the user's own) does not make it managed, and a user message that joins a managed turn does not make it unmanaged. The flag is cleared when the agent run ends. A turn the session's own user started is never managed. The sender's id is a claim, like every `from`: a false claim can only make the rule skip the automatic pause.
 
 At session start, before the session serves any request, the rule (`restartDecision`, a pure function of the saved record and the pause file) decides:
 
@@ -53,12 +53,14 @@ At session start, before the session serves any request, the rule (`restartDecis
 | none (a new session) | | unchanged |
 | clean exit, or an older record without `clean` | | unchanged |
 | unclean, `managed: true` (working for the master when it died) | | unchanged: the master may continue it |
-| unclean, not managed (idle, or working on its own user's turn) | no | paused automatically: `by: restart`, reason `idle before the restart` |
+| unclean, not managed (idle, or working on its own user's turn) | no | paused automatically: `by: restart`, reason `not working for the master before the restart` |
 | unclean | yes | unchanged: the existing pause keeps its `by` |
 
-The pause is written first and the session's socket and registry row appear afterwards, so no master message, prompt or watcher digest can slip in. The session's own user sees one local notice at start (`<name> (<id>) was paused automatically: the previous run did not shut down cleanly and the session was not working for the master. Nothing automatic can wake it and the master cannot resume it; run /peers resume to continue`). The master cannot clear a `restart` pause; only `/peers resume` in that session does. Nothing is evaluated by waking the session: the decision reads two files.
+The pause is normally written before the session's socket and registry row appear, so no master message, prompt or watcher digest can slip in. If the write fails (an unwritable state directory, a full disk), the session stays gated anyway: its receiver and its registry row (`paused`, `pausedBy: restart`) treat it as paused, the user gets one warning per distinct failure, the write is retried on every 5 second refresh, and `/peers pause status` says the pause is not recorded yet. It stays gated until the write succeeds or its user runs `/peers resume`, which cancels the pending pause (it is then never written). While the write is pending, a master `pause` changes nothing and a master `resume` is refused as for a restart pause. Features that read `pause.json` directly (auto-compact, digests, dependency and watchdog senders in other sessions) cannot see a pause that is not recorded; only the receiver gate and the published registry flag do.
 
-Consequences to know about: a master that is restarted after a kill is paused too (its own turns are never managed), so its watcher digests wait until its user resumes it. A saved session record written by an older version has no `clean` field, so the first restart after upgrading never pauses anything. If `pause.json` cannot be written when the rule applies, the user gets a warning and the session starts unpaused (an unreadable file already counts as paused).
+The session's own user sees one local notice at start (`<name> (<id>) was paused automatically: the previous run did not shut down cleanly and the session was not working for the master. Nothing automatic can wake it and the master cannot resume it; run /peers resume to continue`). The master cannot clear a `restart` pause; only `/peers resume` in that session does. Nothing is evaluated by waking the session: the decision reads two files.
+
+Consequences to know about: a master that is restarted after a kill is paused too (its own turns are never managed), so its watcher digests wait until its user resumes it. A saved session record written by an older version has no `clean` field, so the first restart after upgrading never pauses anything.
 
 ## What a pause does
 
@@ -84,7 +86,7 @@ The decision is `wakeGate(state, op)` in `lib/features/pause.ts`, a pure functio
 
 ## What senders see
 
-- `/peers msg`, `/peers do ... prompt` and `peers_send`/`peers_control` print `not delivered: <name> is paused; resend after its user resumes it (<id>)` instead of `failed: ...`. The structured result keeps `status: "deferred"` (message) or `"refused"` (prompt); the text says what actually happened: nothing was delivered or queued, so the sender must resend. A broadcast prints one line per target, so paused and working sessions are visible side by side.
+- `/peers msg`, `/peers do ... prompt` and `peers_send`/`peers_control` print `not delivered: <name> is paused; resend after it is resumed (<who may resume it>) (<id>)` instead of `failed: ...`, where the parenthesis names who may resume it from the pause file: `paused by its user: only its user can resume it`, `paused by the master: the master or its user can resume it`, `paused after a restart: only its user can resume it`, or `resume policy: see /peers pause status` when it is not known. The structured result keeps `status: "deferred"` (message) or `"refused"` (prompt); the text says what actually happened: nothing was delivered or queued, so the sender must resend. A broadcast prints one line per target, so paused and working sessions are visible side by side. The completion-watcher, dependency and inbox texts use the same wording.
 - `resume` prints `ok (resumed)`, `ok (was not paused)` or `failed: <the fixed error above>` per target. Over a group or `all`, each target answers for itself: the ones the master paused are resumed and the others print their refusal.
 - `peers_list` and `/peers list` show `[paused:<by>]` in the flags (`[paused]` for a registration from an older version), `status` reports `paused`, `pausedSince` (an ISO time) and `pausedBy` in the session's registry row `~/.omp/run/peers/<id>.json`, and the session's own status line shows `paused`. Reading any of these never wakes anything. Registrations from older versions have no `paused` field and are shown without a flag.
 - The completion watcher keeps its digest queued when the master is paused: it is not dropped and not marked delivered, it is retried after at most 30 seconds, and it logs one warning (`notification deferred: the master session is paused ...`) for the whole paused period instead of one per attempt. After the master resumes, the same digest, with the same event IDs, is delivered once.
@@ -99,7 +101,7 @@ The decision is `wakeGate(state, op)` in `lib/features/pause.ts`, a pure functio
 - A stored `by` longer than 64 bytes is invalid (the file is then treated as unreadable); the reason stays limited to 120 characters.
 - `/peers do all pause` does not include the session you run it from; use `/peers pause` there.
 - Pausing a master stops the watcher's digests from waking it; they wait as described above.
-- The restart rule cannot tell a kill from a crash or a power cut, and it cannot see a turn that is accepted but has not started yet (milliseconds). It cannot know that a user was away: a session killed while its user was typing is paused like any idle one. Every session now has a saved metadata file (`clean`, `managed` and the previous fields); files are small and are not removed.
+- The restart rule cannot tell a kill from a crash or a power cut, and it cannot see a turn that is accepted but has not started yet (milliseconds). A master message accepted while the session is idle that never starts a turn leaves the next turn marked managed until an agent run ends. It cannot know that a user was away: a session killed while its user was typing is paused like any session that was not working for the master. A process that exits through the extension's teardown with code 0 counts as clean even if it was about to crash later. Every session now has a saved metadata file (`clean`, `managed` and the previous fields); files are small and are not removed.
 
 ## Files and privacy
 

@@ -532,9 +532,9 @@ describe("recipients", () => {
 		metrics[B] = { paused: true };
 		await fire();
 		expect(sent).toEqual([]);
-		expect(alertOf(A, "busy")?.notified).toEqual({ [B]: "not delivered: worker-b is paused (only its user can resume it)" });
+		expect(alertOf(A, "busy")?.notified).toEqual({ [B]: "not delivered: worker-b is paused (resume policy: see /peers pause status)" });
 		const status = await run("status");
-		expect(status).toContain(`notify ${B}: not delivered: worker-b is paused (only its user can resume it)`);
+		expect(status).toContain(`notify ${B}: not delivered: worker-b is paused (resume policy: see /peers pause status)`);
 		advance(200);
 		metrics[B] = { paused: false };
 		await ticks();
@@ -706,7 +706,7 @@ describe("status and check are read-only and mirror the real evaluation", () => 
 		expect(out).toContain("watchdog check (read-only: nothing is sent and no state is written)");
 		expect(out).toContain("context: context 95% (limit 90%): WOULD ALERT now");
 		expect(out).toContain(`would alert: worker-a (${A}) context at 95% (limit 90%)`);
-		expect(out).toContain(`would notify worker-b (${B}): not delivered: worker-b is paused (only its user can resume it)`);
+		expect(out).toContain(`would notify worker-b (${B}): not delivered: worker-b is paused (resume policy: see /peers pause status)`);
 		expect(out).toContain("busy: busy 0 min since first observed " + new Date(T0).toISOString() + " (limit 30 min), ok");
 		expect(stored().busy).toEqual({});
 		await ticks();
@@ -724,7 +724,7 @@ describe("status and check are read-only and mirror the real evaluation", () => 
 		expect(out).toContain("evaluation: runs in this session (the master) every 5 s");
 		expect(out).toContain("recipients: this master session's agent-context hint; peer message to worker-b (p00000000000000b2)");
 		expect(out).toContain(`alerted ${new Date(T0).toISOString()}; still active, no further alert until it clears`);
-		expect(out).toContain(`notify ${B}: not delivered: worker-b is paused (only its user can resume it)`);
+		expect(out).toContain(`notify ${B}: not delivered: worker-b is paused (resume policy: see /peers pause status)`);
 		expect(out.endsWith("active alerts: 1 (1 unacknowledged)")).toBe(true);
 		expect(await renderStatus(host())).toBe(out);
 	});
@@ -940,7 +940,7 @@ describe("recipients are never woken while paused, and delivery text is capped",
 		await run("set notify worker-b");
 		metrics[A] = { busy: true };
 	});
-	const PAUSED = "not delivered: worker-b is paused (only its user can resume it)";
+	const PAUSED = "not delivered: worker-b is paused (paused by its user: only its user can resume it)";
 
 	test("a recipient paused in the pause state file is never messaged even when its registry row says it is not paused; check says so and writes nothing", async () => {
 		await pauseSession(home, B, "user", now, "waiting");

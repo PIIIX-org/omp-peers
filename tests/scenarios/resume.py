@@ -16,7 +16,15 @@ USER_PAUSED = "paused by its user: only that user can resume it with /peers resu
 RESTART_PAUSED = "paused after a restart because it was idle: only its user can resume it"
 SUBAGENT = "resume is not available to subagents"
 NOT_MASTER = "sender is not the master session"
-NOT_DELIVERED = "not delivered: worker-r is paused; resend after its user resumes it"
+
+
+def not_delivered(hint):
+    return f"not delivered: worker-r is paused; resend after it is resumed ({hint})"
+
+
+BY_USER = not_delivered("paused by its user: only its user can resume it")
+BY_MASTER = not_delivered("paused by the master: the master or its user can resume it")
+BY_RESTART = not_delivered("paused after a restart: only its user can resume it")
 
 
 class HoldGateway(BaseHTTPRequestHandler):
@@ -91,6 +99,7 @@ def scenario(h):
     assert h.say(master, f"/peers do {wid} pause maintenance window") == f"worker-r ({wid}): ok (paused)"
     wait_for(lambda: h.row(worker).get("paused") is True)
     assert h.row(worker)["pausedBy"] == "master"
+    assert h.say(master, f"/peers msg {wid} hello") == f"{BY_MASTER} ({wid})"
     entry = pause_entry(h, wid)
     assert entry["by"] == "master" and entry["reason"] == "maintenance window", entry
     assert any(wid in line and "paused:master" in line for line in h.say(master, "/peers list").splitlines())
@@ -111,7 +120,7 @@ def scenario(h):
     assert pause_entry(h, wid)["by"] == "user", "a master pause does not turn the user's pause into the master's"
     assert h.say(master, f"/peers do {wid} resume") == f"worker-r ({wid}): failed: {USER_PAUSED}"
     assert h.row(worker)["paused"] is True
-    assert h.say(master, f"/peers msg {wid} hi") == f"{NOT_DELIVERED} ({wid})"
+    assert h.say(master, f"/peers msg {wid} hi") == f"{BY_USER} ({wid})"
     assert "by its user (my own call); resumable by only its user" in h.say(worker, "/peers pause status")
     assert h.say(worker, "/peers resume").startswith(f"resumed worker-r ({wid}) (it was paused by its user)")
     wait_for(lambda: h.row(worker)["paused"] is False)
@@ -159,16 +168,16 @@ def scenario(h):
     row = wait_for(lambda: h.row(worker) if h.row(worker).get("paused") is True else None)
     assert row["pausedBy"] == "restart", row
     entry = pause_entry(h, wid)
-    assert entry["by"] == "restart" and entry["reason"] == "idle before the restart", entry
+    assert entry["by"] == "restart" and entry["reason"] == "not working for the master before the restart", entry
     wait_for(lambda: any(f.get("method") == "notify" and "was paused automatically" in str(f.get("message", "")) for f in worker.frames))
     start, requests = len(worker.frames), len(h.gateway.requests)
     assert h.say(master, f"/peers do {wid} resume") == f"worker-r ({wid}): failed: {RESTART_PAUSED}"
-    assert h.say(master, f"/peers msg {wid} anybody home?") == f"{NOT_DELIVERED} ({wid})"
+    assert h.say(master, f"/peers msg {wid} anybody home?") == f"{BY_RESTART} ({wid})"
     assert rpc(h.row(worker), {"op": "prompt", "text": "x", "from": {"id": mid, "name": "master"}})["status"] == "refused"
     time.sleep(0.5)
     assert [f for f in worker.frames[start:] if str(f.get("type", "")).startswith(("agent_", "turn_", "message_")) or "Message from" in json.dumps(f)] == []
     assert len(h.gateway.requests) == requests
-    assert "by the restart rule (idle before the restart); resumable by only its user" in h.say(worker, "/peers pause status")
+    assert "by the restart rule (not working for the master before the restart); resumable by only its user" in h.say(worker, "/peers pause status")
     assert pause_entry(h, wid)["by"] == "restart"
     print("PASS an idle session killed with -9 comes back paused (restart); the master cannot resume it and nothing wakes it")
     assert h.say(worker, "/peers resume").startswith(f"resumed worker-r ({wid}) (it was paused by the restart rule)")

@@ -8,7 +8,7 @@ import time
 
 from smoke import wait_for
 
-NOT_DELIVERED = "not delivered: worker-b is paused; resend after its user resumes it"
+NOT_DELIVERED = "not delivered: worker-b is paused; resend after it is resumed (paused by its user: only its user can resume it)"
 NOT_MASTER = "sender is not the master session"
 USER_PAUSED = "paused by its user: only that user can resume it with /peers resume"
 

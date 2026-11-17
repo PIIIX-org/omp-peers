@@ -3,11 +3,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { FileLock } from "@oh-my-pi/pi-natives";
 import { FEATURES } from "../../lib/features";
 import type { FeatureHost } from "../../lib/features/host";
 import {
-	MAX_BY_BYTES, MAX_REASON, NON_WAKE_OPS, RESTART_REASON, RESUME_REFUSED, SUBAGENT_RESUME_ERROR, pause, pauseAfterRestart, pauseFile, pauseSession, readPause,
-	restartDecision, restartNotice, resume, resumeSession, wakeGate, type PauseBy, type PauseState,
+	MAX_BY_BYTES, MAX_REASON, NEUTRAL_RESUME_HINT, NON_WAKE_OPS, RESTART_REASON, RESUME_REFUSED, SUBAGENT_RESUME_ERROR, pause, pauseAfterRestart, pauseFile, pauseSession, readPause,
+	restartDecision, restartNotice, resume, resumeHint, resumeHintFor, resumeSession, wakeGate, type PauseBy, type PauseState,
 } from "../../lib/features/pause";
 
 const A = "p00000000000000a1";
@@ -222,11 +223,12 @@ describe("pause provenance", () => {
 		expect(await pauseSession(home, B, "master", NOW, "by the master")).toEqual({ ok: true, already: false, upgraded: false, entry: { since: NOW, by: "master", reason: "by the master" } });
 		const C = "p00000000000000c3";
 		expect(await pauseAfterRestart(home, C, NOW + 7)).toEqual({ ok: true, already: false, upgraded: false, entry: { since: NOW + 7, by: "restart", reason: RESTART_REASON } });
-		expect(RESTART_REASON).toBe("idle before the restart");
+		expect(RESTART_REASON).toBe("not working for the master before the restart");
+		expect(Buffer.byteLength(RESTART_REASON)).toBeLessThanOrEqual(MAX_REASON);
 		expect(stored().sessions).toEqual({
 			[A]: { since: NOW, by: "user", reason: "mine" },
 			[B]: { since: NOW, by: "master", reason: "by the master" },
-			[C]: { since: NOW + 7, by: "restart", reason: "idle before the restart" },
+			[C]: { since: NOW + 7, by: "restart", reason: "not working for the master before the restart" },
 		});
 	});
 
@@ -236,7 +238,7 @@ describe("pause provenance", () => {
 		expect(readPause(home, B)).toEqual({ paused: true, since: NOW + 1, by: "user", reason: undefined });
 		expect(readPause(home, "p00000000000000c3")).toMatchObject({ by: "user", reason: "kept" });
 		// The master cannot clear any of them; the user can.
-		for (const id of [A, B, "p00000000000000c3"]) expect(await resumeSession(home, id, "master")).toEqual({ ok: false, error: RESUME_REFUSED.user });
+		for (const id of [A, B, "p00000000000000c3"]) expect(await resumeSession(home, id, MASTER)).toEqual({ ok: false, error: RESUME_REFUSED.user });
 		expect(await resumeSession(home, A, "user")).toMatchObject({ ok: true, cleared: { by: "user" } });
 		// Any later write keeps them as the user's.
 		expect(stored().sessions[B]).toEqual({ since: NOW + 1, by: "user" });
@@ -259,10 +261,73 @@ describe("pause provenance", () => {
 
 	test("the file stays private after provenance writes", async () => {
 		await pauseSession(home, A, "master", NOW);
-		await resumeSession(home, A, "master");
+		await resumeSession(home, A, MASTER);
 		await pauseAfterRestart(home, B, NOW);
 		expect(fs.statSync(pauseFile(home)).mode & 0o777).toBe(0o600);
 		expect(fs.statSync(path.dirname(pauseFile(home))).mode & 0o777).toBe(0o700);
+	});
+});
+
+/** A master whose claim is still current. */
+const MASTER = { stillAuthorized: () => undefined };
+
+describe("master resume authorization is re-read under the lock", () => {
+	test("a master that lost its claim, or a session that locked control, is refused and the pause stays", async () => {
+		await pauseSession(home, A, "master", NOW, "hold");
+		const before = fs.readFileSync(pauseFile(home), "utf8");
+		for (const denial of ["sender is not the master session", "peer is locked (control refused)", "peer refuses inbound requests"]) {
+			expect(await resumeSession(home, A, { stillAuthorized: () => denial })).toEqual({ ok: false, error: denial });
+			expect(fs.readFileSync(pauseFile(home), "utf8")).toBe(before);
+		}
+		expect(readPause(home, A)).toMatchObject({ paused: true, by: "master" });
+		expect(await resumeSession(home, A, MASTER)).toMatchObject({ ok: true, cleared: { by: "master" } });
+	});
+
+	test("the check runs inside the locked update: a handoff or lock that lands while the call waits for the lock is honoured", async () => {
+		await pauseSession(home, A, "master", NOW);
+		let denial: string | undefined;
+		let checks = 0;
+		const caller = { stillAuthorized: () => { checks++; return denial; } };
+		// Another process holds the pause lock, so the resume cannot reach its check until the lock is released.
+		const lock = FileLock.tryAcquire(`${pauseFile(home)}.lock`);
+		expect(lock.acquired).toBe(true);
+		const pending = resumeSession(home, A, caller);
+		expect(checks).toBe(0);
+		denial = "sender is not the master session"; // the master handoff lands during the wait
+		lock.release();
+		expect(await pending).toEqual({ ok: false, error: "sender is not the master session" });
+		expect(checks).toBe(1);
+		expect(readPause(home, A)).toMatchObject({ paused: true, by: "master" });
+		// The same wait with a lock toggled to "control refused".
+		const second = FileLock.tryAcquire(`${pauseFile(home)}.lock`);
+		const waiting = resumeSession(home, A, caller);
+		denial = "peer is locked (control refused)";
+		second.release();
+		expect(await waiting).toEqual({ ok: false, error: "peer is locked (control refused)" });
+		expect(readPause(home, A).paused).toBe(true);
+		// Authorized again: it clears.
+		denial = undefined;
+		expect(await resumeSession(home, A, caller)).toMatchObject({ ok: true, cleared: { by: "master" } });
+	});
+
+	test("the user's own resume needs no master authority", async () => {
+		await pauseSession(home, A, "restart", NOW);
+		expect(await resumeSession(home, A, "user")).toMatchObject({ ok: true, cleared: { by: "restart" } });
+	});
+});
+
+describe("resume hints name who may resume", () => {
+	test("by provenance, with a neutral text when it is not known", async () => {
+		expect(resumeHintFor("user")).toBe("paused by its user: only its user can resume it");
+		expect(resumeHintFor("restart")).toBe("paused after a restart: only its user can resume it");
+		expect(resumeHintFor("master")).toBe("paused by the master: the master or its user can resume it");
+		expect(resumeHintFor(undefined)).toBe("resume policy: see /peers pause status");
+		expect(NEUTRAL_RESUME_HINT).toBe("resume policy: see /peers pause status");
+		expect(resumeHint(home, A)).toBe(NEUTRAL_RESUME_HINT);
+		await pauseSession(home, A, "master", NOW);
+		expect(resumeHint(home, A)).toBe("paused by the master: the master or its user can resume it");
+		fs.writeFileSync(pauseFile(home), "{ not json");
+		expect(resumeHint(home, A)).toBe(NEUTRAL_RESUME_HINT);
 	});
 });
 
@@ -271,7 +336,7 @@ describe("master resume", () => {
 
 	test("clears a pause the master set itself, and says what was cleared", async () => {
 		await pauseSession(home, A, "master", NOW, "hold");
-		expect(await resumeSession(home, A, "master")).toEqual({ ok: true, cleared: { since: NOW, by: "master", reason: "hold" } });
+		expect(await resumeSession(home, A, MASTER)).toEqual({ ok: true, cleared: { since: NOW, by: "master", reason: "hold" } });
 		expect(readPause(home, A)).toEqual({ paused: false });
 		expect(stored().sessions).toEqual({});
 	});
@@ -280,8 +345,8 @@ describe("master resume", () => {
 		await pauseSession(home, A, "user", NOW, "mine");
 		await pauseAfterRestart(home, B, NOW);
 		const before = fs.readFileSync(pauseFile(home), "utf8");
-		expect(await resumeSession(home, A, "master")).toEqual({ ok: false, error: "paused by its user: only that user can resume it with /peers resume" });
-		expect(await resumeSession(home, B, "master")).toEqual({ ok: false, error: "paused after a restart because it was idle: only its user can resume it" });
+		expect(await resumeSession(home, A, MASTER)).toEqual({ ok: false, error: "paused by its user: only that user can resume it with /peers resume" });
+		expect(await resumeSession(home, B, MASTER)).toEqual({ ok: false, error: "paused after a restart because it was idle: only its user can resume it" });
 		expect(fs.readFileSync(pauseFile(home), "utf8")).toBe(before);
 		expect(readPause(home, A).paused && readPause(home, B).paused).toBe(true);
 		// The session's own user clears either.
@@ -290,14 +355,14 @@ describe("master resume", () => {
 	});
 
 	test("a session that is not paused is a harmless no-op, and writes nothing", async () => {
-		expect(await resumeSession(home, FRESH, "master")).toEqual({ ok: true });
+		expect(await resumeSession(home, FRESH, MASTER)).toEqual({ ok: true });
 		expect(fs.existsSync(pauseFile(home))).toBe(false);
 	});
 
 	test("an unreadable pause file is an error, never a guess, and is left alone", async () => {
 		fs.mkdirSync(path.dirname(pauseFile(home)), { recursive: true, mode: 0o700 });
 		fs.writeFileSync(pauseFile(home), "{ not json");
-		await expect(resumeSession(home, A, "master")).rejects.toThrow("not valid JSON");
+		await expect(resumeSession(home, A, MASTER)).rejects.toThrow("not valid JSON");
 		expect(fs.readFileSync(pauseFile(home), "utf8")).toBe("{ not json");
 	});
 
@@ -306,7 +371,7 @@ describe("master resume", () => {
 		const out = await say(pause, "");
 		expect(out).toBe(`worker-a (${A}) was paused by the master and is now paused by its user (maintenance): only /peers resume clears it`);
 		expect(stored().sessions[A]).toEqual({ since: NOW, by: "user", reason: "maintenance" });
-		expect(await resumeSession(home, A, "master")).toEqual({ ok: false, error: RESUME_REFUSED.user });
+		expect(await resumeSession(home, A, MASTER)).toEqual({ ok: false, error: RESUME_REFUSED.user });
 		expect(readPause(home, A).paused).toBe(true);
 	});
 
@@ -333,7 +398,7 @@ describe("master resume", () => {
 		for (let round = 0; round < 20; round++) {
 			await resumeSession(home, A, "user");
 			await pauseSession(home, A, "master", NOW);
-			const [userPause, masterResume] = await Promise.all([pauseSession(home, A, "user", NOW + 1), resumeSession(home, A, "master")]);
+			const [userPause, masterResume] = await Promise.all([pauseSession(home, A, "user", NOW + 1), resumeSession(home, A, MASTER)]);
 			// Either the resume won (it cleared the master's pause, then the user's pause is new) or the user's pause won first
 			// (the entry became the user's and the resume was refused); never a user-owned pause that the master cleared.
 			if (masterResume.ok && masterResume.cleared) expect(userPause.ok && userPause.already).toBe(false);
@@ -404,12 +469,12 @@ describe("restart rule", () => {
 		for (const id of Object.keys(saved)) {
 			if (restartDecision(saved[id], readPause(home, id)) === "pause") await pauseAfterRestart(home, id, NOW);
 		}
-		expect(readPause(home, idle)).toEqual({ paused: true, since: NOW, by: "restart", reason: "idle before the restart" });
+		expect(readPause(home, idle)).toEqual({ paused: true, since: NOW, by: "restart", reason: "not working for the master before the restart" });
 		for (const id of [managed, clean, fresh]) expect(readPause(home, id)).toEqual({ paused: false });
 		// An earlier pause keeps its own provenance: the master can still clear it.
 		expect(readPause(home, previouslyPaused)).toMatchObject({ by: "master", reason: "paused earlier" });
-		expect(await resumeSession(home, idle, "master")).toEqual({ ok: false, error: RESUME_REFUSED.restart });
-		expect(await resumeSession(home, previouslyPaused, "master")).toMatchObject({ ok: true, cleared: { by: "master" } });
+		expect(await resumeSession(home, idle, MASTER)).toEqual({ ok: false, error: RESUME_REFUSED.restart });
+		expect(await resumeSession(home, previouslyPaused, MASTER)).toMatchObject({ ok: true, cleared: { by: "master" } });
 		// Only the user clears the restart pause; a second restart of a resumed session pauses it again.
 		expect(await resumeSession(home, idle, "user")).toMatchObject({ ok: true, cleared: { by: "restart" } });
 		expect(restartDecision({ clean: false, managed: false }, readPause(home, idle))).toBe("pause");

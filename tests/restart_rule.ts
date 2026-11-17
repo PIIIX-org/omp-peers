@@ -11,7 +11,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import * as z from "@oh-my-pi/omptype/zod";
 import peers from "../extensions/peers";
 import { stablePeerId } from "../lib/identity";
-import { RESUME_REFUSED, SUBAGENT_RESUME_ERROR, pauseFile, pauseSession, readPause } from "../lib/features/pause";
+import { FileLock } from "@oh-my-pi/pi-natives";
+import { RESTART_REASON, RESUME_REFUSED, SUBAGENT_RESUME_ERROR, pauseFile, pauseSession, readPause } from "../lib/features/pause";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 
 const home = os.homedir();
@@ -108,7 +109,8 @@ try {
 	manager.id = "ses-idle";
 	await emit("session_start");
 	await until(() => row("ses-idle") !== undefined);
-	assert.deepEqual(view("ses-idle"), { paused: true, since: view("ses-idle").since, by: "restart", reason: "idle before the restart" });
+	assert.deepEqual(view("ses-idle"), { paused: true, since: view("ses-idle").since, by: "restart", reason: "not working for the master before the restart" });
+	assert.equal(RESTART_REASON, "not working for the master before the restart");
 	// The pause exists before the session is reachable: its first registry row already says so.
 	assert.equal(row("ses-idle")!.paused, true);
 	assert.equal(row("ses-idle")!.pausedBy, "restart");
@@ -124,7 +126,7 @@ try {
 	assert.deepEqual(await rpc("ses-idle", { op: "resume" }), { ok: false, error: RESUME_REFUSED.restart });
 	assert.equal(view("ses-idle").by, "restart");
 	assert.deepEqual(sent, [], "nothing woke the restart-paused session");
-	assert.match(await command("pause status"), /is paused since .* by the restart rule \(idle before the restart\); resumable by only its user/);
+	assert.match(await command("pause status"), /is paused since .* by the restart rule \(not working for the master before the restart\); resumable by only its user/);
 	assert.match(await command("resume"), /\(it was paused by the restart rule\): wake-triggering messages and prompts are accepted again$/);
 	assert.equal(view("ses-idle").paused, false);
 
@@ -182,12 +184,26 @@ try {
 	// What a kill -9 right now would leave behind is a managed, unclean record: the next start leaves the session alone.
 	const mid = saved("ses-work");
 	await emit("agent_end");
+	assert.equal(saved("ses-work").managed, false);
+	// Provenance is fixed when the turn starts. A turn the user started stays unmanaged when a master message joins it ...
+	await emit("agent_start");
 	idle = false;
-	assert.equal((await rpc("ses-work", { op: "message", text: "joins the running turn" })).ok, true);
+	assert.equal((await rpc("ses-work", { op: "message", text: "joins the user's running turn" })).ok, true);
 	await emit("turn_end");
-	assert.equal(saved("ses-work").managed, true, "a master message that joins a running turn is managed too");
+	assert.equal(saved("ses-work").managed, false, "a master message that joins a user-started turn does not make it managed");
 	idle = true;
 	await emit("agent_end");
+	assert.equal(saved("ses-work").managed, false);
+	// ... and a managed turn stays managed when other senders join it, until the run ends.
+	assert.equal((await rpc("ses-work", { op: "prompt", text: "another task", tier: "keep" })).ok, true);
+	await emit("agent_start");
+	idle = false;
+	assert.equal((await rpc("ses-work", { op: "message", text: "a stranger joins", from: { id: STRANGER, name: "stranger" } })).ok, true);
+	await emit("turn_end");
+	assert.equal(saved("ses-work").managed, true, "a managed turn stays managed when someone else's message joins it");
+	idle = true;
+	await emit("agent_end");
+	assert.equal(saved("ses-work").managed, false);
 	await switchTo("ses-managed");
 	leave("ses-work", mid);
 	await switchTo("ses-work");
@@ -196,8 +212,63 @@ try {
 	await switchTo("ses-managed");
 	leave("ses-work", { ...mid, managed: false });
 	await switchTo("ses-work");
+	await until(() => view("ses-work").paused);
 	assert.equal(view("ses-work").by, "restart");
 	await command("resume");
+
+	// ---- A failed restart-pause write keeps the session gated until it is recorded or the user resumes -------
+	const stateDir = path.dirname(pauseFile(home));
+	const stateBackup = `${stateDir}.bak`;
+	const breakStateDir = () => {
+		// A symlinked state directory: reads still work, every write is refused (privateDir refuses symlinks).
+		fs.renameSync(stateDir, stateBackup);
+		fs.symlinkSync(stateBackup, stateDir);
+	};
+	const repairStateDir = () => {
+		fs.unlinkSync(stateDir);
+		fs.renameSync(stateBackup, stateDir);
+	};
+	const warnings = (id: string) => notices.filter(n => n.includes(id) && n.includes("is treated as paused after a restart, but the pause could not be recorded")).length;
+	breakStateDir();
+	leave("ses-fail", { clean: false, managed: false });
+	await switchTo("ses-fail");
+	const failId = stablePeerId("ses-fail");
+	assert.equal(view("ses-fail").paused, false, "nothing could be written");
+	assert.equal(row("ses-fail")!.paused, true, "the registry row already says paused");
+	assert.equal(row("ses-fail")!.pausedBy, "restart");
+	await until(() => warnings(failId) === 1);
+	assert.deepEqual(await rpc("ses-fail", { op: "message", text: "wake up", from: { id: STRANGER, name: "stranger" } }), { ok: false, status: "deferred", paused: true, error: "session is paused" });
+	assert.deepEqual(await rpc("ses-fail", { op: "prompt", text: "do it" }), { ok: false, status: "refused", paused: true, error: "session is paused" });
+	assert.deepEqual(await rpc("ses-fail", { op: "resume" }), { ok: false, error: RESUME_REFUSED.restart });
+	assert.deepEqual(await rpc("ses-fail", { op: "pause", text: "x" }), { ok: true, paused: true }, "a master pause does not replace the pending restart pause");
+	const sentBefore = sent.length;
+	assert.match(await command("pause status"), /treated as paused by the restart rule .*could not be recorded yet/);
+	await emit("turn_end");
+	await emit("turn_end");
+	await until(() => row("ses-fail")!.paused === true);
+	assert.equal(warnings(failId), 1, "the same failure is warned about once, not on every retry");
+	assert.equal(sent.length, sentBefore, "nothing woke the gated session");
+	repairStateDir();
+	await emit("turn_end"); // the next refresh retries the write
+	await until(() => view("ses-fail").paused);
+	assert.equal(view("ses-fail").by, "restart");
+	assert.equal(view("ses-fail").reason, RESTART_REASON);
+	assert.deepEqual(await rpc("ses-fail", { op: "resume" }), { ok: false, error: RESUME_REFUSED.restart }, "recorded: now refused by the stored provenance");
+	assert.match(await command("resume"), /\(it was paused by the restart rule\)/);
+
+	// The user can cancel a pause that cannot be recorded; a later repair then writes nothing.
+	breakStateDir();
+	leave("ses-fail2", { clean: false, managed: false });
+	await switchTo("ses-fail2");
+	await until(() => warnings(stablePeerId("ses-fail2")) === 1);
+	assert.equal((await rpc("ses-fail2", { op: "message", text: "gated", from: { id: STRANGER, name: "stranger" } })).paused, true);
+	assert.match(await command("resume"), /the restart pause could not be recorded and is cancelled/);
+	assert.equal(row("ses-fail2")!.paused, false);
+	assert.equal((await rpc("ses-fail2", { op: "message", text: "welcome back", from: { id: STRANGER, name: "stranger" } })).ok, true);
+	repairStateDir();
+	await emit("turn_end");
+	await delay(50);
+	assert.equal(view("ses-fail2").paused, false, "a cancelled restart pause is never written later");
 
 	// ---- Receiver resume op ------------------------------------------------------------------------------
 	await switchTo("ses-rcv");
@@ -249,6 +320,35 @@ try {
 	assert.deepEqual(completed.map(r => [r.outcome, r.reason, r.masterChecked]), [["ok", undefined, true], ["refused", "not-resumable", true]]);
 	assert.equal(auditRecords().filter(r => r.side === "receiver" && r.phase === "attempted" && r.op === "resume").length, 2);
 	assert.equal(JSON.stringify(auditRecords()).includes("only that user"), false, "refusal text is never stored");
+
+	// ---- Authorization is re-read under the pause lock: a handoff or a lock during the wait is honoured -----
+	await switchTo("ses-race");
+	const resumeAttempts = () => auditRecords().filter(r => r.side === "receiver" && r.phase === "attempted" && r.op === "resume").length;
+	const heldResume = async (during: () => Promise<void>): Promise<Record<string, unknown>> => {
+		await rpc("ses-race", { op: "pause", text: "hold" });
+		assert.equal(view("ses-race").by, "master");
+		const attempts = resumeAttempts();
+		const lock = FileLock.tryAcquire(`${pauseFile(home)}.lock`);
+		assert.equal(lock.acquired, true);
+		const pending = rpc("ses-race", { op: "resume" });
+		await until(() => resumeAttempts() === attempts + 1);
+		await delay(50); // the receiver has passed its first master check and is polling for the lock
+		await during();
+		lock.release();
+		return pending;
+	};
+	const other = "p3333333333333333";
+	fs.writeFileSync(path.join(root, `${other}.json`), JSON.stringify({ id: other, pid: process.pid }));
+	const claim = (id: string) => fs.writeFileSync(path.join(root, "master.json"), JSON.stringify({ id, pid: process.pid }));
+	assert.deepEqual(await heldResume(async () => claim(other)), { ok: false, error: "sender is not the master session" }, "the master claim moved while the resume waited");
+	assert.equal(view("ses-race").by, "master");
+	assert.equal(view("ses-race").paused, true);
+	claim(MASTER);
+	assert.deepEqual(await heldResume(async () => void (await command("lock"))), { ok: false, error: "peer is locked (control refused)" }, "control was locked while the resume waited");
+	assert.equal(view("ses-race").paused, true);
+	await command("unlock");
+	assert.deepEqual(await rpc("ses-race", { op: "resume" }), { ok: true, paused: false, cleared: true });
+	fs.rmSync(path.join(root, `${other}.json`));
 
 	// ---- Tool: peers_control accepts resume, and a subagent cannot use it -------------------------------------
 	fs.rmSync(path.join(root, "master.json"));

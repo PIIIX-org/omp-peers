@@ -49,7 +49,7 @@ export const MAX_REASON = 120;
 /** Longest `by` text accepted from the file: an older version stored a peer id (at most 17 bytes) there. */
 export const MAX_BY_BYTES = 64;
 /** Reason recorded by the restart rule. */
-export const RESTART_REASON = "idle before the restart";
+export const RESTART_REASON = "not working for the master before the restart";
 const PEER_ID_RE = /^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
 
 /**
@@ -168,21 +168,42 @@ export const RESUME_REFUSED: Record<Exclude<PauseBy, "master">, string> = {
 
 export type ResumeResult = { ok: true; cleared?: PauseEntry } | { ok: false; error: string };
 
+/** Who is resuming. The master's request is only honoured while `stillAuthorized` (checked inside the locked update) returns undefined; otherwise its text is the refusal. */
+export type ResumeCaller = "user" | { stillAuthorized: () => string | undefined };
+
 /**
- * Resume `peerId`. The session's own user (`user`) clears any pause. The master (`master`) clears only an entry
- * whose provenance is `master`; any other entry stays and the fixed refusal says who may resume it. Not paused:
- * `ok` with nothing cleared. The decision runs under the state lock, so a user pause that lands first always wins.
+ * Resume `peerId`. The session's own user clears any pause. The master clears only an entry whose provenance is
+ * `master`; any other entry stays and the fixed refusal says who may resume it. Not paused: `ok` with nothing
+ * cleared. The decision runs under the state lock, so a user pause that lands first always wins, and the master's
+ * authority is re-read there, so a handoff or lock that happened while the call waited for the lock is honoured.
  */
-export async function resumeSession(home: string, peerId: string, caller: "user" | "master"): Promise<ResumeResult> {
+export async function resumeSession(home: string, peerId: string, caller: ResumeCaller): Promise<ResumeResult> {
 	return updateState<PauseState, ResumeResult>(pauseFile(home), emptyState, validateState, current => {
+		// The master's authority is re-read here, under the lock: a handoff or lock that happened while this call waited for it is honoured.
+		const denied = caller === "user" ? undefined : caller.stillAuthorized();
+		if (denied) return { result: { ok: false, error: denied } };
 		const entry = current.sessions[peerId];
 		if (!entry) return { result: { ok: true } };
-		if (caller === "master" && entry.by !== "master") return { result: { ok: false, error: RESUME_REFUSED[entry.by] } };
+		if (caller !== "user" && entry.by !== "master") return { result: { ok: false, error: RESUME_REFUSED[entry.by] } };
 		const rest = { ...current.sessions };
 		delete rest[peerId];
 		return { state: { ...current, sessions: rest }, result: { ok: true, cleared: entry } };
 	});
 }
+
+const RESUME_HINT: Record<PauseBy, string> = {
+	user: "paused by its user: only its user can resume it",
+	restart: "paused after a restart: only its user can resume it",
+	master: "paused by the master: the master or its user can resume it",
+};
+/** Shown when who paused the session is not known (a registry flag without the pause file, an unreadable file). */
+export const NEUTRAL_RESUME_HINT = "resume policy: see /peers pause status";
+
+/** Who may resume a session paused by `by`; neutral text when that is not known. */
+export const resumeHintFor = (by: PauseBy | undefined): string => (by ? RESUME_HINT[by] : NEUTRAL_RESUME_HINT);
+
+/** Who may resume `peerId`, from the pause file read fresh; neutral text when it is not paused or cannot be read. Never wakes anything. */
+export const resumeHint = (home: string, peerId: string): string => resumeHintFor(readPause(home, peerId).by);
 
 // ---- Restart rule -------------------------------------------------------------------------------
 

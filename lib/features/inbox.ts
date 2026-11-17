@@ -11,6 +11,7 @@
 import * as path from "node:path";
 import type { FeatureHost } from "./host";
 import type { Feature, ToolSpec } from "./index";
+import { resumeHint } from "./pause";
 import { looksLikeSecret } from "./secrets";
 import { readState, stateRoot, updateState } from "./store";
 
@@ -309,13 +310,13 @@ export async function renderInbox(host: FeatureHost, openOnly: boolean): Promise
 	return lines.join("\n");
 }
 
-function describeResolve(result: ResolveResult & { ok: true }, verb: string): string {
+function describeResolve(result: ResolveResult & { ok: true }, verb: string, home: string): string {
 	const { entry, delivery } = result;
 	if (verb !== "answered") return `${entry.id} ${verb}`;
 	switch (delivery) {
 		case "delivered": return `${entry.id} answered; the answer was delivered to ${entry.source.name} (${entry.source.id})`;
 		case "pending": return `${entry.id} answered; ${entry.source.name} (${entry.source.id}) is not reachable from this session, so delivery is pending. It can read the answer with peers_decision check, or run /peers inbox retry ${entry.id}`;
-		default: return `${entry.id} answered; ${entry.delivery}${entry.delivery.endsWith("session is paused") ? " (only that session's own user can /peers resume)" : ""}. Fix the cause and run /peers inbox retry ${entry.id}, or the session can read it with peers_decision check`;
+		default: return `${entry.id} answered; ${entry.delivery}${entry.delivery.endsWith("session is paused") ? ` (${resumeHint(home, entry.source.id)})` : ""}. Fix the cause and run /peers inbox retry ${entry.id}, or the session can read it with peers_decision check`;
 	}
 }
 
@@ -391,22 +392,22 @@ async function command(args: string[], host: FeatureHost): Promise<string> {
 			case "answer": {
 				if (rest.length < 2) return USAGE;
 				const result = await answerQuestion(host, rest[0], rest.slice(1).join(" "));
-				return result.ok ? describeResolve(result, "answered") : `error: ${result.error}`;
+				return result.ok ? describeResolve(result, "answered", host.home) : `error: ${result.error}`;
 			}
 			case "defer": {
 				if (!rest.length) return USAGE;
 				const result = await deferQuestion(host, rest[0], rest.slice(1).join(" "));
-				return result.ok ? describeResolve(result, "deferred; nothing was sent to the asking session") : `error: ${result.error}`;
+				return result.ok ? describeResolve(result, "deferred; nothing was sent to the asking session", host.home) : `error: ${result.error}`;
 			}
 			case "reopen": {
 				if (rest.length !== 1) return USAGE;
 				const result = await reopenQuestion(host, rest[0]);
-				return result.ok ? describeResolve(result, "reopened") : `error: ${result.error}`;
+				return result.ok ? describeResolve(result, "reopened", host.home) : `error: ${result.error}`;
 			}
 			case "retry": {
 				if (rest.length !== 1) return USAGE;
 				const result = await retryDelivery(host, rest[0]);
-				return result.ok ? describeResolve(result, "answered") : `error: ${result.error}`;
+				return result.ok ? describeResolve(result, "answered", host.home) : `error: ${result.error}`;
 			}
 			default:
 				return USAGE;
