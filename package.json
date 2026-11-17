@@ -21,7 +21,7 @@
     "test:reports": "bun test tests/reports.test.ts",
     "test:identity": "bun test tests/identity.test.ts",
     "test:features": "bun test tests/features",
-    "test:features-smoke": "python3 tests/features_smoke.py",
+    "test:features-smoke": "python3 -u tests/features_smoke.py",
     "test:activity-smoke": "python3 tests/activity_smoke.py",
     "test:routing": "python3 -m unittest discover -s tests -p 'test_routing.py'",
     "test:routing-smoke": "python3 tests/routing_smoke.py",
