@@ -26,9 +26,11 @@ import { formatModelStringWithRouting, resolveModelRoleValue } from "@oh-my-pi/p
 import { Notifications } from "./notifications";
 import { formatActivity, initializeActivityHost, readActivity, type PeerActivity } from "../lib/activity";
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
-import { identifyPeers, identityFlags, matchesWriter, resolvePeerTargets, stablePeerId, type IdentityStatus } from "../lib/identity";
+import { identifyPeers, identityFlags, logicalId, matchesWriter, resolvePeerTargets, skippedLine, stablePeerId, type IdentityStatus, type Skipped } from "../lib/identity";
 import { FEATURES } from "../lib/features";
+import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInput } from "../lib/features/audit";
 import type { FeatureHost, SendResult } from "../lib/features/host";
+import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
 import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
@@ -36,7 +38,7 @@ const MASTER_FILE = path.join(ROOT, "master.json");
 const SESSION_ROOT = path.join(os.homedir(), ".omp", "agent", "peer-sessions");
 const MASTER_LOCK = path.join(ROOT, "master.lock");
 const notifications = new Notifications(ROOT);
-const CONTROL_OPS = new Set(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "pause"]);
+
 // Settings the master may never touch remotely (credentials, trust/approval/sandbox, transports).
 const SETTING_DENY = /^(auth|secrets|collab|share|mcp|providers)\.|approval|token|apikey|api_key|password|credential|trust|sandbox|extension/i;
 const MAX_LINE = 256 * 1024;
@@ -163,6 +165,10 @@ interface Req {
 	value?: unknown;
 	n?: number;
 	report?: Report;
+	/** Random id the sender attaches to a control op so both sides' audit records correlate. A claim, like `from`. */
+	request?: string;
+	/** Set by the dependency dispatcher: the receiver refuses this message while its control is locked. */
+	dependency?: boolean;
 	/** Set by a sender whose report came from a subagent, not its main session; never feeds report-driven features. */
 	subagent?: boolean;
 }
@@ -391,8 +397,14 @@ async function listPeers(): Promise<Array<PeerInfo & IdentityStatus>> {
 	});
 }
 
-async function resolveTargets(spec: string): Promise<{ peers: PeerInfo[]; error?: string }> {
-	return resolvePeerTargets(spec, await listPeers(), state.id, state.sessionId);
+/** `op` decides which group members are skipped (refusing, locked for control ops, paused for wake ops). */
+async function resolveTargets(spec: string, op: string): Promise<{ peers: Array<PeerInfo & IdentityStatus>; error?: string; skipped?: Skipped[] }> {
+	const roster = await listPeers();
+	try {
+		return resolvePeerTargets(spec, roster, state.id, state.sessionId, groupTargeting<PeerInfo & IdentityStatus>(os.homedir(), op));
+	} catch (error) {
+		return { peers: [], error: (error as Error).message };
+	}
 }
 
 function call(peer: PeerInfo, req: Req, timeoutMs = 10_000): Promise<Record<string, unknown>> {
@@ -520,7 +532,14 @@ async function settingOp(pi: ExtensionAPI, req: Req): Promise<Record<string, unk
 // Set by the extension factory: feature hooks that run from the receiver path need the same host the commands get.
 let featureHostFor: ((ctx: ExtensionContext) => FeatureHost) | undefined;
 
-async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknown>> {
+/** What the receiver path learned that its audit record or the deferred follow-up needs. */
+interface HandleTrace {
+	masterChecked?: boolean;
+	/** Remote shutdown was accepted; `handleAudited` schedules it once the completed audit record is written. */
+	shutdown?: boolean;
+}
+
+async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Promise<Record<string, unknown>> {
 	const ctx = state.ctx;
 	if (!ctx) return { ok: false, error: "session not ready" };
 	if (state.inbound === "refuse") return { ok: false, error: "peer refuses inbound requests" };
@@ -528,7 +547,8 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 	const text = typeof req.text === "string" ? req.text : "";
 	if (CONTROL_OPS.has(req.op)) {
 		if (!state.control) return { ok: false, error: "peer is locked (control refused)" };
-		if (!req.from?.id || masterId() !== req.from.id) return { ok: false, error: "sender is not the master session" };
+		trace.masterChecked = !!req.from?.id && masterId() === req.from.id;
+		if (!trace.masterChecked) return { ok: false, error: "sender is not the master session" };
 	}
 	// Resume is the paused session's own user action (/peers resume); no remote caller, including the master's agent, can clear a pause.
 	if (req.op === "resume") return { ok: false, error: "resume is only available as /peers resume in the paused session itself" };
@@ -554,6 +574,8 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 				return { ok: false, error: `invalid message/report: ${(error as Error).message}` };
 			}
 			const from = req.from ?? { id: "?", name: "unknown" };
+			// Dependency deliveries are authorized work: the receiver's own control lock applies, whatever the sender saw earlier.
+			if (req.dependency === true && !state.control) return { ok: false, error: "peer is locked (control refused)" };
 			if (!rateOk(from.id)) return { ok: false, error: "rate limited" };
 			if (report && req.from && featureHostFor && req.subagent !== true) {
 				// Only an explicit structured report feeds features; a failing hook never blocks delivery.
@@ -642,11 +664,35 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 			return { ok: true, entries: rows };
 		}
 		case "shutdown":
-			ctx.setTimeout(() => ctx.shutdown(), 150);
+			trace.shutdown = true;
 			return { ok: true };
 		default:
 			return { ok: false, error: `unknown op "${req.op}"` };
 	}
+}
+
+// Local audit log (opt-in): the receiving session records every control attempt and its outcome. Recording never
+// throws and never blocks the op; `req.from` is only a claim, so records say "claimed actor".
+const auditWarn = (text: string) => state.ctx?.ui.notify(text, "warning");
+const auditRecord = (input: AuditInput) => auditLog.record(os.homedir(), Date.now(), input, auditWarn);
+
+async function handleAudited(pi: ExtensionAPI, req: Req): Promise<Record<string, unknown>> {
+	if (!CONTROL_OPS.has(req.op)) return handle(pi, req);
+	const base = {
+		request: validRequestId(req.request) ?? newRequestId(),
+		side: "receiver" as const,
+		actor: { id: req.from?.id, name: req.from?.name },
+		target: { id: state.id, name: pi.getSessionName() || state.saved.name || path.basename(state.ctx?.cwd ?? process.cwd()) },
+		op: req.op,
+		args: req,
+	};
+	await auditRecord({ ...base, phase: "attempted" });
+	const trace: HandleTrace = {};
+	const response = await handle(pi, req, trace).catch(e => ({ ok: false, error: String((e as Error)?.message ?? e) }));
+	await auditRecord({ ...base, phase: "completed", masterChecked: trace.masterChecked, result: classifyResponse(req.op, response) });
+	// Only now: the timer must not outrun the completed record (the audit write can wait for the lock) or the reply.
+	if (trace.shutdown) state.ctx?.setTimeout(() => state.ctx?.shutdown(), 150);
+	return response;
 }
 
 function startServer(pi: ExtensionAPI): void {
@@ -672,7 +718,7 @@ function startServer(pi: ExtensionAPI): void {
 				conn.end(`${JSON.stringify({ ok: false, error: "bad request" })}\n`);
 				return;
 			}
-			handle(pi, req)
+			handleAudited(pi, req)
 				.catch(e => ({ ok: false, error: String((e as Error)?.message ?? e) }))
 				.then(res => conn.end(`${JSON.stringify(res)}\n`));
 		});
@@ -832,9 +878,13 @@ export default function peers(pi: ExtensionAPI) {
 			isMaster: () => masterId() === id,
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
-				.map(p => ({ id: p.id, name: p.name, acceptsRemote: p.inbound === "accept" && p.control, busy: p.busy, context: p.context, paused: p.paused, recentErrorTurns: p.recentErrorTurns, updatedAt: p.updatedAt })),
-			groupsOf: () => [],
-			send: (to, req) => sendTo(to, req.text),
+				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse", busy: p.busy, context: p.context, paused: p.paused, recentErrorTurns: p.recentErrorTurns, updatedAt: p.updatedAt })),
+			groupsOf: peerId => groupsOf(os.homedir(), peerId),
+			resolveGroup: async (name, op) => {
+				const { peers, error, skipped } = await resolveTargets(`group:${name}`, op);
+				return { recipients: peers.map(p => ({ id: logicalId(p), name: p.name })), skipped: skipped ?? [], error };
+			},
+			send: (to, req) => sendTo(to, req.text, req.dependency === true),
 			acceptsRemote: () => state.inbound === "accept" && state.control,
 		};
 	};
@@ -902,8 +952,8 @@ export default function peers(pi: ExtensionAPI) {
 			}
 		}
 		if (!state.sessionLock?.acquired) return `error: ${state.identityError || "session identity unavailable"}`;
-		const { peers: targets, error } = await resolveTargets(spec);
-		if (error) return `error: ${error}`;
+		const { peers: targets, error, skipped = [] } = await resolveTargets(spec, req.op);
+		if (error) return [`error: ${error}`, ...skipped.map(skippedLine)].join("\n");
 		let out = req;
 		let note = "";
 		if (req.op === "prompt" && req.text && (state.route || req.tier)) {
@@ -915,8 +965,12 @@ export default function peers(pi: ExtensionAPI) {
 		const reportMaster = req.report ? masterId() : undefined;
 		const lines = await Promise.all(
 			targets.map(async t => {
+				const request = CONTROL_OPS.has(req.op) ? newRequestId() : undefined;
+				const audit = request && { request, side: "sender" as const, actor: senderInfo(), target: t, op: req.op, args: req };
+				if (audit) await auditRecord({ ...audit, phase: "attempted" });
 				// A subagent's report must not stamp its parent's state: the receiver skips feature hooks for it.
-				const response = await call(t, { ...out, from: senderInfo(), ...(recordReport ? {} : { subagent: true }) });
+				const response = await call(t, { ...out, from: senderInfo(), request, ...(recordReport ? {} : { subagent: true }) });
+				if (audit) await auditRecord({ ...audit, phase: "completed", result: classifyResponse(req.op, response) });
 				if (req.op === "message" && req.report && recordReport && reportMaster === t.id && masterId() === t.id) {
 					notifications.reported(turn, req.report.kind, t, response);
 				}
@@ -924,11 +978,11 @@ export default function peers(pi: ExtensionAPI) {
 				return response.ok === false && response.paused === true ? `${summary} (${t.id})` : `${t.name} (${t.id}): ${summary}`;
 			}),
 		);
-		return note + lines.join("\n");
+		return note + [...lines, ...skipped.map(skippedLine)].join("\n");
 	}
 
 	/** One message to one live session by stable id, through the same resolution and socket path as fanout(). */
-	async function sendTo(to: string, text: string): Promise<SendResult> {
+	async function sendTo(to: string, text: string, dependency = false): Promise<SendResult> {
 		if (!state.sessionLock?.acquired) return { status: "failed", reason: state.identityError || "session identity unavailable" };
 		let message: ReturnType<typeof readMessage>;
 		try {
@@ -937,9 +991,9 @@ export default function peers(pi: ExtensionAPI) {
 			return { status: "failed", reason: `invalid message: ${(error as Error).message}` };
 		}
 		if (!(await listPeers()).some(p => p.id === to)) return { status: "offline" };
-		const { peers: targets, error } = await resolveTargets(to);
+		const { peers: targets, error } = await resolveTargets(to, "message");
 		if (error || targets.length !== 1 || targets[0].id !== to) return { status: "failed", reason: error ?? "target is ambiguous" };
-		const response = await call(targets[0], { op: "message", text: message.text, from: senderInfo() });
+		const response = await call(targets[0], { op: "message", text: message.text, from: senderInfo(), ...(dependency ? { dependency: true } : {}) });
 		return response.ok ? { status: "delivered" } : { status: "failed", reason: String(response.error) };
 	}
 
@@ -963,7 +1017,7 @@ export default function peers(pi: ExtensionAPI) {
 		name: "peers_send",
 		label: "Message Peer",
 		description:
-			"Send an agent-attributed message to a peer or 'all'. Supply either ordinary text or a structured report (kind plus required human-readable fields). Reports deliver immediately; only acknowledged main-session reports suppress exact same-turn watcher notices. Idle recipients may start a turn.",
+			"Send an agent-attributed message to a peer, 'all', or 'group:<name>' (a group set with /peers groups; paused and refusing members are skipped and listed in the result). Supply either ordinary text or a structured report (kind plus required human-readable fields). Reports deliver immediately; only acknowledged main-session reports suppress exact same-turn watcher notices. Idle recipients may start a turn.",
 		parameters: sendIngressParameters,
 		async execute(_id, p: unknown, _signal, _onUpdate, ctx) {
 			const parsed = sendParameters.safeParse(p);
@@ -992,7 +1046,7 @@ export default function peers(pi: ExtensionAPI) {
 	}
 
 	const controlParameters = z.object({
-		to: z.string().describe("Stable peer id, name (or unique prefix), or 'all'"),
+		to: z.string().describe("Stable peer id, name (or unique prefix), 'all', or 'group:<name>' (members that are paused, refusing or locked are skipped and listed)"),
 		action: z.enum(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "status", "pause"]),
 		text: z
 			.string()
@@ -1014,7 +1068,7 @@ export default function peers(pi: ExtensionAPI) {
 		name: "peers_control",
 		label: "Control Peer",
 		description:
-			"MASTER ONLY. Control other omp sessions (by id/name or 'all'): prompt (give the session a task as if the user typed it), abort, compact, model (text=model spec), rename (text=name), tail (read its last messages; text=count), shutdown, status, pause (refuse new wake-triggering messages/prompts; text=optional reason; only the paused session's own user can resume it with /peers resume). Fails unless this session is the master (claimed by the user with /peers master).",
+			"MASTER ONLY. Control other omp sessions (by id/name, 'all' or 'group:<name>'): prompt (give the session a task as if the user typed it), abort, compact, model (text=model spec), rename (text=name), tail (read its last messages; text=count), shutdown, status, pause (refuse new wake-triggering messages/prompts; text=optional reason; only the paused session's own user can resume it with /peers resume). Fails unless this session is the master (claimed by the user with /peers master).",
 		parameters: controlParameters,
 		async execute(_id, p: typeof controlParameters.infer) {
 			if (p.action !== "status" && masterId() !== state.id) {

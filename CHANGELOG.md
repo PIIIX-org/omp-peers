@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Session groups
+
+- Add `/peers groups list|add|remove|delete|members|preview` (private `groups.json`, keyed by stable session id, 64 groups of 64 members) and a `group:<name>` target for `/peers msg|report|do`, `peers_send` and `peers_control`: recipients that are paused (from the published registry flag; the receiver's wake gate stays authoritative), refusing inbound or locked (control ops) are skipped and listed as `skipped: <name> (<reason>)`; unknown, empty, no-recipient and unproven-duplicate-writer groups are explicit errors and `all` is unchanged. Group-scoped standing rules now match real membership.
+
+### Shared locks
+
+- Add `/peers locks` and the `peers_lock` tool: named locks and semaphores (capacity 1-64, TTL with renewal) stored in a private `locks.json` and acquired atomically across processes. A session holds at most one slot per name (a second acquire is refused; use renew). Contention returns `acquired`, `busy` (names the holders, never waits) or `refused`; only the owner releases, an unexpired lease is never stolen (including after a restart of the same session), expired leases are reclaimed lazily, `status` is read-only, and the master can `force-release` (a live lease only with `--yes-live`).
+
+### Report-driven dependencies
+
+- Add `/peers deps` (`add`, `list`, `remove`, `enable`, `disable`, `preview`, `pending`, `approve`, `reject`, `ledger`): opt-in rules that turn a structured DONE report accepted by the master into one peer message for another session. Rules store stable session IDs and are validated for missing targets, self-dependency, session-graph cycles and caps (64 rules, 8 per source); a persisted, cross-process-locked ledger deduplicates by report event key across restarts; `confirm` mode (default) only queues a trigger until the master user approves it, `--auto` dispatches at once, a `--once` rule (default) disables itself after firing, and a paused, refusing or absent target is recorded as not delivered and never resumed. Adds `PeerView.refusesInbound` to the feature host.
+
 ### Decision inbox
 
 - Add `/peers inbox` and the `peers_decision` tool: sessions queue deduplicated, credential-screened questions into a private cross-process-safe `inbox.json`; the master lists them grouped by source (read-only, never wakes a session) and answers, defers, reopens or retries them. An answer is sent once to the live asking session through the normal send path with the outcome recorded; otherwise it stays pending for `peers_decision check`. Extend the feature registry with `tools()` and the feature host with `send()`.
@@ -17,6 +29,10 @@
 ### Session task board
 
 - Add `/peers board` (`list`, `assign`, `set`, `clear`, `stale`): a persisted, private `board.json` with one entry per stable session ID, fed by explicit assignments and accepted structured reports via a new `Feature.onReport` hook; shows stale (configurable `board.staleHours`), unknown and not-running state honestly, never wakes sessions, and updates entries under a per-entry locked read-modify-write.
+
+### Audit log
+
+- Add opt-in `/peers audit on|off|status|tail|clear --yes`: a private local record (`peer-state/audit.jsonl`, 0600, append-only, symlink/hard-link/owner/permission checks) of every master control attempt and outcome with sender claims kept as claims, no prompt text, setting values or transcripts, a fixed reason vocabulary, size and age retention with one rotated file, and write failures that never block the control op.
 
 ### Lifecycle cleanup
 
