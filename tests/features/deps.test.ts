@@ -50,6 +50,7 @@ function host(self = MASTER, opts: { master?: boolean; accepts?: boolean } = {})
 		acceptsRemote: () => opts.accepts ?? true,
 		peers: async () => live,
 		groupsOf: () => [],
+		usageNow: () => undefined,
 		notify: () => {},
 		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
