@@ -28,6 +28,7 @@ import { formatActivity, initializeActivityHost, readActivity, type PeerActivity
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, logicalId, matchesWriter, resolvePeerTargets, skippedLine, stablePeerId, type IdentityStatus, type Skipped } from "../lib/identity";
 import { FEATURES } from "../lib/features";
+import { autoCompactRuntime } from "../lib/features/autocompact";
 import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInput } from "../lib/features/audit";
 import type { FeatureHost, SendResult } from "../lib/features/host";
 import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
@@ -786,6 +787,7 @@ export default function peers(pi: ExtensionAPI) {
 		state.manager = ctx.sessionManager;
 		bindIdentity(ctx.sessionManager.getSessionId());
 		state.ctx = ctx;
+		autoCompactRuntime.bind(ctx);
 		return true;
 	};
 	const refresh = (ctx: ExtensionContext) => {
@@ -813,8 +815,12 @@ export default function peers(pi: ExtensionAPI) {
 	const refreshAfterEvent = async (_event: unknown, ctx: ExtensionContext) => {
 		if (ctx.agent.kind === "main" && state.server) refresh(ctx);
 	};
-	pi.on("session_switch", refreshAfterEvent);
+	pi.on("session_switch", async (event, ctx) => {
+		if (ctx.agent.kind === "main") autoCompactRuntime.onSessionChange(ctx);
+		await refreshAfterEvent(event, ctx);
+	});
 	pi.on("agent_start", async (_event, ctx) => {
+		autoCompactRuntime.onAgentStart(ctx);
 		if (ctx.agent.kind === "main" && state.server && bind(ctx)) notifications.start();
 		await refreshAfterEvent(_event, ctx);
 	});
@@ -852,6 +858,16 @@ export default function peers(pi: ExtensionAPI) {
 		};
 	};
 	featureHostFor = featureHost;
+	// Opt-in auto-compact (/peers autocompact): evaluated only after the main agent's whole run ended, never from turn_end.
+	pi.on("agent_end", async (_event, ctx) => {
+		if (ctx.agent.kind === "main" && state.server && bind(ctx)) autoCompactRuntime.onAgentEnd(ctx, featureHost(ctx));
+	});
+	pi.on("auto_compaction_start", async (_event, ctx) => {
+		if (ctx.agent.kind === "main") autoCompactRuntime.onHostCompaction(true);
+	});
+	pi.on("auto_compaction_end", async (_event, ctx) => {
+		if (ctx.agent.kind === "main") autoCompactRuntime.onHostCompaction(false);
+	});
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		const host = featureHost(ctx);
@@ -896,6 +912,7 @@ export default function peers(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_e, ctx) => {
 		// A pinned process releases its identity only when the pinned session shuts down.
 		if (ctx.agent.kind !== "main" || (state.manager && state.manager !== ctx.sessionManager)) return;
+		autoCompactRuntime.onSessionChange(ctx);
 		teardown();
 		state.manager = undefined;
 		if (state.timer) ctx.clearTimer(state.timer as never);

@@ -77,6 +77,7 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 - Shared locks: `/peers locks acquire|renew|release|status` and the `peers_lock` tool give sessions named locks and semaphores with capacity, owner-only release and TTL expiry; contention returns `busy` instead of waiting. See [docs/features/locks.md](docs/features/locks.md).
 - Audit log: `/peers audit on|off|status|tail|clear --yes` keeps an opt-in, private, local record of master control attempts and outcomes (no prompt text, setting values or transcripts). See [docs/features/audit.md](docs/features/audit.md).
 - Report-driven dependencies: `/peers deps add|list|preview|pending|approve|reject|remove|enable|disable|ledger` turns a session's structured DONE report into a queued prompt for another session; confirm mode by default, `--auto` only when you add it, deduplicated across restarts, never to a paused session. See [docs/features/deps.md](docs/features/deps.md).
+- Auto-compact (opt-in, off by default): `/peers autocompact on|off|status|set|add|remove|log|reset-suppression` lets sessions you list compact themselves at a safe turn boundary above a context threshold, with a cooldown, an hourly limit, loop suppression and a private audit log; it is local to each session and nothing remote can trigger it. See [docs/features/autocompact.md](docs/features/autocompact.md).
 
 ### Tools
 
