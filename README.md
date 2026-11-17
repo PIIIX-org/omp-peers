@@ -78,6 +78,7 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 - Shared locks: `/peers locks acquire|renew|release|status` and the `peers_lock` tool give sessions named locks and semaphores with capacity, owner-only release and TTL expiry; contention returns `busy` instead of waiting. See [docs/features/locks.md](docs/features/locks.md).
 - Audit log: `/peers audit on|off|status|tail|clear --yes` keeps an opt-in, private, local record of master control attempts and outcomes (no prompt text, setting values or transcripts). See [docs/features/audit.md](docs/features/audit.md).
 - Report-driven dependencies: `/peers deps add|list|preview|pending|approve|reject|remove|enable|disable|ledger` turns a session's structured DONE report into a queued prompt for another session; confirm mode by default, `--auto` only when you add it, deduplicated across restarts, never to a paused session. See [docs/features/deps.md](docs/features/deps.md).
+- Scheduled digests: `/peers digest on|off|status|set|preview|now|history|clear --yes` is an opt-in, master-only summary of the task board, pending decisions and paused sessions on an hourly, daily or weekly schedule in a configured time zone and group scope; one digest per slot (claimed before it is produced), one catch-up digest after a restart, unknown stays unknown, credential-looking text withheld, delivered only to the master's own next agent start or a local notification and never to another session. See [docs/features/digest.md](docs/features/digest.md).
 
 ### Tools
 

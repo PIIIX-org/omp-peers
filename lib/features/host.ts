@@ -53,6 +53,8 @@ export interface FeatureHost {
 	self(): PeerView;
 	/** Whether this session currently holds the master role (same check as peer control ops). */
 	isMaster(): boolean;
+	/** Show `text` to this session's user as a local notification. Never sent to another session and never added to a prompt. */
+	notify(text: string): void;
 	/** Whether this session accepts requests from others (inbound accepted and control not locked). */
 	acceptsRemote(): boolean;
 	/** Live logical sessions, including this one. */

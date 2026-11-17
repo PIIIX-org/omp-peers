@@ -819,12 +819,38 @@ export default function peers(pi: ExtensionAPI) {
 		ctx.ui.setStatus("peers", `peers:${n}${m === state.id ? " ★master" : m ? ` master:${m}` : ""}${readPause(os.homedir(), state.id).paused ? " paused" : ""}`);
 	};
 
+	// Periodic feature work (the watchdog) rides the 5 s refresh, runs only in the master session and never overlaps itself.
+	// A failing tick warns once per feature and never breaks the refresh.
+	let ticking = false;
+	const warnedTicks = new Set<string>();
+	const runTicks = async (ctx: ExtensionContext) => {
+		if (ticking || !state.sessionLock?.acquired || state.identityError || masterId() !== state.id) return;
+		ticking = true;
+		try {
+			const host = featureHost(ctx);
+			for (const feature of FEATURES) {
+				try {
+					await feature.tick?.(host);
+				} catch (error) {
+					if (warnedTicks.has(feature.name)) continue;
+					warnedTicks.add(feature.name);
+					ctx.ui.notify(`peers ${feature.name}: periodic check failed: ${(error as Error).message}`, "warning");
+				}
+			}
+		} finally {
+			ticking = false;
+		}
+	};
+
 	pi.on("session_start", async (_e, ctx) => {
 		if (ctx.mode === "print" || ctx.mode === "json" || !bind(ctx)) return;
 		await initializeActivityHost();
 		refresh(ctx);
 		if (state.timer) ctx.clearTimer(state.timer as never);
-		state.timer = ctx.setInterval(() => refresh(state.ctx ?? ctx), 5_000);
+		state.timer = ctx.setInterval(() => {
+			refresh(state.ctx ?? ctx);
+			void runTicks(state.ctx ?? ctx);
+		}, 5_000);
 		// A template named in the environment is only shown, never applied: the variable is inherited by every program this session starts.
 		if (process.env.OMP_PEERS_TEMPLATE?.trim()) {
 			const text = state.sessionLock?.acquired
@@ -862,6 +888,7 @@ export default function peers(pi: ExtensionAPI) {
 			now: Date.now,
 			self: () => ({ id, name: pi.getSessionName() || state.saved.name || path.basename(ctx.cwd) }),
 			isMaster: () => masterId() === id,
+			notify: text => ctx.ui.notify(text, "info"),
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
 				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse" })),
@@ -892,7 +919,7 @@ export default function peers(pi: ExtensionAPI) {
 		const blocks: string[] = [];
 		for (const feature of FEATURES) {
 			try {
-				const block = feature.agentContext?.(host);
+				const block = await feature.agentContext?.(host);
 				if (block) blocks.push(block);
 			} catch (error) {
 				ctx.ui.notify(`peers ${feature.name}: not injected: ${(error as Error).message}`, "warning");
