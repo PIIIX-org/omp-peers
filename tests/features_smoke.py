@@ -54,11 +54,11 @@ class Harness:
         plugin_link(self.env, self.home)
 
     def start(self, resume=None, env=None, args=()):
-        """Start a peer. `env` adds environment variables; such a peer is used as launched (no `new_session`)."""
+        """Start a peer. `env` adds environment variables and `args` extra omp arguments (for example `-e <file>`); such a peer is used as launched (no `new_session`)."""
         peer = Peer({**self.env, **(env or {})}, str(self.home), resume=resume, extra_args=args)
         self.peers.append(peer)
         peer.call("get_state")
-        if resume is None and not env:
+        if resume is None and not env and not args:
             peer.call("new_session")
         return peer
 
