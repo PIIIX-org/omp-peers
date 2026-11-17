@@ -29,6 +29,21 @@ export function privateDir(dir: string): string {
 }
 
 /**
+ * Read a user-writable file without ever blocking: an O_NONBLOCK open, then only a regular file is read. A FIFO (or any other
+ * non-regular file) a same-user process planted there is refused with `code: "NOT_REGULAR"` instead of hanging the caller;
+ * symlinks are followed as before. Other errors (ENOENT, EACCES, ...) propagate unchanged.
+ */
+export function readRegularFile(file: string): string {
+	const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+	try {
+		if (!fs.fstatSync(fd).isFile()) throw Object.assign(new Error("not a regular file"), { code: "NOT_REGULAR" });
+		return fs.readFileSync(fd, "utf8");
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+/**
  * Read JSON state. A missing file yields `fallback()`. A symlink, unparsable file or one rejected by
  * `validate` (which must throw) is an error: callers must not silently overwrite state they cannot read.
  */
