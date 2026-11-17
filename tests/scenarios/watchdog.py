@@ -159,6 +159,25 @@ def run(h):
         time.sleep(1.0)
         assert not [f for f in other.frames[other_frames:] if str(f.get("type", "")).startswith(("agent_", "turn_", "message_")) or "Message from" in json.dumps(f)]
         assert len([1 for _, b in requests[other_requests:] if "Watchdog alert" in dump(b)]) == 0, "the paused target was woken"
+        # The busy alert reaches the master's next real model request as one exact item; further evaluations dedupe it.
+        item = f"{wid} busy for {busy_alert['value']} min since first observed (limit 1 min)"
+        served = turn(master, "Reply with the word ok.")
+        assert any(item in dump(b) and dump(b).count("Watchdog:") == 1 for b in served), [dump(b)[-600:] for b in served]
+
+        def core():
+            snapshot = state()
+            return {"config": snapshot["config"], "overrides": snapshot["overrides"], "alerts": snapshot["alerts"],
+                    "busy": {k: v["since"] for k, v in snapshot["busy"].items()}}
+
+        quiet = core()
+        time.sleep(11)  # at least two more 5 s evaluations of a condition that is still over its threshold
+        assert core() == quiet, "a repeated evaluation changed an alert"
+        assert [a["alertedAt"] for a in state()["alerts"] if a["session"] == wid and a["condition"] == "busy"] == [busy_alert["alertedAt"]]
+        h.say(master, "/peers watchdog status")
+        h.say(master, "/peers watchdog check")
+        assert core() == quiet, "status or check wrote state"
+        assert not any(f.get("type") == "agent_end" for f in worker.frames[worker_start:]), "the held turn was interrupted"
+        print("PASS the busy alert reaches the master's request once, repeated ticks dedupe it, and status and check write nothing")
         h.gateway.release.set()
         wait_for(lambda: any(f.get("type") == "agent_end" for f in worker.frames[worker_start:]), seconds=30)
         assert sum(1 for f in worker.frames[worker_start:] if f.get("type") == "agent_start") == 1

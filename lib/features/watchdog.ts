@@ -16,6 +16,7 @@
 import * as path from "node:path";
 import type { FeatureHost, PeerView } from "./host";
 import type { Feature } from "./index";
+import { readPause } from "./pause";
 import { resolvePeer } from "./rules";
 import { looksLikeSecret } from "./secrets";
 import { readState, stateRoot, updateState } from "./store";
@@ -96,8 +97,17 @@ export const MAX_GROUP_RECIPIENTS = 20;
 export const STALE_MS = 60_000;
 /** Busy records are refreshed at most this often so an unchanged busy session does not rewrite the file every tick. */
 const OBSERVE_REFRESH_MS = 60_000;
-const MAX_NAME = 60;
-const MAX_REASON = 120;
+/**
+ * A busy record whose last observation is older than this is not trusted: the session may have gone idle and
+ * busy again while nobody was watching (master absent, machine asleep). The busy clock restarts instead.
+ * A master restart of a few minutes keeps it.
+ */
+export const OBSERVE_GAP_MS = 5 * 60_000;
+/** Display cap for a session name and for a delivery failure reason, in UTF-8 bytes. */
+export const MAX_NAME_BYTES = 60;
+export const MAX_REASON_BYTES = 120;
+/** Cap for one stored delivery outcome, in UTF-8 bytes. */
+export const MAX_OUTCOME_BYTES = 200;
 const GROUP_RE = /^[a-z0-9][a-z0-9._-]{0,47}$/;
 const PEER_ID_RE = /^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
 const MASTER_ONLY = "only the master session may change watchdog settings; run /peers master first";
@@ -134,7 +144,7 @@ function validateState(value: unknown): WatchdogState {
 		const ok = isRecord(entry) && typeof entry.session === "string" && PEER_ID_RE.test(entry.session) && CONDITIONS.includes(entry.condition as Condition) &&
 			typeof entry.active === "boolean" && typeof entry.emitted === "boolean" && typeof entry.acked === "boolean" &&
 			Number.isFinite(entry.alertedAt) && Number.isFinite(entry.value) && Number.isFinite(entry.limit) &&
-			isRecord(entry.notified) && Object.entries(entry.notified).every(([id, text]) => PEER_ID_RE.test(id) && typeof text === "string" && text.length <= 200);
+			isRecord(entry.notified) && Object.entries(entry.notified).every(([id, text]) => PEER_ID_RE.test(id) && typeof text === "string" && Buffer.byteLength(text) <= MAX_OUTCOME_BYTES);
 		const key = ok ? `${entry.session}:${entry.condition}` : "";
 		if (!ok || seen.has(key)) throw new Error("malformed or duplicate alert");
 		seen.add(key);
@@ -197,9 +207,23 @@ export interface Evaluation {
 
 const isoOf = (ms: number) => new Date(ms).toISOString();
 
-/** One-line, control-free, length-capped session name; a credential-looking name is withheld. */
+/** `text` cut to at most `max` UTF-8 bytes on a character boundary. */
+function capBytes(text: string, max: number): string {
+	if (Buffer.byteLength(text) <= max) return text;
+	let out = "";
+	let used = 0;
+	for (const char of text) {
+		const size = Buffer.byteLength(char);
+		if (used + size > max) break;
+		out += char;
+		used += size;
+	}
+	return out;
+}
+
+/** One-line, control-free, byte-capped session name; a credential-looking name is withheld. */
 export function safeName(name: string): string {
-	const text = name.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim().slice(0, MAX_NAME);
+	const text = capBytes(name.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim(), MAX_NAME_BYTES).trim();
 	return !text || looksLikeSecret(text) ? "(name withheld)" : text;
 }
 
@@ -281,8 +305,10 @@ export function evaluate(state: WatchdogState, peers: PeerView[], now: number, s
 			continue;
 		}
 		const updated = peer.updatedAt === undefined ? NaN : Date.parse(peer.updatedAt);
-		const staleSeconds = Number.isFinite(updated) && now - updated > STALE_MS ? Math.round((now - updated) / 1000) : undefined;
-		const stale = staleSeconds === undefined ? undefined : `registry entry not updated for ${staleSeconds} s`;
+		const age = now - updated;
+		const stale = !Number.isFinite(age) ? "registry update time not published or unreadable"
+			: Math.abs(age) <= STALE_MS ? undefined
+			: age > 0 ? `registry entry not updated for ${Math.round(age / 1000)} s` : `registry entry time is ${Math.round(-age / 1000)} s in the future`;
 
 		const found: Record<Condition, { status: "ok" | "triggered" | "unknown"; value?: number; detail: string }> = {
 			busy: { status: "unknown", detail: "busy state not published" },
@@ -296,7 +322,8 @@ export function evaluate(state: WatchdogState, peers: PeerView[], now: number, s
 				delete busy[peer.id];
 				found.busy = { status: "ok", value: 0, detail: "idle" };
 			} else if (peer.busy === true) {
-				const record = { ...(busy[peer.id] ?? { since: now, observedAt: now }) };
+				const prior = busy[peer.id];
+				const record = prior && now - prior.observedAt <= OBSERVE_GAP_MS ? { ...prior } : { since: now, observedAt: now };
 				if (now - record.observedAt >= OBSERVE_REFRESH_MS) record.observedAt = now;
 				busy[peer.id] = record;
 				const minutes = Math.floor((now - record.since) / MINUTE);
@@ -348,7 +375,11 @@ export function evaluate(state: WatchdogState, peers: PeerView[], now: number, s
 
 // ---- Recipients --------------------------------------------------------------------------------
 
-const oneLine = (text: string, max: number) => text.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim().slice(0, max) || "unknown reason";
+/** One line, control characters flattened, capped at `max` bytes; a credential-looking text is withheld. */
+const oneLine = (text: string, max: number) => {
+	const line = capBytes(text.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim(), max).trim();
+	return !line ? "unknown reason" : looksLikeSecret(line) ? "(reason withheld)" : line;
+};
 
 /** The sessions `config.notify` reaches now, never the master itself or `except`. Group membership read errors surface as `error`. */
 function recipientsOf(config: Config, peers: PeerView[], selfId: string, except: string, groupsOf: (id: string) => string[]): { ids: string[]; missing: string[]; error?: string } {
@@ -373,15 +404,19 @@ function recipientsOf(config: Config, peers: PeerView[], selfId: string, except:
 	return { ids, missing, ...(error ? { error } : {}) };
 }
 
-/** Why a recipient would not receive a message; undefined when it can be tried. Never wakes the recipient. */
-function refusalOf(peer: PeerView): string | undefined {
-	if (peer.paused) return `not delivered: ${safeName(peer.name)} is paused (only its user can resume it)`;
+/** Why a recipient would not receive a message; undefined when it can be tried. Reads the authoritative pause state and never wakes the recipient. */
+function refusalOf(host: FeatureHost, peer: PeerView): string | undefined {
+	const pause = readPause(host.home, peer.id);
+	if (pause.error) return "not delivered: pause state cannot be read, so the session is treated as paused";
+	if (pause.paused || peer.paused) return `not delivered: ${safeName(peer.name)} is paused (only its user can resume it)`;
+	if (peer.refusesInbound === true) return `not delivered: ${safeName(peer.name)} refuses inbound requests`;
 	if (peer.acceptsRemote === false) return `not delivered: ${safeName(peer.name)} does not accept remote requests`;
 	return undefined;
 }
 
+/** The peer message text: ids, condition and observed value only. A session's name is attacker-controlled text and never goes into a message the master sends. */
 function alertMessage(emission: Emission): string {
-	return `Watchdog alert (automated; from observed session metadata only; nothing was interrupted): ${safeName(emission.name)} (${emission.session}) ${describe(emission.condition, emission.value, emission.limit)}. This is a notice, not an instruction.`;
+	return `Watchdog alert (automated; from observed session metadata only; nothing was interrupted): ${emission.session} ${describe(emission.condition, emission.value, emission.limit)}. This is a notice, not an instruction.`;
 }
 
 /** Send `emission` to the configured recipients through the normal send path; one outcome per recipient id. */
@@ -389,19 +424,19 @@ async function notifyRecipients(host: FeatureHost, config: Config, peers: PeerVi
 	const { ids, missing, error } = recipientsOf(config, peers, host.self().id, emission.session, host.groupsOf);
 	const outcomes: Record<string, string> = {};
 	for (const target of missing) if (PEER_ID_RE.test(target)) outcomes[target] = "not delivered: session is not live";
-	if (error) outcomes[host.self().id] = `not delivered to a group: ${error}`.slice(0, 200);
+	if (error) outcomes[host.self().id] = capBytes(`not delivered to a group: ${error}`, MAX_OUTCOME_BYTES);
 	for (const id of ids) {
 		const peer = peers.find(candidate => candidate.id === id)!;
-		const refused = refusalOf(peer);
+		const refused = refusalOf(host, peer);
 		if (refused) {
 			outcomes[id] = refused;
 			continue;
 		}
 		try {
 			const result = await host.send(id, { text: alertMessage(emission) });
-			outcomes[id] = result.status === "delivered" ? "delivered" : result.status === "offline" ? "not delivered: session is not live" : `not delivered: ${oneLine(result.reason, MAX_REASON)}`;
+			outcomes[id] = capBytes(result.status === "delivered" ? "delivered" : result.status === "offline" ? "not delivered: session is not live" : `not delivered: ${oneLine(result.reason, MAX_REASON_BYTES)}`, MAX_OUTCOME_BYTES);
 		} catch (e) {
-			outcomes[id] = `not delivered: ${oneLine((e as Error).message, MAX_REASON)}`;
+			outcomes[id] = capBytes(`not delivered: ${oneLine((e as Error).message, MAX_REASON_BYTES)}`, MAX_OUTCOME_BYTES);
 		}
 	}
 	return outcomes;
@@ -540,7 +575,7 @@ export async function renderCheck(host: FeatureHost): Promise<string> {
 		if (error) lines.push(`  would not notify a group: ${error}`);
 		for (const id of ids) {
 			const peer = peers.find(candidate => candidate.id === id)!;
-			lines.push(`  would notify ${label(peer)}: ${refusalOf(peer) ?? "would be sent"}`);
+			lines.push(`  would notify ${label(peer)}: ${refusalOf(host, peer) ?? "would be sent"}`);
 		}
 	}
 	return lines.join("\n");

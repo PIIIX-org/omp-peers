@@ -19,6 +19,7 @@ const host: FeatureHost = {
 		{ id, name: "worker", busy: true, updatedAt: new Date(T0).toISOString() },
 	],
 	groupsOf: () => [],
+	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async () => ({ status: "delivered" }),
 };
 

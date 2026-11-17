@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Watchdog
+
+- Add opt-in `/peers watchdog on|off|status|check|set|override|clear-override|ack` (private `watchdog.json`, off by default; master-only changes): the master evaluates published session metadata every 5 s and alerts once per session and condition when a session has been busy longer than `busyMinutes` (default 30, counted from first observation and restarted after a 5 minute observation gap), has `errorTurns` (3) consecutive error-ended turns or reaches `contextPercent` (90), with a `cooldownMinutes` (30) dedupe and `ack`. Per-session overrides (or `--off`) let long legitimate tasks raise thresholds. Alerts reach the master's next agent context as ids and observed values only and, for explicit `notify` recipients (up to 5 targets, groups capped at 20), as an ordinary peer message without names; a paused recipient (authoritative pause file, fail closed), refusing or absent session is recorded as `not delivered` and never woken. Missing, stale or future-dated data is `unknown` and never alerts; `status` and `check` run the same evaluation read-only. Nothing is interrupted, restarted or resumed. Adds `Feature.tick`, the published `recentErrorTurns` registry field and `PeerView` busy/context/paused/recentErrorTurns/updatedAt.
+
 ### Session groups
 
 - Add `/peers groups list|add|remove|delete|members|preview` (private `groups.json`, keyed by stable session id, 64 groups of 64 members) and a `group:<name>` target for `/peers msg|report|do`, `peers_send` and `peers_control`: recipients that are paused (from the published registry flag; the receiver's wake gate stays authoritative), refusing inbound or locked (control ops) are skipped and listed as `skipped: <name> (<reason>)`; unknown, empty, no-recipient and unproven-duplicate-writer groups are explicit errors and `all` is unchanged. Group-scoped standing rules now match real membership.
