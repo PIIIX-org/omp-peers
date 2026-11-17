@@ -16,6 +16,7 @@ const host: FeatureHost = {
 	peers: async () => [],
 	groupsOf: () => [],
 	notify: () => {},
+	usageNow: () => undefined,
 	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	resolveModel: async () => ({ ok: false, error: "not exercised" }),
 	applyModel: async () => ({ ok: false, error: "not exercised" }),

@@ -21,7 +21,7 @@ This is deliberately small. It sends one informational message to one named remo
 - `<ssh>` is an ssh config alias or `user@host`: letters, digits, `.`, `_`, `-` (and `+` in the user part, `:` in the host part), at most 255 characters, never starting with `-`, no spaces, control characters or shell characters. It becomes exactly one argument after `--`; no option is ever taken from the configuration. Host name, port, identity file, proxy and so on belong in your own `~/.ssh/config` alias, which this plugin never reads.
 - A remote session is addressed `<host-name>:<peer-id>` and shown as `<host-name>:<name> (<peer-id>)`. The peer id is the remote session's own stable id (the id `/peers list` shows there).
 - `sessions` and `msg` refuse a host whose host id is not pinned yet (run `test` first).
-- `list`, `status`, `sessions` and `msg` work in any session; `add`, `remove`, `test` and `pin` are master only (run `/peers master` first). There is no LLM tool and no `peers_control` or `peers_send` integration: only a user typing a command makes a request.
+- `list`, `status`, `sessions` and `msg` work in any main session; `add`, `remove`, `test` and `pin` are master only (run `/peers master` first). A subagent that shares the extension cannot run any `/peers hosts` command (`/peers hosts runs only in a main session`). There is no LLM tool and no `peers_control` or `peers_send` integration: only a user typing a command in a main session makes a request.
 
 What `sessions` shows per remote session is exactly: peer id, display name (control characters removed, `"`, `[`, `]` replaced by `'`, at most 40 bytes, credential-looking names shown as `[withheld]`), and the flags `busy`, `paused` and `refuses` (the remote session refuses inbound requests). Unknown stays unknown: a flag the remote does not publish is not shown. At most 64 sessions are listed. Never the working directory, socket path, process id, instance id, model, effort, subagent text, context usage or session id. The remote bridge enforces this list and the local side validates and caps it again.
 
@@ -53,7 +53,7 @@ You need the plugin on both machines (the remote needs `scripts/omp-peers-remote
    command="bun /path/to/omp-peers/scripts/omp-peers-remote.ts",restrict ssh-ed25519 AAAA... peers-bridge
    ```
 
-   `command="..."` makes sshd run only the bridge whatever the client asks for. `restrict` turns off port, agent and X11 forwarding, pty allocation and `~/.ssh/rc` for the key. Use the absolute path of `bun` and of the script (sshd's forced command has a minimal `PATH`). You may add `from="<pattern>"` to limit where the key can be used from. Without the `command="..."` restriction the key is a normal login key and the bridge is not enforced: do not use such a key here.
+   `command="..."` makes sshd run only the bridge whatever the client asks for. The client always sends the one fixed command word `omp-peers-remote`; with the forced command sshd ignores it (it is only passed to the bridge in `SSH_ORIGINAL_COMMAND`, which the bridge never reads), so the word in the `authorized_keys` line and the word the client sends need not match. If you use a key without the forced command, the remote shell would try to run a program called `omp-peers-remote` and fail: harmless, and a sign the key is not restricted. `restrict` turns off port, agent and X11 forwarding, pty allocation and `~/.ssh/rc` for the key. Use the absolute path of `bun` and of the script (sshd's forced command has a minimal `PATH`). You may add `from="<pattern>"` to limit where the key can be used from. Without the `command="..."` restriction the key is a normal login key and the bridge is not enforced: do not use such a key here.
 
 4. **Trust the remote host key yourself.** The plugin runs ssh with `StrictHostKeyChecking=yes`, so the host key must already be in your `known_hosts`. Connect once by hand with `ssh -T ops-box < /dev/null` (the bridge answers with a JSON `bad request` error, which is fine) and check the fingerprint ssh shows against one you obtained from the remote machine by another route before you accept it.
 
@@ -132,9 +132,11 @@ Breaker, rate and last-outcome state is in `peer-state/hosts-runtime.json` (0600
 - `hosts.json`, `hosts-runtime.json` and `host-id.json` are private (directory 0700, files 0600, atomic replace, symlinks and non-regular files refused). A tampered or unreadable one makes every command fail closed with an error and nothing is overwritten.
 - Only POSIX systems are covered (process groups, unix sockets, file modes); Windows is untested and not supported.
 
-## Test seam
+## Which `ssh` runs, and the test seam
 
-For tests only, the environment variable `OMP_PEERS_SSH_BIN` may name an absolute path to an executable regular file you own that others cannot write; it replaces the `ssh` found on `PATH`. It is read once when the plugin loads and cannot be set by a command, the configuration or a remote request. Otherwise `ssh` is resolved once from the absolute entries of `PATH`.
+The `ssh` client is the first executable `ssh` in the absolute entries of the `PATH` the plugin saw when it loaded; relative and empty entries are ignored, and the result is cached as an absolute path for the life of the process. **Nothing else can substitute it**: no environment variable, configuration value, command argument or remote reply names the client (an earlier `OMP_PEERS_SSH_BIN` override was removed because an inherited variable could have redirected a credential-carrying channel; it is now ignored, and a test proves that). Changing `PATH` after OMP started has no effect; restart the session. Put the `ssh` you trust first on the `PATH` OMP is started with.
+
+Unit tests pin a fake client through the exported `setSshBinForTests()` in `lib/features/hosts.ts`; nothing in production code calls it. The end-to-end tests and the real-OMP scenario instead put a script named `ssh` first on the `PATH` of the process under test (a normal, user-controlled mechanism); the scenario also removes every other `ssh` from that `PATH`.
 
 ## Files
 

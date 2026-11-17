@@ -30,10 +30,14 @@ afterEach(() => {
 	for (const dir of [local, remote, tools]) fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// The fake ssh is named `ssh` in `tools`, which comes first on the child's PATH: PATH is the only way production code finds ssh.
 async function hosts(...args: string[]): Promise<string> {
+	return hostsWith({ PATH: `${tools}${path.delimiter}${process.env.PATH ?? ""}` }, ...args);
+}
+async function hostsWith(env: Record<string, string>, ...args: string[]): Promise<string> {
 	const child = path.join(import.meta.dir, "child_hosts.ts");
 	const proc = Bun.spawn([process.execPath, child, local, LOCAL_SESSION, ...args], {
-		env: { PATH: process.env.PATH ?? "", HOME: local, OMP_PEERS_SSH_BIN: fake, ["ANTHROPIC_API" + "_KEY"]: "must-not-reach-ssh" }, stdout: "pipe", stderr: "pipe",
+		env: { HOME: local, ["ANTHROPIC_API" + "_KEY"]: "must-not-reach-ssh", ...env }, stdout: "pipe", stderr: "pipe",
 	});
 	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 	expect(await proc.exited).toBe(0);
@@ -138,5 +142,21 @@ describe("through a fake ssh to the real remote bridge", () => {
 	test("the fake ssh rejects any other argv, so a changed option or target would fail these tests", async () => {
 		const proc = Bun.spawn([fake, "-o", "BatchMode=no", "--", TARGET, "omp-peers-remote"], { stdout: "pipe", stderr: "pipe" });
 		expect(await proc.exited).toBe(97);
+	});
+
+	test("an environment variable cannot substitute the ssh client: the retired OMP_PEERS_SSH_BIN is ignored and PATH alone decides", async () => {
+		// PATH holds only a stand-in that fails without touching any network; the variable names the working fake.
+		const stand = tmpHome();
+		try {
+			const standLog = path.join(stand, "stand-in.log");
+			fs.writeFileSync(path.join(stand, "ssh"), `#!/bin/sh\necho called >> '${standLog}'\necho 'Permission denied (publickey).' >&2\nexit 255\n`, { mode: 0o700 });
+			expect(await hosts("add", "alpha", TARGET)).toStartWith("added host alpha");
+			const out = await hostsWith({ PATH: stand, OMP_PEERS_SSH_BIN: fake }, "test", "alpha");
+			expect(out).toBe("error: alpha: permission denied");
+			expect(fs.readFileSync(standLog, "utf8")).toBe("called\n");
+			expect(sshCalls()).toBe(0);
+		} finally {
+			fs.rmSync(stand, { recursive: true, force: true });
+		}
 	});
 });

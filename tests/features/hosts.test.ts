@@ -7,7 +7,7 @@ import { FEATURES } from "../../lib/features";
 import type { FeatureHost } from "../../lib/features/host";
 import {
 	BACKOFF_MS, BREAKER_FAILURES, COOLDOWN_MS, RATE_PER_HOUR, REQUEST_TIMEOUT_MS, SSH_OPTIONS, createHosts, hosts, hostsFile, parseReply, readHosts, readRuntime, resolveSshBin,
-	runSsh, runtimeFile, sshArgv, sshEnv, sshTargetError, type HostsDeps, type RunResult,
+	runSsh, runtimeFile, setSshBinForTests, sshArgv, sshEnv, sshTargetError, type HostsDeps, type RunResult,
 } from "../../lib/features/hosts";
 import { BRIDGE_COMMAND, HOST_NAME_RE, MAX_HOSTS, MAX_TEXT_BYTES, cleanName, capBytes, ensureHostId, hostIdFile, hostLabel, readRemoteMessage } from "../../lib/features/hosts_wire";
 import { allFileText, tmpHome } from "./hosts_helpers";
@@ -67,6 +67,7 @@ function host(): FeatureHost {
 		peers: async () => [],
 		groupsOf: () => [],
 		notify: () => {},
+		usageNow: () => undefined,
 		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
@@ -168,39 +169,62 @@ describe("ssh executable resolution", () => {
 	beforeEach(() => {
 		dir = tmpHome();
 	});
-	afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
-	const uid = process.getuid?.();
-	const make = (name: string, mode: number) => {
+	afterEach(() => {
+		setSshBinForTests(undefined);
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+	const make = (name: string, mode: number, body = "#!/bin/sh\n") => {
 		const file = path.join(dir, name);
-		fs.writeFileSync(file, "#!/bin/sh\n");
+		fs.writeFileSync(file, body);
 		fs.chmodSync(file, mode);
 		return file;
 	};
 
-	test("a test override must be an absolute, executable, user-owned regular file that others cannot write", () => {
-		expect(resolveSshBin(make("good", 0o700), undefined, uid)).toBe(path.join(dir, "good"));
-		expect(() => resolveSshBin("ssh", undefined, uid)).toThrow("OMP_PEERS_SSH_BIN");
-		expect(() => resolveSshBin("./ssh", undefined, uid)).toThrow("OMP_PEERS_SSH_BIN");
-		expect(() => resolveSshBin(make("plain", 0o600), undefined, uid)).toThrow("OMP_PEERS_SSH_BIN");
-		expect(() => resolveSshBin(make("writable", 0o722), undefined, uid)).toThrow("OMP_PEERS_SSH_BIN");
-		expect(() => resolveSshBin(make("foreign", 0o700), undefined, (uid ?? 0) + 1)).toThrow("OMP_PEERS_SSH_BIN");
-		expect(() => resolveSshBin(path.join(dir, "missing"), undefined, uid)).toThrow("OMP_PEERS_SSH_BIN");
-		expect(() => resolveSshBin(dir, undefined, uid)).toThrow("OMP_PEERS_SSH_BIN");
-	});
-
-	test("PATH resolution yields an absolute path and ignores relative and empty entries", () => {
+	test("only PATH names the client: the first executable ssh in an absolute entry; relative, empty and non-executable entries are ignored", () => {
 		const bin = make("ssh", 0o755);
-		expect(resolveSshBin(undefined, `${dir}`, uid)).toBe(bin);
-		expect(resolveSshBin(undefined, `${path.delimiter}relative/dir${path.delimiter}.${path.delimiter}${dir}`, uid)).toBe(bin);
+		expect(resolveSshBin(dir)).toBe(bin);
+		expect(resolveSshBin(`${path.delimiter}relative/dir${path.delimiter}.${path.delimiter}${dir}`)).toBe(bin);
+		const other = tmpHome();
+		try {
+			fs.writeFileSync(path.join(other, "ssh"), "#!/bin/sh\n", { mode: 0o644 });
+			expect(resolveSshBin(`${other}${path.delimiter}${dir}`)).toBe(bin);
+			fs.mkdirSync(path.join(other, "d"));
+			expect(() => resolveSshBin(path.join(other, "d"))).toThrow("ssh client not found");
+		} finally {
+			fs.rmSync(other, { recursive: true, force: true });
+		}
 		const previous = process.cwd();
 		process.chdir(dir);
 		try {
-			expect(() => resolveSshBin(undefined, `.${path.delimiter}`, uid)).toThrow("ssh client not found");
-			expect(() => resolveSshBin(undefined, "", uid)).toThrow("ssh client not found");
-			expect(() => resolveSshBin(undefined, undefined, uid)).toThrow("ssh client not found");
+			expect(() => resolveSshBin(`.${path.delimiter}`)).toThrow("ssh client not found");
+			expect(() => resolveSshBin("")).toThrow("ssh client not found");
+			expect(() => resolveSshBin(undefined)).toThrow("ssh client not found");
 		} finally {
 			process.chdir(previous);
 		}
+	});
+
+	test("the resolver takes no override: its source mentions no environment variable but PATH", () => {
+		const source = fs.readFileSync(path.join(import.meta.dir, "..", "..", "lib", "features", "hosts.ts"), "utf8");
+		expect([...source.matchAll(/process\.env(?:\.(\w+)|\[)/g)].map(m => m[1])).toEqual(["PATH"]);
+		expect(source).not.toContain("OMP_PEERS_SSH_BIN");
+		expect(resolveSshBin.length).toBe(1);
+	});
+
+	test("the test setter pins the default feature's ssh, and insists on an absolute path", async () => {
+		expect(() => setSshBinForTests("ssh")).toThrow("absolute");
+		expect(() => setSshBinForTests("./ssh")).toThrow("absolute");
+		setSshBinForTests(make("fake-ssh", 0o700, "#!/bin/sh\necho 'Permission denied (publickey).' >&2\nexit 255\n"));
+		await say("add alpha ops@box");
+		expect(await hosts.command(["test", "alpha"], host())).toBe("error: alpha: permission denied");
+	});
+
+	test("the feature runs in the main session only and offers no LLM tool", () => {
+		expect(hosts.mainOnly).toBe(true);
+		expect(hosts.tools).toBeUndefined();
+		expect(hosts.agentContext).toBeUndefined();
+		expect(hosts.onReport).toBeUndefined();
+		expect(hosts.tick).toBeUndefined();
 	});
 });
 

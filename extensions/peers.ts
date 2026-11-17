@@ -1200,6 +1200,8 @@ export default function peers(pi: ExtensionAPI) {
 			}
 			const feature = FEATURES.find(f => f.name === sub);
 			if (feature) {
+				// Network-capable features act for the user's main session only, never for a subagent that shares this extension.
+				if (feature.mainOnly && ctx.agent.kind !== "main") return say(`/peers ${feature.name} runs only in a main session`);
 				const out = await feature.command(rest, featureHost(ctx));
 				publish(pi); // a pause or resume must show in the registry now, not at the next 5 s refresh
 				return say(out);

@@ -178,33 +178,30 @@ async function record(home: string, name: string, now: number, last: string, tra
 
 // ---- ssh ---------------------------------------------------------------------------------------
 
-/** `OMP_PEERS_SSH_BIN` is test-only: read once when this module loads, never from a command, config or remote request. */
-const ENV_SSH_BIN = process.env.OMP_PEERS_SSH_BIN;
+/**
+ * The ssh client is found on `PATH` as it was when this module loaded and cached for the life of the process. Nothing in
+ * the environment (apart from that PATH), the configuration, a command or a remote reply can name or replace it.
+ */
+const STARTUP_PATH = process.env.PATH;
 let sshBinCache: string | undefined;
 
-/**
- * The ssh executable as an absolute path: the test override (an absolute path to an executable regular file
- * owned by this user, not group/world-writable) or the first absolute PATH entry containing an executable `ssh`.
- * Relative and empty PATH entries are ignored.
- */
-export function resolveSshBin(override: string | undefined, pathVar: string | undefined, uid: number | undefined = process.getuid?.()): string {
-	const executable = (file: string): fs.Stats | undefined => {
-		try {
-			const info = fs.statSync(file);
-			return info.isFile() && (info.mode & 0o111) !== 0 ? info : undefined;
-		} catch {
-			return undefined;
-		}
-	};
-	if (override !== undefined) {
-		const info = path.isAbsolute(override) ? executable(override) : undefined;
-		if (!info || info.uid !== uid || (info.mode & 0o022) !== 0) throw new Error("OMP_PEERS_SSH_BIN must be an absolute path to an executable regular file you own that others cannot write");
-		return override;
-	}
+/** Tests only: pin the ssh executable the default feature runs. Nothing in production calls it; `undefined` restores PATH resolution. */
+export function setSshBinForTests(bin: string | undefined): void {
+	if (bin !== undefined && !path.isAbsolute(bin)) throw new Error("the test ssh executable must be an absolute path");
+	sshBinCache = bin;
+}
+
+/** The first executable `ssh` in the absolute entries of `pathVar` (relative and empty entries are ignored), as an absolute path. */
+export function resolveSshBin(pathVar: string | undefined): string {
 	for (const dir of (pathVar ?? "").split(path.delimiter)) {
 		if (!dir || !path.isAbsolute(dir)) continue;
 		const candidate = path.join(dir, "ssh");
-		if (executable(candidate)) return candidate;
+		try {
+			const info = fs.statSync(candidate);
+			if (info.isFile() && (info.mode & 0o111) !== 0) return candidate;
+		} catch {
+			// not in this directory
+		}
 	}
 	throw new Error("ssh client not found in an absolute PATH entry");
 }
@@ -297,7 +294,7 @@ export interface HostsDeps {
 }
 
 const defaultDeps: HostsDeps = {
-	sshBin: () => (sshBinCache ??= resolveSshBin(ENV_SSH_BIN, process.env.PATH)),
+	sshBin: () => (sshBinCache ??= resolveSshBin(STARTUP_PATH)),
 	run: (argv, stdin) => runSsh(argv, stdin, { timeoutMs: REQUEST_TIMEOUT_MS, stdoutMax: STDOUT_MAX, stderrMax: STDERR_MAX, env: sshEnv() }),
 	sleep: ms => {
 		const { promise, resolve } = Promise.withResolvers<void>();
@@ -606,7 +603,7 @@ export function createHosts(deps: HostsDeps): Feature {
 		return outcome.data.status === "delivered" ? `delivered to ${label}` : `${label}: unknown outcome, not retried (bridge protocol error)`;
 	}
 
-	return { name: "hosts", command };
+	return { name: "hosts", command, mainOnly: true };
 }
 
 export const hosts: Feature = createHosts(defaultDeps);

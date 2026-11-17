@@ -90,7 +90,12 @@ def run(h):
 
 
 def scenario(h, remote, fake, log):
-    master = h.start(env={"OMP_PEERS_SSH_BIN": str(fake)})
+    # Production finds ssh only on PATH (resolved once at load, no override exists). `fake` is named `ssh` and sits first on
+    # the master's PATH; PATH entries holding any other ssh are dropped, so the real client can never run here.
+    # (A second test extension calling the module's test setter does not work: OMP loads each extension's relative
+    # imports under their own cache-busting key, so such an extension gets a different hosts.ts instance than peers.ts.)
+    clean_path = [d for d in os.environ["PATH"].split(os.pathsep) if d and not os.access(os.path.join(d, "ssh"), os.X_OK)]
+    master = h.start(env={"PATH": os.pathsep.join([str(fake.parent), *clean_path])})
     master.call("new_session")
     worker = remote.start()
     wid = remote.row(worker)["id"]

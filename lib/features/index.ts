@@ -35,6 +35,8 @@ export interface Feature {
 	name: string;
 	/** `args` are the whitespace-split tokens after the feature name. Returns text shown to the user. */
 	command(args: string[], host: FeatureHost): Promise<string>;
+	/** Set for a feature whose command reaches outside this machine: the extension runs it only in a main (user-driven) session, never a subagent's. */
+	mainOnly?: boolean;
 	/** Context added before this session's next agent start; undefined adds nothing. May throw. */
 	agentContext?(host: FeatureHost): string | undefined | Promise<string | undefined>;
 	/** A structured report this session accepted; `from` is the sender's claimed identity, not authenticated. May reject. */
