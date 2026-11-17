@@ -151,6 +151,8 @@ interface PeerInfo extends PeerActivity {
 	/** Explicit pause: wake-triggering requests are refused. Absent on registrations from older versions. */
 	paused?: boolean;
 	pausedSince?: string;
+	/** Consecutive assistant turns that ended in an error, counted since this process started (the watchdog reads it). Absent on registrations from older versions. */
+	recentErrorTurns?: number;
 }
 interface Req {
 	op: string;
@@ -196,6 +198,7 @@ const state = {
 	forcedTier: undefined as Tier | undefined,
 	timer: undefined as unknown,
 	rate: new Map<string, number[]>(),
+	errorTurns: 0,
 };
 let exitHooked = false;
 const sockPath = () => path.join(ROOT, `${state.id}.sock`);
@@ -250,6 +253,7 @@ function bindIdentity(sessionId: string): void {
 	notifications.bind(sessionId);
 	state.id = stablePeerId(sessionId);
 	state.saved = { name: "", restoreMaster: false, routingPolicy: "keep" };
+	state.errorTurns = 0;
 	state.identityError = "";
 	for (const dir of [ROOT, SESSION_ROOT]) {
 		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -330,6 +334,7 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 		routingPolicy: state.saved.routingPolicy,
 		paused: pause.paused,
 		pausedSince: pause.since === undefined ? undefined : new Date(pause.since).toISOString(),
+		recentErrorTurns: state.errorTurns,
 	};
 }
 
@@ -821,12 +826,38 @@ export default function peers(pi: ExtensionAPI) {
 		ctx.ui.setStatus("peers", `peers:${n}${m === state.id ? " ★master" : m ? ` master:${m}` : ""}${readPause(os.homedir(), state.id).paused ? " paused" : ""}`);
 	};
 
+	// Periodic feature work (the watchdog) rides the 5 s refresh, runs only in the master session and never overlaps itself.
+	// A failing tick warns once per feature and never breaks the refresh.
+	let ticking = false;
+	const warnedTicks = new Set<string>();
+	const runTicks = async (ctx: ExtensionContext) => {
+		if (ticking || !state.sessionLock?.acquired || state.identityError || masterId() !== state.id) return;
+		ticking = true;
+		try {
+			const host = featureHost(ctx);
+			for (const feature of FEATURES) {
+				try {
+					await feature.tick?.(host);
+				} catch (error) {
+					if (warnedTicks.has(feature.name)) continue;
+					warnedTicks.add(feature.name);
+					ctx.ui.notify(`peers ${feature.name}: periodic check failed: ${(error as Error).message}`, "warning");
+				}
+			}
+		} finally {
+			ticking = false;
+		}
+	};
+
 	pi.on("session_start", async (_e, ctx) => {
 		if (ctx.mode === "print" || ctx.mode === "json" || !bind(ctx)) return;
 		await initializeActivityHost();
 		refresh(ctx);
 		if (state.timer) ctx.clearTimer(state.timer as never);
-		state.timer = ctx.setInterval(() => refresh(state.ctx ?? ctx), 5_000);
+		state.timer = ctx.setInterval(() => {
+			refresh(state.ctx ?? ctx);
+			void runTicks(state.ctx ?? ctx);
+		}, 5_000);
 		// A template named in the environment is only shown, never applied: the variable is inherited by every program this session starts.
 		if (process.env.OMP_PEERS_TEMPLATE?.trim()) {
 			const text = state.sessionLock?.acquired
@@ -851,7 +882,13 @@ export default function peers(pi: ExtensionAPI) {
 		if (ctx.agent.kind === "main" && state.server && bind(ctx)) notifications.end(selfInfo(pi).name);
 		await refreshAfterEvent(_event, ctx);
 	});
-	pi.on("turn_end", refreshAfterEvent);
+	pi.on("turn_end", async (event, ctx) => {
+		// Metadata only: the stop reason of this session's own assistant turns, never their content.
+		if (ctx.agent.kind === "main" && state.manager === ctx.sessionManager && event.message.role === "assistant") {
+			state.errorTurns = event.message.stopReason === "error" ? state.errorTurns + 1 : 0;
+		}
+		await refreshAfterEvent(event, ctx);
+	});
 	// Track the session's current task tier from the prompt it is about to work on (the master's explicit tier wins).
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind !== "main" || event.reason === "revive" || !event.prompt) return;
@@ -870,7 +907,7 @@ export default function peers(pi: ExtensionAPI) {
 			isMaster: () => masterId() === id,
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
-				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse" })),
+				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse", busy: p.busy, context: p.context, paused: p.paused, recentErrorTurns: p.recentErrorTurns, updatedAt: p.updatedAt })),
 			groupsOf: peerId => groupsOf(os.homedir(), peerId),
 			resolveGroup: async (name, op) => {
 				const { peers, error, skipped } = await resolveTargets(`group:${name}`, op);

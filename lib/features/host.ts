@@ -12,6 +12,16 @@ export interface PeerView {
 	acceptsRemote?: boolean;
 	/** Whether the peer refuses all inbound requests (published state); undefined when unknown. A control lock alone is not a refusal: messages still arrive. */
 	refusesInbound?: boolean;
+	/** Published busy state (a turn is running); undefined when unknown. */
+	busy?: boolean;
+	/** Published context usage text such as `1234 (56%)`; empty or undefined when the peer has no figure. */
+	context?: string;
+	/** Published explicit pause; undefined on registrations from versions without pause. */
+	paused?: boolean;
+	/** Consecutive assistant turns that ended in an error, counted by the peer since its process started; undefined on versions that do not publish it. */
+	recentErrorTurns?: number;
+	/** ISO time of the peer's last registry write; undefined when unknown. */
+	updatedAt?: string;
 }
 
 /** Who a request addressed to `group:<name>` reaches right now; `skipped` lists every member left out and why. */
