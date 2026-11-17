@@ -166,6 +166,8 @@ interface Req {
 	report?: Report;
 	/** Random id the sender attaches to a control op so both sides' audit records correlate. A claim, like `from`. */
 	request?: string;
+	/** Set by the dependency dispatcher: the receiver refuses this message while its control is locked. */
+	dependency?: boolean;
 	/** Set by a sender whose report came from a subagent, not its main session; never feeds report-driven features. */
 	subagent?: boolean;
 }
@@ -583,6 +585,8 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 				return { ok: false, error: `invalid message/report: ${(error as Error).message}` };
 			}
 			const from = req.from ?? { id: "?", name: "unknown" };
+			// Dependency deliveries are authorized work: the receiver's own control lock applies, whatever the sender saw earlier.
+			if (req.dependency === true && !state.control) return { ok: false, error: "peer is locked (control refused)" };
 			if (!rateOk(from.id)) return { ok: false, error: "rate limited" };
 			if (report && req.from && featureHostFor && req.subagent !== true) {
 				// Only an explicit structured report feeds features; a failing hook never blocks delivery.
@@ -862,13 +866,13 @@ export default function peers(pi: ExtensionAPI) {
 			isMaster: () => masterId() === id,
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
-				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control })),
+				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse" })),
 			groupsOf: peerId => groupsOf(os.homedir(), peerId),
 			resolveGroup: async (name, op) => {
 				const { peers, error, skipped } = await resolveTargets(`group:${name}`, op);
 				return { recipients: peers.map(p => ({ id: logicalId(p), name: p.name })), skipped: skipped ?? [], error };
 			},
-			send: (to, req) => sendTo(to, req.text),
+			send: (to, req) => sendTo(to, req.text, req.dependency === true),
 			acceptsRemote: () => state.inbound === "accept" && state.control,
 			resolveModel: async selector => (await checkModel(pi, ctx, selector)).check,
 			applyModel: async (selector): Promise<ModelApply> => {
@@ -977,7 +981,7 @@ export default function peers(pi: ExtensionAPI) {
 	}
 
 	/** One message to one live session by stable id, through the same resolution and socket path as fanout(). */
-	async function sendTo(to: string, text: string): Promise<SendResult> {
+	async function sendTo(to: string, text: string, dependency = false): Promise<SendResult> {
 		if (!state.sessionLock?.acquired) return { status: "failed", reason: state.identityError || "session identity unavailable" };
 		let message: ReturnType<typeof readMessage>;
 		try {
@@ -988,7 +992,7 @@ export default function peers(pi: ExtensionAPI) {
 		if (!(await listPeers()).some(p => p.id === to)) return { status: "offline" };
 		const { peers: targets, error } = await resolveTargets(to, "message");
 		if (error || targets.length !== 1 || targets[0].id !== to) return { status: "failed", reason: error ?? "target is ambiguous" };
-		const response = await call(targets[0], { op: "message", text: message.text, from: senderInfo() });
+		const response = await call(targets[0], { op: "message", text: message.text, from: senderInfo(), ...(dependency ? { dependency: true } : {}) });
 		return response.ok ? { status: "delivered" } : { status: "failed", reason: String(response.error) };
 	}
 

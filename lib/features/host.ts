@@ -10,6 +10,8 @@ export interface PeerView {
 	name: string;
 	/** Whether the peer accepts requests from others (published inbound/control state); undefined when unknown. */
 	acceptsRemote?: boolean;
+	/** Whether the peer refuses all inbound requests (published state); undefined when unknown. A control lock alone is not a refusal: messages still arrive. */
+	refusesInbound?: boolean;
 }
 
 /** Who a request addressed to `group:<name>` reaches right now; `skipped` lists every member left out and why. */
@@ -62,9 +64,10 @@ export interface FeatureHost {
 	/**
 	 * Send an ordinary peer message to the live session with stable id `to`. It takes the same path as
 	 * `peers_send`, so the receiver's inbound refuse, lock and rate limit apply unchanged. Never resumes a
-	 * session that is not live.
+	 * session that is not live. `dependency: true` marks authorized work (a dependency trigger): the RECEIVER then
+	 * also refuses it while its own control is locked, so a lock set after the sender's preflight still holds.
 	 */
-	send(to: string, req: { text: string }): Promise<SendResult>;
+	send(to: string, req: { text: string; dependency?: boolean }): Promise<SendResult>;
 	/**
 	 * Resolve `selector` (a model id, `provider/id` or role alias, no thinking-level suffix) against the available
 	 * models and check its credentials, the way a routed model change is validated. Read-only: never substitutes

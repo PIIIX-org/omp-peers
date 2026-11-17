@@ -14,6 +14,10 @@
 
 - Add `/peers locks` and the `peers_lock` tool: named locks and semaphores (capacity 1-64, TTL with renewal) stored in a private `locks.json` and acquired atomically across processes. A session holds at most one slot per name (a second acquire is refused; use renew). Contention returns `acquired`, `busy` (names the holders, never waits) or `refused`; only the owner releases, an unexpired lease is never stolen (including after a restart of the same session), expired leases are reclaimed lazily, `status` is read-only, and the master can `force-release` (a live lease only with `--yes-live`).
 
+### Report-driven dependencies
+
+- Add `/peers deps` (`add`, `list`, `remove`, `enable`, `disable`, `preview`, `pending`, `approve`, `reject`, `ledger`): opt-in rules that turn a structured DONE report accepted by the master into one peer message for another session. Rules store stable session IDs and are validated for missing targets, self-dependency, session-graph cycles and caps (64 rules, 8 per source); a persisted, cross-process-locked ledger deduplicates by report event key across restarts; `confirm` mode (default) only queues a trigger until the master user approves it, `--auto` dispatches at once, a `--once` rule (default) disables itself after firing, and a paused, refusing or absent target is recorded as not delivered and never resumed. Adds `PeerView.refusesInbound` to the feature host.
+
 ### Decision inbox
 
 - Add `/peers inbox` and the `peers_decision` tool: sessions queue deduplicated, credential-screened questions into a private cross-process-safe `inbox.json`; the master lists them grouped by source (read-only, never wakes a session) and answers, defers, reopens or retries them. An answer is sent once to the live asking session through the normal send path with the outcome recorded; otherwise it stays pending for `peers_decision check`. Extend the feature registry with `tools()` and the feature host with `send()`.
