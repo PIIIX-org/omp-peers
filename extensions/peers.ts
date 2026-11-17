@@ -28,6 +28,7 @@ import { formatActivity, initializeActivityHost, readActivity, type PeerActivity
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, logicalId, matchesWriter, resolvePeerTargets, skippedLine, stablePeerId, type IdentityStatus, type Skipped } from "../lib/identity";
 import { FEATURES } from "../lib/features";
+import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInput } from "../lib/features/audit";
 import type { FeatureHost, SendResult } from "../lib/features/host";
 import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
 import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
@@ -162,6 +163,8 @@ interface Req {
 	value?: unknown;
 	n?: number;
 	report?: Report;
+	/** Random id the sender attaches to a control op so both sides' audit records correlate. A claim, like `from`. */
+	request?: string;
 	/** Set by a sender whose report came from a subagent, not its main session; never feeds report-driven features. */
 	subagent?: boolean;
 }
@@ -522,7 +525,14 @@ async function settingOp(pi: ExtensionAPI, req: Req): Promise<Record<string, unk
 // Set by the extension factory: feature hooks that run from the receiver path need the same host the commands get.
 let featureHostFor: ((ctx: ExtensionContext) => FeatureHost) | undefined;
 
-async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknown>> {
+/** What the receiver path learned that its audit record or the deferred follow-up needs. */
+interface HandleTrace {
+	masterChecked?: boolean;
+	/** Remote shutdown was accepted; `handleAudited` schedules it once the completed audit record is written. */
+	shutdown?: boolean;
+}
+
+async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Promise<Record<string, unknown>> {
 	const ctx = state.ctx;
 	if (!ctx) return { ok: false, error: "session not ready" };
 	if (state.inbound === "refuse") return { ok: false, error: "peer refuses inbound requests" };
@@ -530,7 +540,8 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 	const text = typeof req.text === "string" ? req.text : "";
 	if (CONTROL_OPS.has(req.op)) {
 		if (!state.control) return { ok: false, error: "peer is locked (control refused)" };
-		if (!req.from?.id || masterId() !== req.from.id) return { ok: false, error: "sender is not the master session" };
+		trace.masterChecked = !!req.from?.id && masterId() === req.from.id;
+		if (!trace.masterChecked) return { ok: false, error: "sender is not the master session" };
 	}
 	// Resume is the paused session's own user action (/peers resume); no remote caller, including the master's agent, can clear a pause.
 	if (req.op === "resume") return { ok: false, error: "resume is only available as /peers resume in the paused session itself" };
@@ -644,11 +655,35 @@ async function handle(pi: ExtensionAPI, req: Req): Promise<Record<string, unknow
 			return { ok: true, entries: rows };
 		}
 		case "shutdown":
-			ctx.setTimeout(() => ctx.shutdown(), 150);
+			trace.shutdown = true;
 			return { ok: true };
 		default:
 			return { ok: false, error: `unknown op "${req.op}"` };
 	}
+}
+
+// Local audit log (opt-in): the receiving session records every control attempt and its outcome. Recording never
+// throws and never blocks the op; `req.from` is only a claim, so records say "claimed actor".
+const auditWarn = (text: string) => state.ctx?.ui.notify(text, "warning");
+const auditRecord = (input: AuditInput) => auditLog.record(os.homedir(), Date.now(), input, auditWarn);
+
+async function handleAudited(pi: ExtensionAPI, req: Req): Promise<Record<string, unknown>> {
+	if (!CONTROL_OPS.has(req.op)) return handle(pi, req);
+	const base = {
+		request: validRequestId(req.request) ?? newRequestId(),
+		side: "receiver" as const,
+		actor: { id: req.from?.id, name: req.from?.name },
+		target: { id: state.id, name: pi.getSessionName() || state.saved.name || path.basename(state.ctx?.cwd ?? process.cwd()) },
+		op: req.op,
+		args: req,
+	};
+	await auditRecord({ ...base, phase: "attempted" });
+	const trace: HandleTrace = {};
+	const response = await handle(pi, req, trace).catch(e => ({ ok: false, error: String((e as Error)?.message ?? e) }));
+	await auditRecord({ ...base, phase: "completed", masterChecked: trace.masterChecked, result: classifyResponse(req.op, response) });
+	// Only now: the timer must not outrun the completed record (the audit write can wait for the lock) or the reply.
+	if (trace.shutdown) state.ctx?.setTimeout(() => state.ctx?.shutdown(), 150);
+	return response;
 }
 
 function startServer(pi: ExtensionAPI): void {
@@ -674,7 +709,7 @@ function startServer(pi: ExtensionAPI): void {
 				conn.end(`${JSON.stringify({ ok: false, error: "bad request" })}\n`);
 				return;
 			}
-			handle(pi, req)
+			handleAudited(pi, req)
 				.catch(e => ({ ok: false, error: String((e as Error)?.message ?? e) }))
 				.then(res => conn.end(`${JSON.stringify(res)}\n`));
 		});
@@ -889,8 +924,12 @@ export default function peers(pi: ExtensionAPI) {
 		const reportMaster = req.report ? masterId() : undefined;
 		const lines = await Promise.all(
 			targets.map(async t => {
+				const request = CONTROL_OPS.has(req.op) ? newRequestId() : undefined;
+				const audit = request && { request, side: "sender" as const, actor: senderInfo(), target: t, op: req.op, args: req };
+				if (audit) await auditRecord({ ...audit, phase: "attempted" });
 				// A subagent's report must not stamp its parent's state: the receiver skips feature hooks for it.
-				const response = await call(t, { ...out, from: senderInfo(), ...(recordReport ? {} : { subagent: true }) });
+				const response = await call(t, { ...out, from: senderInfo(), request, ...(recordReport ? {} : { subagent: true }) });
+				if (audit) await auditRecord({ ...audit, phase: "completed", result: classifyResponse(req.op, response) });
 				if (req.op === "message" && req.report && recordReport && reportMaster === t.id && masterId() === t.id) {
 					notifications.reported(turn, req.report.kind, t, response);
 				}

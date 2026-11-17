@@ -26,6 +26,10 @@
 
 - Add `/peers board` (`list`, `assign`, `set`, `clear`, `stale`): a persisted, private `board.json` with one entry per stable session ID, fed by explicit assignments and accepted structured reports via a new `Feature.onReport` hook; shows stale (configurable `board.staleHours`), unknown and not-running state honestly, never wakes sessions, and updates entries under a per-entry locked read-modify-write.
 
+### Audit log
+
+- Add opt-in `/peers audit on|off|status|tail|clear --yes`: a private local record (`peer-state/audit.jsonl`, 0600, append-only, symlink/hard-link/owner/permission checks) of every master control attempt and outcome with sender claims kept as claims, no prompt text, setting values or transcripts, a fixed reason vocabulary, size and age retention with one rotated file, and write failures that never block the control op.
+
 ### Lifecycle cleanup
 
 - Pin the first bound session manager per process so extra ACP sessions cannot swap the peer identity or master claim; only the pinned manager's `session_switch` moves the logical identity; a switch from another manager is ignored. Document single-session-per-process behavior.

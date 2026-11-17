@@ -75,6 +75,7 @@ Broadcasts deliver once per logical session, using its proved canonical writer w
 - Session task board: `/peers board list|assign|set|clear|stale` keeps a persisted board of each session's assigned task and last reported status (stable-ID keyed, honest about stale and unknown). See [docs/features/board.md](docs/features/board.md).
 - Pause and resume: `/peers pause [reason]` and `/peers resume` persistently stop automated wakes (master messages and prompts, watcher digests) of a session until you resume it; status and listing still work. See [docs/features/pause.md](docs/features/pause.md).
 - Shared locks: `/peers locks acquire|renew|release|status` and the `peers_lock` tool give sessions named locks and semaphores with capacity, owner-only release and TTL expiry; contention returns `busy` instead of waiting. See [docs/features/locks.md](docs/features/locks.md).
+- Audit log: `/peers audit on|off|status|tail|clear --yes` keeps an opt-in, private, local record of master control attempts and outcomes (no prompt text, setting values or transcripts). See [docs/features/audit.md](docs/features/audit.md).
 
 ### Tools
 
