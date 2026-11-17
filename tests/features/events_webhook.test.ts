@@ -284,6 +284,7 @@ describe("listener inside the feature", () => {
 		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		notify: () => {},
+		usageNow: () => undefined,
 		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		send: async (to, req) => {
 			sent.push({ to, text: req.text, dependency: req.dependency === true });
