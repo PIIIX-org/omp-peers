@@ -23,6 +23,7 @@ const host: FeatureHost = {
 	groupsOf: () => [],
 	resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
+	notify: () => {},
 	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async (to, req) => {
 		await Bun.sleep(150);

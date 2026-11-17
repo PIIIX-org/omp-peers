@@ -51,6 +51,7 @@ function host(opts: { master?: boolean; accepts?: boolean } = {}): FeatureHost {
 		groupsOf: () => [],
 		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
+		notify: () => {},
 		resolveGroup: async name => {
 			const members = JSON.parse(fs.readFileSync(path.join(stateRoot(home), "groups.json"), "utf8")).groups[name] as string[] | undefined;
 			if (!members) return { recipients: [], skipped: [], error: `unknown group "${name}"` };
