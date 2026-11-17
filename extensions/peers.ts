@@ -825,14 +825,12 @@ export default function peers(pi: ExtensionAPI) {
 		refresh(ctx);
 		if (state.timer) ctx.clearTimer(state.timer as never);
 		state.timer = ctx.setInterval(() => refresh(state.ctx ?? ctx), 5_000);
-		// A template named in the environment is applied only to a brand new session, and only when also confirmed there.
+		// A template named in the environment is only shown, never applied: the variable is inherited by every program this session starts.
 		if (process.env.OMP_PEERS_TEMPLATE?.trim()) {
-			const fresh = !fs.existsSync(sessionPath()) && !ctx.sessionManager.getEntries().some(entry => entry.type === "message");
 			const text = state.sessionLock?.acquired
-				? await startupTemplate(featureHost(ctx), process.env, fresh)
+				? await startupTemplate(featureHost(ctx), process.env)
 				: `template not applied: ${state.identityError || "session identity unavailable"}`;
 			if (text) ctx.ui.notify(text, "info");
-			publish(pi);
 		}
 	});
 	const refreshAfterEvent = async (_event: unknown, ctx: ExtensionContext) => {

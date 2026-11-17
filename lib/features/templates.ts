@@ -4,9 +4,8 @@
 /**
  * Reusable session templates: a named model, role prompt, standing rules and groups.
  *
- * Nothing here starts a process. A template is applied by the session itself, after the user asked for it
- * (`/peers templates apply <name> --yes`, or `OMP_PEERS_TEMPLATE` plus `OMP_PEERS_TEMPLATE_CONFIRM=yes` in the
- * environment of a brand new session). Applying only ever changes the current session: it switches its model,
+ * Nothing here starts a process. A template is applied by the session itself, only when the user types
+ * `/peers templates apply <name> --yes` in it. Applying only ever changes the current session: it switches its model,
  * adds session-scoped rules and joins it to groups. Every step is planned first, read-only, and the plan is
  * exactly what apply does: any refused step means nothing is applied.
  */
@@ -294,11 +293,13 @@ async function applyPlan(host: FeatureHost, plan: Plan): Promise<string> {
 					lines.push(stepLine({ ...step, action: "present" }, true));
 					continue;
 				}
-				lines.push(stepLine({ ...step, action: joined.count === 1 ? "create" : "join" }, true));
+				// Created only when the plan found no such group and we are its first member; an existing (even empty) group is joined and never deleted by rollback.
+				const created = step.action === "create" && joined.count === 1;
+				lines.push(stepLine({ ...step, action: created ? "create" : "join" }, true));
 				undo.push({ what: `membership of group ${step.name}`, run: async () => {
 					const left = await removeMember(host.home, step.name, plan.self, actor);
 					if (!left.ok) return left.error;
-					if (left.count === 0) {
+					if (created && left.count === 0) {
 						const deleted = await deleteGroup(host.home, step.name, actor);
 						if (!deleted.ok) return deleted.error;
 					}
@@ -327,27 +328,23 @@ async function applyPlan(host: FeatureHost, plan: Plan): Promise<string> {
 // ---- Session start -----------------------------------------------------------------------------
 
 /**
- * Environment-driven apply for a brand new session. `OMP_PEERS_TEMPLATE=<name>` names the template; it is applied
- * only when `OMP_PEERS_TEMPLATE_CONFIRM=yes` is also set, otherwise the plan is shown and nothing changes. A session
- * that is not new (`fresh` false) is never changed this way. Returns the text to show, or undefined when no template
- * was requested.
+ * `OMP_PEERS_TEMPLATE=<name>` in the environment of a starting session shows that template's plan and nothing else: it
+ * never applies. Environment variables are inherited by every program the session starts (including another omp), so
+ * they cannot carry authorization; applying always needs `/peers templates apply <name> --yes` typed in the session.
+ * Returns the text to show, or undefined when no template was requested.
  */
-export async function startupTemplate(host: FeatureHost, env: Record<string, string | undefined>, fresh: boolean): Promise<string | undefined> {
+export async function startupTemplate(host: FeatureHost, env: Record<string, string | undefined>): Promise<string | undefined> {
 	const requested = env.OMP_PEERS_TEMPLATE?.trim();
 	if (!requested) return undefined;
 	if (!NAME_RE.test(requested)) return "template not applied: OMP_PEERS_TEMPLATE is not a valid template name";
 	const name = requested;
 	const not = `template ${name} not applied: `;
-	if (!fresh) return `${not}this session is not new (it has messages or saved peer-session data); run /peers templates apply ${name} --yes to apply it on purpose`;
 	try {
 		const { templates } = readTemplates(host.home);
 		if (!Object.hasOwn(templates, name)) return `${not}no such template; /peers templates list shows the stored ones`;
 		const plan = await buildPlan(host, name, templates[name]);
 		if (blocked(plan)) return await renderPlan(host, plan, `${not}${plan.steps.filter(step => step.action === "refuse").length} step(s) refused above; nothing was changed`);
-		if (env.OMP_PEERS_TEMPLATE_CONFIRM !== "yes") {
-			return await renderPlan(host, plan, `${not}set OMP_PEERS_TEMPLATE_CONFIRM=yes or run /peers templates apply ${name} --yes`);
-		}
-		return await applyPlan(host, plan);
+		return await renderPlan(host, plan, `${not}run /peers templates apply ${name} --yes in this session to apply it`);
 	} catch (error) {
 		return `${not}${(error as Error).message}`;
 	}
@@ -437,10 +434,10 @@ async function command(args: string[], host: FeatureHost): Promise<string> {
 				if (sub === "launch") {
 					return [
 						...await configLines(host, name, template),
-						"nothing was started or changed. To start a new session with this template, run in a NEW terminal:",
-						`  OMP_PEERS_TEMPLATE=${name} OMP_PEERS_TEMPLATE_CONFIRM=yes omp`,
-						`Without OMP_PEERS_TEMPLATE_CONFIRM=yes the new session only shows its plan and applies nothing (OMP_PEERS_TEMPLATE=${name} omp).`,
-						"The new session starts with no rules or groups of its own, so each rule is added and each group joined; its model is switched unless it already runs the selected one. Availability is checked again there.",
+						"nothing was started or changed. To start a new session and see this plan there, run in a NEW terminal:",
+						`  OMP_PEERS_TEMPLATE=${name} omp`,
+						`That session only shows the plan; nothing is applied until you type /peers templates apply ${name} --yes in it. (The variable is inherited by programs started from that session, so a program it launches shows its plan too and likewise changes nothing.)`,
+						"Applying adds each rule and joins each group, and switches the model unless the session already runs the selected one; availability is checked again there.",
 					].join("\n");
 				}
 				const plan = await buildPlan(host, name, template);

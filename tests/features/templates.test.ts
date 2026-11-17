@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { FEATURES } from "../../lib/features";
-import { addMember, groupsFile, groupsOf, MAX_MEMBERS, readGroups } from "../../lib/features/groups";
+import { addMember, groupsFile, groupsOf, MAX_MEMBERS, readGroups, removeMember } from "../../lib/features/groups";
 import type { FeatureHost, ModelApply, ModelCheck } from "../../lib/features/host";
 import { addRule, agentContext, readRules, removeRule, rules, rulesFile } from "../../lib/features/rules";
 import { MAX_SELECTOR, MAX_TEMPLATE_GROUPS, MAX_TEMPLATE_RULES, MAX_TEMPLATES, readTemplates, startupTemplate, templates, templatesFile, type TemplatesState } from "../../lib/features/templates";
@@ -251,10 +251,11 @@ describe("read-only commands", () => {
 			"  role: Review carefully.  (session rule, key role)",
 			"  rule 1: Prefer small diffs  (session rule)",
 			"  groups: frontend",
-			"nothing was started or changed. To start a new session with this template, run in a NEW terminal:",
+			"nothing was started or changed. To start a new session and see this plan there, run in a NEW terminal:",
 		]);
-		expect(out).toContain("\n  OMP_PEERS_TEMPLATE=web OMP_PEERS_TEMPLATE_CONFIRM=yes omp\n");
-		expect(out).toContain("Without OMP_PEERS_TEMPLATE_CONFIRM=yes the new session only shows its plan and applies nothing (OMP_PEERS_TEMPLATE=web omp).");
+		expect(out).toContain("\n  OMP_PEERS_TEMPLATE=web omp\n");
+		expect(out).toContain("That session only shows the plan; nothing is applied until you type /peers templates apply web --yes in it.");
+		expect(out).not.toContain("CONFIRM");
 		expect(await say("launch nope")).toBe('error: no template "nope"; /peers templates list shows the stored ones');
 	});
 });
@@ -409,6 +410,24 @@ describe("apply", () => {
 		expect(readGroups(home).groups.newgroup).not.toContain(A);
 	});
 
+	test("an existing empty group is joined, not created: the result says joined and a later failure leaves the group in place", async () => {
+		const actor = { self: MASTER, master: true };
+		await addMember(home, "keep", "p00000000000000f1", actor);
+		await removeMember(home, "keep", "p00000000000000f1", actor);
+		expect(readGroups(home).groups.keep).toEqual([]);
+		await say("add pair --model prov/a --group keep --group boom");
+		afterApply = async () => {
+			afterApply = undefined;
+			for (let i = 0; i < MAX_MEMBERS; i++) await addMember(home, "boom", `p${i.toString(16).padStart(16, "0")}`, actor);
+		};
+		expect(await say("apply pair --yes")).toBe("error: template pair not applied: group boom: member limit reached (64 per group); remove a member first; every earlier step was rolled back");
+		expect(readGroups(home).groups.keep).toEqual([]);
+		await say("remove pair");
+		await say("add solo --group keep");
+		expect(await say("apply solo --yes")).toContain("  group keep: joined");
+		expect(readGroups(home).groups.keep).toEqual([A]);
+	});
+
 	test("a warning appears when the injection cap would leave rules out, in the plan and in the result", async () => {
 		for (let i = 0; i < 22; i++) await addRule(host(A), `session:${A}`, `${"filler".repeat(60)} ${i}`.slice(0, 390));
 		const plan = await say("show web");
@@ -449,7 +468,7 @@ describe("apply", () => {
 	});
 });
 
-describe("new session from the environment", () => {
+describe("template named in the environment", () => {
 	beforeEach(async () => {
 		await say(FULL);
 	});
@@ -457,43 +476,34 @@ describe("new session from the environment", () => {
 
 	test("does nothing unless OMP_PEERS_TEMPLATE is set", async () => {
 		const before = snapshot();
-		expect(await startupTemplate(host(A), {}, true)).toBeUndefined();
-		expect(await startupTemplate(host(A), { OMP_PEERS_TEMPLATE: " ", OMP_PEERS_TEMPLATE_CONFIRM: "yes" }, true)).toBeUndefined();
-		expect(await startupTemplate(host(A), { OMP_PEERS_TEMPLATE_CONFIRM: "yes" }, true)).toBeUndefined();
+		expect(await startupTemplate(host(A), {})).toBeUndefined();
+		expect(await startupTemplate(host(A), { OMP_PEERS_TEMPLATE: " " })).toBeUndefined();
+		expect(await startupTemplate(host(A), { OMP_PEERS_TEMPLATE_CONFIRM: "yes" })).toBeUndefined();
 		expect(snapshot()).toBe(before);
 	});
 
-	test("without confirmation it shows the plan and applies nothing", async () => {
+	test("it only shows the plan and never applies, whatever else the environment carries", async () => {
 		const before = snapshot();
 		const plan = (await say("show web")).split("\n").slice(0, -1).join("\n");
-		for (const confirm of [undefined, "", "true", "YES", "no"]) {
-			const out = await startupTemplate(host(A), confirm === undefined ? env() : env({ OMP_PEERS_TEMPLATE_CONFIRM: confirm }), true);
-			expect(out).toBe(`${plan}\ntemplate web not applied: set OMP_PEERS_TEMPLATE_CONFIRM=yes or run /peers templates apply web --yes`);
+		const extras: Record<string, string>[] = [{}, { OMP_PEERS_TEMPLATE_CONFIRM: "yes" }, { OMP_PEERS_TEMPLATE_CONFIRM: "true" }];
+		for (const extra of extras) {
+			expect(await startupTemplate(host(A), env(extra))).toBe(`${plan}\ntemplate web not applied: run /peers templates apply web --yes in this session to apply it`);
 		}
 		expect(snapshot()).toBe(before);
+		expect(sessions[A].model).toBe("prov/b");
 	});
 
-	test("with confirmation on a new session it applies exactly what apply --yes does", async () => {
-		const out = await startupTemplate(host(A), env({ OMP_PEERS_TEMPLATE_CONFIRM: "yes" }), true);
-		expect(out).toStartWith(`applied template web to this session (${A})\n  model prov/a: switched prov/b -> prov/a`);
-		expect(sessions[A].model).toBe("prov/a");
-		expect(readRules(host(A)).rules.map(r => r.text)).toEqual(["Review carefully.", "Prefer small diffs"]);
-		expect(readGroups(home).groups).toEqual({ frontend: [A] });
-	});
-
-	test("a session that is not new, an unknown or invalid name and a blocked plan change nothing", async () => {
+	test("an unknown or invalid name and a blocked plan change nothing", async () => {
 		const before = snapshot();
-		const confirm = { OMP_PEERS_TEMPLATE_CONFIRM: "yes" };
-		expect(await startupTemplate(host(A), env(confirm), false)).toBe("template web not applied: this session is not new (it has messages or saved peer-session data); run /peers templates apply web --yes to apply it on purpose");
-		expect(await startupTemplate(host(A), { OMP_PEERS_TEMPLATE: "nope", ...confirm }, true)).toBe("template nope not applied: no such template; /peers templates list shows the stored ones");
-		expect(await startupTemplate(host(A), { OMP_PEERS_TEMPLATE: "../x", ...confirm }, true)).toBe("template not applied: OMP_PEERS_TEMPLATE is not a valid template name");
+		expect(await startupTemplate(host(A), { OMP_PEERS_TEMPLATE: "nope" })).toBe("template nope not applied: no such template; /peers templates list shows the stored ones");
+		expect(await startupTemplate(host(A), { OMP_PEERS_TEMPLATE: "../x" })).toBe("template not applied: OMP_PEERS_TEMPLATE is not a valid template name");
 		available.delete("prov/a");
-		const blocked = await startupTemplate(host(A), env(confirm), true);
+		const blocked = await startupTemplate(host(A), env());
 		expect(blocked).toContain(`  model prov/a: refused: ${NOT_AVAILABLE}`);
 		expect(blocked).toEndWith("template web not applied: 1 step(s) refused above; nothing was changed");
 		expect(snapshot()).toBe(before);
 		fs.writeFileSync(templatesFile(home), "{broken");
-		expect(await startupTemplate(host(A), env(confirm), true)).toStartWith("template web not applied: templates.json is not valid JSON");
+		expect(await startupTemplate(host(A), env())).toStartWith("template web not applied: templates.json is not valid JSON");
 	});
 });
 

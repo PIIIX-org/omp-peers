@@ -4,7 +4,7 @@
 
 ### Session templates
 
-- Add `/peers templates add|show|list|remove|apply|launch` (private `templates.json`, 32 templates): a template names an optional model, a role prompt, up to 8 rules and up to 8 groups. It is applied only to the session that runs `apply <name> --yes` (or a brand new session started with `OMP_PEERS_TEMPLATE` and `OMP_PEERS_TEMPLATE_CONFIRM=yes`): the model is switched only if available with credentials (never substituted), the role and rules become session-scoped rules and the groups are joined, all or nothing. `show` and `apply` without `--yes` print the same read-only plan; `launch` prints the shell line and starts nothing.
+- Add `/peers templates add|show|list|remove|apply|launch` (private `templates.json`, 32 templates): a template names an optional model, a role prompt, up to 8 rules and up to 8 groups. It is applied only to the session that runs `apply <name> --yes`: the model is switched only if available with credentials (never substituted), the role and rules become session-scoped rules and the groups are joined, all or nothing (rollback deletes a group only if this run created it). `show` and `apply` without `--yes` print the same read-only plan; `launch` prints the shell line and starts nothing. `OMP_PEERS_TEMPLATE=<name>` in a new session only shows the plan: environment variables are inherited by programs the session starts, so they never authorize an apply.
 
 ### Session groups
 

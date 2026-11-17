@@ -65,7 +65,7 @@ def run(h):
     ]), show
     before = files()
     launch = h.say(worker, "/peers templates launch web")
-    assert "nothing was started or changed" in launch and "\n  OMP_PEERS_TEMPLATE=web OMP_PEERS_TEMPLATE_CONFIRM=yes omp\n" in launch, launch
+    assert "nothing was started or changed" in launch and "\n  OMP_PEERS_TEMPLATE=web omp\n" in launch and "CONFIRM" not in launch, launch
     assert h.say(worker, "/peers templates apply web") == show
     assert files() == before and model(worker) == "first" and len(h.gateway.requests) == requests
     assert len(list(h.registry.glob("p*.json"))) == 2, "launch must not start a session"
@@ -105,20 +105,22 @@ def run(h):
     assert files() == applied_state
     print("PASS re-applying reports what is already present and changes nothing")
 
-    # A session started with only OMP_PEERS_TEMPLATE shows the plan and applies nothing.
-    unconfirmed = h.start(env={"OMP_PEERS_TEMPLATE": "web"})
-    uid = h.row(unconfirmed)["id"]
-    text = notice(unconfirmed, "template web")
-    expected = h.say(unconfirmed, "/peers templates show web").split("\n")[:-1]
-    assert text == "\n".join([*expected, "template web not applied: set OMP_PEERS_TEMPLATE_CONFIRM=yes or run /peers templates apply web --yes"]), text
-    assert "  group frontend: join" in text and f"({uid})" in text
-    assert files() == applied_state and model(unconfirmed) == "first"
-    assert injected(h.ask(unconfirmed, ASK)) is None
-    print("PASS OMP_PEERS_TEMPLATE alone only shows the plan: no rules, groups or model change")
+    # A session started with OMP_PEERS_TEMPLATE shows the plan and applies nothing, and a stray OMP_PEERS_TEMPLATE_CONFIRM=yes
+    # does not change that: the environment is inherited by everything a session starts, so it carries no authorization.
+    for extra in ({}, {"OMP_PEERS_TEMPLATE_CONFIRM": "yes"}):
+        started = h.start(env={"OMP_PEERS_TEMPLATE": "web", **extra})
+        sid = h.row(started)["id"]
+        text = notice(started, "template web")
+        expected = h.say(started, "/peers templates show web").split("\n")[:-1]
+        assert text == "\n".join([*expected, "template web not applied: run /peers templates apply web --yes in this session to apply it"]), text
+        assert "  group frontend: join" in text and f"({sid})" in text
+        assert files() == applied_state and model(started) == "first"
+        assert injected(h.ask(started, ASK)) is None
+    print("PASS OMP_PEERS_TEMPLATE only shows the plan, with or without OMP_PEERS_TEMPLATE_CONFIRM: no rules, groups or model change")
 
-    confirmed = h.start(env={"OMP_PEERS_TEMPLATE": "web", "OMP_PEERS_TEMPLATE_CONFIRM": "yes"})
-    cid = h.row(confirmed)["id"]
-    text = notice(confirmed, "applied template web")
+    # Applying in that session is the explicit step.
+    cid = h.row(started)["id"]
+    text = h.say(started, "/peers templates apply web --yes")
     assert text == "\n".join([
         f"applied template web to this session ({cid})",
         "  model smoke/second: switched smoke/first -> smoke/second",
@@ -127,23 +129,10 @@ def run(h):
         "  group frontend: joined",
         TAIL,
     ]), text
-    assert model(confirmed) == "second"
-    assert injected(h.ask(confirmed, ASK)) == ["- [r3 session] Review carefully.", "- [r4 session] Prefer small diffs"]
+    assert model(started) == "second"
+    assert injected(h.ask(started, ASK)) == ["- [r3 session] Review carefully.", "- [r4 session] Prefer small diffs"]
     assert json.loads((h.state / "groups.json").read_text())["groups"] == {"frontend": sorted([wid, cid])}
-    print("PASS OMP_PEERS_TEMPLATE with OMP_PEERS_TEMPLATE_CONFIRM=yes applies to the brand new session only")
-
-    # A session that already has messages is never changed by the environment.
-    used = h.start()
-    h.ask(used, ASK)
-    session_file = used.call("get_state")["sessionFile"]
-    used.close()
-    snapshot = files()
-    resumed = h.start(resume=session_file, env={"OMP_PEERS_TEMPLATE": "web", "OMP_PEERS_TEMPLATE_CONFIRM": "yes"})
-    text = notice(resumed, "template web not applied")
-    assert text == ("template web not applied: this session is not new (it has messages or saved peer-session data); "
-                    "run /peers templates apply web --yes to apply it on purpose"), text
-    assert files() == snapshot and model(resumed) == "first"
-    print("PASS a resumed session with messages is not changed by the environment")
+    print("PASS the user's own apply --yes in the new session then applies it")
 
     # The model disappears from the available set: nothing is applied, nothing substituted.
     models.write_text(first_only)
@@ -158,7 +147,7 @@ def run(h):
     assert "added r" not in refused and "joined" not in refused
     assert files() == snapshot and model(bare) == "first" and len(h.gateway.requests) == requests
     assert injected(h.ask(bare, ASK)) is None
-    envbare = h.start(env={"OMP_PEERS_TEMPLATE": "web", "OMP_PEERS_TEMPLATE_CONFIRM": "yes"})
+    envbare = h.start(env={"OMP_PEERS_TEMPLATE": "web"})
     text = notice(envbare, "template web not applied")
     assert text.endswith("template web not applied: 1 step(s) refused above; nothing was changed"), text
     assert files() == snapshot and model(envbare) == "first"

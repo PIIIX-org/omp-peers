@@ -17,7 +17,7 @@ A template is applied by the session it changes, after you ask for it. An intera
 
 - `add` takes options after the name. A value runs until the next of the exact words `--model`, `--prompt`, `--rule`, `--group`, so a role prompt or rule may contain spaces (and other `--words`), but not those four. `--model` and `--prompt` may appear once; `--rule` and `--group` repeat. Whitespace is collapsed to single spaces and one pair of surrounding quotes is removed (the same normalisation as `/peers rules add`). A template must set at least one field. Adding an existing name is an error; `remove` it first (there is no silent overwrite).
 - `show`, `list` and `launch` never write: the templates, rules and groups files and the session's model are unchanged. `apply` without `--yes` is identical to `show`.
-- No LLM tool exposes templates. Only a user command, or the environment of a new session (below), applies one.
+- No LLM tool exposes templates. Only the user command `apply <name> --yes` applies one; nothing in the environment can.
 
 ## Fields and limits
 
@@ -86,22 +86,21 @@ Every step is validated before any change. If any step is refused, nothing is ap
 
 A `warning:` line is printed (the template still applies) when the rules' 8192-byte injection cap would leave some of this session's active rules out of the injected text.
 
-If a step fails after the plan was made, because another process changed the state in between, the run stops and undoes what it changed: the rules it added, the memberships it created (and a group it created), and the model. The message says `every earlier step was rolled back` or lists what could not be undone.
+If a step fails after the plan was made, because another process changed the state in between, the run stops and undoes what it changed: the rules it added, the memberships it added, a group only if this run created it (an existing group, even an empty one, is joined and never deleted), and the model. The message says `every earlier step was rolled back` or lists what could not be undone.
 
 ## New sessions from the environment
 
 ```text
-OMP_PEERS_TEMPLATE=<name> OMP_PEERS_TEMPLATE_CONFIRM=yes omp
+OMP_PEERS_TEMPLATE=<name> omp
 ```
 
-`launch <name>` prints this line. It runs nothing; you run it yourself in a new terminal. At session start the extension reads `OMP_PEERS_TEMPLATE` and then:
+`launch <name>` prints this line. It runs nothing; you run it yourself in a new terminal. At session start the extension reads `OMP_PEERS_TEMPLATE` and shows the same plan as `show <name>` for that session, ending in `template <name> not applied: run /peers templates apply <name> --yes in this session to apply it`. **It never applies anything**: an environment variable is inherited by every program the session starts (a shell command in its bash tool, another omp), so it cannot carry the user's authorization. Applying is always your own `/peers templates apply <name> --yes` in the session. A leftover `OMP_PEERS_TEMPLATE_CONFIRM` is ignored.
 
-- the session must be brand new: it has no messages and no saved peer-session data for its stable ID. A resumed or continued session is never changed this way and shows `template <name> not applied: this session is not new ...`;
-- without `OMP_PEERS_TEMPLATE_CONFIRM=yes` (exactly `yes`) it only shows the plan and `template <name> not applied: set OMP_PEERS_TEMPLATE_CONFIRM=yes or run /peers templates apply <name> --yes`;
-- with it, the same checks as `apply --yes` run, and the result (applied or refused, nothing changed) is shown as a notification;
-- an unknown name, an invalid name or an unreadable `templates.json` is reported and nothing changes. A session whose identity is held by another process (single-writer refusal) is not changed.
+- an unknown name, an invalid name or an unreadable `templates.json` is reported and nothing changes; a plan with a refused step says `nothing was changed`. A session whose identity is held by another process (single-writer refusal) shows no plan;
+- a resumed session shows the plan too: the variable cannot tell whether the session is new, and showing is harmless;
+- a program started from that session inherits the variable and shows its own plan the same way, and changes nothing.
 
-A new session starts with no rules or groups of its own, so each rule is added and each group joined. `launch` shows the configuration, not a per-session plan, and availability is checked again in the new session. The variables only matter at session start; they do not affect a session created later in the same process (`/new`).
+`launch` shows the configuration, not a per-session plan, and availability is checked again in the session. The variable is read only at session start.
 
 ## Identity
 
