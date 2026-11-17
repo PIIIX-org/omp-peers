@@ -2,6 +2,7 @@
 // Copyright (c) 2026 PIIIX-org contributors
 
 import type { Skipped } from "../identity";
+import type { UsageSource } from "./usage";
 
 /** A live logical peer session as features see it. */
 export interface PeerView {
@@ -12,6 +13,8 @@ export interface PeerView {
 	acceptsRemote?: boolean;
 	/** Whether the peer refuses all inbound requests (published state); undefined when unknown. A control lock alone is not a refusal: messages still arrive. */
 	refusesInbound?: boolean;
+	/** The `usage` value the peer published in its registry row, unvalidated (undefined when it published none); only the usage feature interprets it. */
+	usage?: unknown;
 	/** Published busy state (a turn is running); undefined when unknown. */
 	busy?: boolean;
 	/** Published context usage text such as `1234 (56%)`; empty or undefined when the peer has no figure. */
@@ -88,4 +91,6 @@ export interface FeatureHost {
 	resolveModel(selector: string): Promise<ModelCheck>;
 	/** Switch this session to `selector` after the same checks as `resolveModel`; the thinking level is kept. No substitution on failure. */
 	applyModel(selector: string): Promise<ModelApply>;
+	/** This session's usage counters as the host reports them now: numeric aggregates only. Undefined when the host provides none. Read-only; never starts a request. */
+	usageNow(): UsageSource | undefined;
 }

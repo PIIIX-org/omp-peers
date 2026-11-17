@@ -17,6 +17,7 @@ const host: FeatureHost = {
 	acceptsRemote: () => true,
 	peers: async () => [{ id: self, name: `child-${tag}` }],
 	groupsOf: peerId => groupsOf(home, peerId),
+	usageNow: () => undefined,
 	notify: () => {},
 	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async () => ({ status: "offline" }),
