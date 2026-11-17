@@ -12,6 +12,7 @@ import { inbox } from "./inbox";
 import { locks } from "./locks";
 import { pause, resume } from "./pause";
 import { rules } from "./rules";
+import { templates } from "./templates";
 
 /** An LLM tool a feature contributes. The extension registers it; the feature never imports host runtime values. */
 export interface ToolSpec {
@@ -38,4 +39,4 @@ export interface Feature {
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, autocompact];
+export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, autocompact];

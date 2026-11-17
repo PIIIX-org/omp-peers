@@ -31,6 +31,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 		peers: async () => PEERS,
 		groupsOf: peerId => groups[peerId] ?? [],
 		resolveGroup: async () => ({ recipients: [], skipped: [] }), // not exercised by this suite
+		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }), applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		send: async () => ({ status: "offline" }),
 	};
 }
