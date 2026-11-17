@@ -94,15 +94,50 @@ const CONFUSABLES: Record<string, string> = {
 	"α": "a", "ε": "e", "ο": "o", "ρ": "p", "ι": "i", "ν": "v", "υ": "u", "κ": "k", "τ": "t", "η": "n", "χ": "x", "β": "b", "ɡ": "g", "ӏ": "l",
 };
 const RESERVED_PHRASES = [DELIVERY_PREFIX, "event work dispatch", "authorized by the user"];
-/** Lower-case, strip accents, fold look-alikes and keep only letters, digits and `[`: spacing, punctuation and zero-width tricks vanish. */
-const fold = (text: string): string =>
+/** Lower-case, strip accents, fold look-alikes and drop everything but letters and digits: spacing, punctuation and zero-width tricks vanish. */
+const foldAll = (text: string): string =>
 	[...text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()].map(char => CONFUSABLES[char] ?? char).join("").replace(/[^a-z0-9[]/g, "");
-const FOLDED_RESERVED = RESERVED_PHRASES.map(fold);
+/** Same, without the opening bracket: brackets inside a phrase must not break its match. */
+const foldPlain = (text: string): string => foldAll(text).replace(/\[/g, "");
+// The delivery prefix keeps its `[` (plain "external event" is ordinary text); the other phrases ignore brackets altogether.
+const FOLDED_RESERVED: Array<[string, boolean]> = RESERVED_PHRASES.map((phrase, index) => [index === 0 ? foldAll(phrase) : foldPlain(phrase), index === 0]);
 /** Whether `text` contains a phrase the plugin's own frames start with or use to claim authority; such text is never accepted as event content. */
 const containsReserved = (text: string): boolean => {
-	const folded = fold(text);
-	return FOLDED_RESERVED.some(phrase => folded.includes(phrase));
+	const all = foldAll(text);
+	const plain = foldPlain(text);
+	return FOLDED_RESERVED.some(([phrase, bracketed]) => (bracketed ? all : plain).includes(phrase));
 };
+
+/**
+ * Render markdown and HTML structure as plain text, so event content can neither hide a reserved phrase behind link
+ * syntax nor reach the receiving model as a clickable link, image, code fence or emphasis: `[text](url)` and
+ * `[text][ref]` become `text`, HTML tags and comments vanish, backslash escapes are resolved, and backticks, `*`, `~` and
+ * emphasis underscores at word edges are removed (snake_case words keep theirs). Repeated until stable, so nested
+ * constructs cannot reassemble; applying it to its own output changes nothing.
+ */
+export function neutralize(text: string): string {
+	let current = text;
+	for (let round = 0; round < 10; round++) {
+		const next = current
+			.replace(/<[^>\n]*>/g, "")
+			.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+			.replace(/\[([^\]]*)\]\[[^\]]*\]/g, "$1")
+			.replace(/\\([!-/:-@[-`{-~])/g, "$1")
+			.replace(/[`*~]/g, "")
+			.replace(/(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])/g, "")
+			.replace(/\s+/g, " ")
+			.trim();
+		if (next === current) return next;
+		current = next;
+	}
+	return current;
+}
+
+/** The text the receiving session sees for one content string: control characters and ANSI gone, markdown neutralised. */
+const content = (raw: string): string => neutralize(cleanText(raw));
+
+/** A reserved phrase in `text` as written or once markdown is rendered as plain text. */
+export const hasReserved = (text: string): boolean => containsReserved(text) || containsReserved(neutralize(text));
 
 // ---- Strict generic validation -----------------------------------------------------------------
 
@@ -118,10 +153,11 @@ export function validateGeneric(value: unknown): Parsed {
 	if (typeof id !== "string" || !ID_RE.test(id)) return reject("bad id");
 	if (typeof type !== "string" || !TYPE_RE.test(type)) return reject("bad type");
 	if (looksLikeSecret(id) || looksLikeSecret(type)) return reject("secret-like id or type");
+	if (hasReserved(id) || hasReserved(type)) return reject("reserved text");
 	if (typeof summary !== "string" || !summary || Buffer.byteLength(summary) > MAX_SUMMARY_BYTES) return reject("bad summary");
-	const cleanSummary = cleanText(summary);
+	if (hasReserved(cleanText(summary))) return reject("reserved text");
+	const cleanSummary = content(summary);
 	if (!cleanSummary) return reject("bad summary");
-	if (containsReserved(cleanSummary)) return reject("reserved text");
 	const out: Record<string, FieldValue> = {};
 	if (fields !== undefined) {
 		if (!isPlain(fields)) return reject("bad fields");
@@ -129,11 +165,12 @@ export function validateGeneric(value: unknown): Parsed {
 		if (entries.length > MAX_FIELDS) return reject("bad fields");
 		for (const [key, raw] of entries) {
 			if (!KEY_RE.test(key)) return reject("bad fields");
+			if (hasReserved(key)) return reject("reserved text");
 			if (typeof raw === "string") {
 				if (!raw || Buffer.byteLength(raw) > MAX_FIELD_VALUE_BYTES) return reject("bad fields");
-				const clean = cleanText(raw);
+				if (hasReserved(cleanText(raw))) return reject("reserved text");
+				const clean = content(raw);
 				if (!clean) return reject("bad fields");
-				if (containsReserved(clean)) return reject("reserved text");
 				out[key] = looksLikeSecret(clean) || looksLikeSecret(`${key}=${clean}`) || looksLikeSecret(`${key}: ${clean}`) ? WITHHELD : clean;
 			} else if (typeof raw === "boolean" || (typeof raw === "number" && Number.isFinite(raw))) {
 				out[key] = raw;
@@ -160,19 +197,24 @@ const pick = (...values: unknown[]): unknown => values.find(value => value !== u
 
 /** Payload shape -> GitHub event name, in priority order. The type comes from the SIGNED body, never from a header. */
 const GITHUB_KINDS: Array<[(body: Record<string, unknown>) => boolean, string]> = [
+	// Most specific first: a payload often carries the objects of the more general kinds (a deployment_status holds a
+	// deployment and often a workflow_run; a review thread holds a pull_request).
+	[b => isPlain(b.workflow_run) && Array.isArray(b.reviewers), "deployment_review"],
+	[b => isPlain(b.deployment_status), "deployment_status"],
+	[b => isPlain(b.deployment), "deployment"],
+	[b => isPlain(b.pull_request) && isPlain(b.thread), "pull_request_review_thread"],
 	[b => isPlain(b.pull_request) && isPlain(b.review), "pull_request_review"],
 	[b => isPlain(b.pull_request) && isPlain(b.comment), "pull_request_review_comment"],
 	[b => isPlain(b.pull_request), "pull_request"],
 	[b => isPlain(b.issue) && isPlain(b.comment), "issue_comment"],
 	[b => isPlain(b.issue), "issues"],
+	[b => isPlain(b.discussion) && isPlain(b.comment), "discussion_comment"],
+	[b => isPlain(b.discussion), "discussion"],
 	[b => isPlain(b.workflow_run), "workflow_run"],
 	[b => isPlain(b.workflow_job), "workflow_job"],
 	[b => isPlain(b.check_run), "check_run"],
 	[b => isPlain(b.check_suite), "check_suite"],
 	[b => isPlain(b.release), "release"],
-	[b => isPlain(b.deployment_status), "deployment_status"],
-	[b => isPlain(b.deployment), "deployment"],
-	[b => isPlain(b.discussion), "discussion"],
 	[b => typeof b.ref === "string" && Array.isArray(b.commits) && isPlain(b.pusher), "push"],
 	[b => typeof b.zen === "string" && b.hook_id !== undefined, "ping"],
 ];

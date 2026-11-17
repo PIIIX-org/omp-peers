@@ -34,6 +34,7 @@ import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInp
 import type { FeatureHost, ModelApply, ModelCheck, SendResult } from "../lib/features/host";
 import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
 import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
+import { frameFor as eventFrameFor, GUARD_CANCELLED, readEnvelope, type EventEnvelope } from "../lib/features/events-wire";
 import { startupTemplate } from "../lib/features/templates";
 import { usageForRegistry, type PublishedUsage, type UsageSource } from "../lib/features/usage";
 
@@ -175,6 +176,8 @@ interface Req {
 	request?: string;
 	/** Set by the dependency dispatcher: the receiver refuses this message while its control is locked. */
 	dependency?: boolean;
+	/** Set by the events feature: the structured delivery the receiver renders itself. Honoured only with `dependency` from the master; stripped otherwise. */
+	event?: unknown;
 	/** Set by a sender whose report came from a subagent, not its main session; never feeds report-driven features. */
 	subagent?: boolean;
 }
@@ -615,6 +618,16 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 				return { ok: false, error: `invalid message/report: ${(error as Error).message}` };
 			}
 			const from = req.from ?? { id: "?", name: "unknown" };
+			// An external-event delivery is rendered HERE from its structured field, so the authority wording ("authorized by the
+			// user", the untrusted-data notice) is this receiver's, never event content. The field is honoured only together with the
+			// flags the events feature sets (dependency, from the master); on any other message it is ignored and the message is
+			// shown as the ordinary peer message it is.
+			let eventFrame: string | undefined;
+			if (req.event !== undefined && req.dependency === true && !!req.from?.id && masterId() === req.from.id) {
+				const envelope = readEnvelope(req.event);
+				if (!envelope) return { ok: false, error: "invalid event envelope" };
+				eventFrame = eventFrameFor(envelope);
+			}
 			// Dependency deliveries are authorized work: the receiver's own control lock applies, whatever the sender saw earlier.
 			if (req.dependency === true && !state.control) return { ok: false, error: "peer is locked (control refused)" };
 			if (!rateOk(from.id)) return { ok: false, error: "rate limited" };
@@ -633,7 +646,9 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 				{
 					customType: "peer-message",
 					content:
-						`[Message from peer session "${from.name}" (${from.id}) — not from the user]\n${text}\n\n` +
+						(eventFrame === undefined
+							? `[Message from peer session "${from.name}" (${from.id}) — not from the user]\n${text}\n\n`
+							: `[External event relayed by the master session "${from.name}" (${from.id}) — not from the user]\n${eventFrame}\n\n`) +
 						`(Reply with the peers_send tool only if this needs an answer or action; do not acknowledge for its own sake.)`,
 					display: true,
 					attribution: "agent",
@@ -916,7 +931,7 @@ export default function peers(pi: ExtensionAPI) {
 	// Track the session's current task tier from the prompt it is about to work on (the master's explicit tier wins).
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind !== "main" || event.reason === "revive" || !event.prompt) return;
-		if (event.prompt.startsWith("[Message from peer session")) return;
+		if (event.prompt.startsWith("[Message from peer session") || event.prompt.startsWith("[External event relayed by")) return;
 		state.tier = state.forcedTier ?? classify(event.prompt).tier;
 		state.forcedTier = undefined;
 	});
@@ -938,7 +953,7 @@ export default function peers(pi: ExtensionAPI) {
 				const { peers, error, skipped } = await resolveTargets(`group:${name}`, op);
 				return { recipients: peers.map(p => ({ id: logicalId(p), name: p.name })), skipped: skipped ?? [], error };
 			},
-			send: (to, req) => sendTo(to, req.text, req.dependency === true),
+			send: (to, req) => sendTo(to, req.text, req.dependency === true, req.event, req.guard),
 			acceptsRemote: () => state.inbound === "accept" && state.control,
 			usageNow: () => usageSourceOf(ctx),
 			resolveModel: async selector => (await checkModel(pi, ctx, selector)).check,
@@ -1059,7 +1074,7 @@ export default function peers(pi: ExtensionAPI) {
 	}
 
 	/** One message to one live session by stable id, through the same resolution and socket path as fanout(). */
-	async function sendTo(to: string, text: string, dependency = false): Promise<SendResult> {
+	async function sendTo(to: string, text: string, dependency = false, event?: EventEnvelope, guard?: () => boolean): Promise<SendResult> {
 		if (!state.sessionLock?.acquired) return { status: "failed", reason: state.identityError || "session identity unavailable" };
 		let message: ReturnType<typeof readMessage>;
 		try {
@@ -1070,7 +1085,9 @@ export default function peers(pi: ExtensionAPI) {
 		if (!(await listPeers()).some(p => p.id === to)) return { status: "offline" };
 		const { peers: targets, error } = await resolveTargets(to, "message");
 		if (error || targets.length !== 1 || targets[0].id !== to) return { status: "failed", reason: error ?? "target is ambiguous" };
-		const response = await call(targets[0], { op: "message", text: message.text, from: senderInfo(), ...(dependency ? { dependency: true } : {}) });
+		// The guard runs after every await above (peer list, target resolution) and right before the call: authorization is rechecked at the last moment.
+		if (guard && !guard()) return { status: "failed", reason: GUARD_CANCELLED };
+		const response = await call(targets[0], { op: "message", text: message.text, from: senderInfo(), ...(dependency ? { dependency: true } : {}), ...(event ? { event } : {}) });
 		return response.ok ? { status: "delivered" } : { status: "failed", reason: String(response.error) };
 	}
 

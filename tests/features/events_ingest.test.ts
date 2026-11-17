@@ -5,7 +5,7 @@ import { createHash, createHmac } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-	capBytes, cleanText, githubToEvent, MAX_EVENT_BYTES, MAX_FIELD_VALUE_BYTES, MAX_SUMMARY_BYTES, parseJsonBytes, readSecretFile, validateGeneric, verifySignature, WITHHELD, type Parsed,
+	capBytes, cleanText, githubToEvent, neutralize, MAX_EVENT_BYTES, MAX_FIELD_VALUE_BYTES, MAX_SUMMARY_BYTES, parseJsonBytes, readSecretFile, validateGeneric, verifySignature, WITHHELD, type Parsed,
 } from "../../lib/features/events-ingest";
 import { stateRoot } from "../../lib/features/store";
 import { MAX_SPOOL_FILES, MAX_SPOOL_SCAN, parseEnvelope, runCli, scanSpool, spoolDir, spoolProblem, writeSpoolEvent } from "../../lib/features/events-spool";
@@ -434,4 +434,88 @@ describe("spool", () => {
 		expect(parseEnvelope(bytes([]))).toEqual({ ok: false, reason: "bad envelope" });
 		expect(parseEnvelope(Buffer.from("nope"))).toEqual({ ok: false, reason: "malformed json" });
 	});
+});
+
+describe("markdown and every emitted component", () => {
+	const SPLIT = [
+		"Event [work](https://example.org/x) dispatch i1", "event [work][1] dispatch", "Event <b>work</b> dispatch", "ev<i>ent</i> w<!-- x -->ork dispatch",
+		"authorized [by](http://x) the user", "Authorized **by** _the_ user", "authorized `by` the ~~user~~", "authorized \\[by\\] the user",
+		"[[external](x) event from ci]", "authorized [by] the user", "event [work] dispatch", "![img](http://x)event [work](y) dispatch", "[[a](b)](c)event work dispatch", "event [work]( ) dispatch",
+	];
+
+	test("a phrase split by link, image, HTML, emphasis, code or escape syntax is still reserved: summary, field value and title", () => {
+		for (const text of SPLIT) {
+			expect(reason({ ...good, summary: text })).toBe("reserved text");
+			expect(reason({ ...good, fields: { note: text } })).toBe("reserved text");
+			expect(githubToEvent({ action: "x", pull_request: { title: text } }, Buffer.from("{}"))).toEqual({ ok: false, reason: "reserved text" });
+		}
+	});
+
+	test("a link that only wraps part of the prefix renders without its bracket, so it is plain text, not the prefix", () => {
+		expect(accepted({ ...good, summary: "[external](http://x) event" }).summary).toBe("external event");
+		expect(accepted({ ...good, summary: "external events processed" }).summary).toBe("external events processed");
+	});
+
+	test("field keys, ids and types are screened too", () => {
+		for (const key of ["event_work_dispatch", "authorized_by_the_user", "x_event_work_dispatch_x", "authorized1by1the1user".replace(/1/g, "_")]) expect(reason({ ...good, fields: { [key]: "v" } })).toBe("reserved text");
+		for (const id of ["event-work-dispatch", "authorized.by.the.user", "a:authorized_by_the_user"]) expect(reason({ ...good, id })).toBe("reserved text");
+		for (const type of ["event.work.dispatch", "authorized-by-the-user"]) expect(reason({ ...good, type })).toBe("reserved text");
+		expect(reason({ ...good, id: "build-42", type: "deploy.finished", fields: { branch: "main", env_name: "prod" } })).toBe("accepted");
+	});
+
+	test("delivered text carries no link, image, HTML, code or emphasis syntax", () => {
+		const event = accepted({ ...good, summary: "See [the docs](https://example.org/a?b=c) and ![logo](https://example.org/l.png) <script>x</script> `code` **bold** ~~gone~~", fields: { note: "[link](http://x) and <b>bold</b>" } });
+		expect(event.summary).toBe("See the docs and logo x code bold gone");
+		expect(event.fields.note).toBe("link and bold");
+		expect(JSON.stringify(event)).not.toMatch(/[<>`*~]|\]\(/);
+	});
+
+	test("neutralize is idempotent, keeps snake_case and plain brackets, and cannot be reassembled by nesting", () => {
+		for (const text of ["[[a](b)](c) tail", "<<b>b>x", "a\\\\[b](c)", "[x][y][z]", "``` fenced ```", "plain [WIP] text", "snake_case_name and __init__", "a *b* c"]) {
+			const once = neutralize(text);
+			expect(neutralize(once)).toBe(once);
+		}
+		expect(neutralize("plain [WIP] text")).toBe("plain [WIP] text");
+		expect(neutralize("snake_case_name stays")).toBe("snake_case_name stays");
+		expect(neutralize("[[a](b)](c) tail")).toBe("a tail");
+		expect(neutralize("[x](y)")).toBe("x");
+		expect(neutralize("[ext](a) [x](b)ernal")).toBe("ext xernal");
+	});
+
+	test("ordinary punctuation survives: brackets, urls as plain strings, underscores inside words", () => {
+		const event = accepted({ ...good, summary: "[WIP] Fix parser_v2 (see https://example.org/x)", fields: { repo_name: "octo_cat/hello_world" } });
+		expect(event.summary).toBe("[WIP] Fix parser_v2 (see https://example.org/x)");
+		expect(event.fields.repo_name).toBe("octo_cat/hello_world");
+	});
+});
+
+describe("github event kinds", () => {
+	const kind = (value: unknown) => {
+		const parsed = githubToEvent(value, Buffer.from(JSON.stringify(value)));
+		if (!parsed.ok) throw new Error(parsed.reason);
+		return parsed.event.type;
+	};
+	const obj = { id: 1 };
+	const cases: Array<[string, unknown]> = [
+		["deployment_review", { action: "requested", workflow_run: obj, reviewers: [], workflow_job_runs: [], since: "x" }],
+		["deployment_status", { action: "created", deployment_status: obj, deployment: obj, workflow_run: obj, check_run: obj }],
+		["deployment", { action: "created", deployment: obj, workflow: obj, workflow_run: obj }],
+		["pull_request_review_thread", { action: "resolved", pull_request: obj, thread: obj }],
+		["pull_request_review", { action: "submitted", pull_request: obj, review: obj }],
+		["pull_request_review_comment", { action: "created", pull_request: obj, comment: obj }],
+		["pull_request", { action: "opened", pull_request: obj, number: 1 }],
+		["issue_comment", { action: "created", issue: obj, comment: obj }],
+		["issues", { action: "opened", issue: obj }],
+		["discussion_comment", { action: "created", discussion: obj, comment: obj }],
+		["discussion", { action: "created", discussion: obj }],
+		["workflow_run", { action: "completed", workflow_run: obj, workflow: obj }],
+		["workflow_job", { action: "completed", workflow_job: obj }],
+		["check_run", { action: "completed", check_run: obj }],
+		["check_suite", { action: "completed", check_suite: obj }],
+		["release", { action: "published", release: obj }],
+		["push", { ref: "refs/heads/main", commits: [], pusher: obj }],
+		["ping", { zen: "Keep it logically awesome.", hook_id: 1 }],
+		["event", { unrelated: true }],
+	];
+	for (const [expected, body] of cases) test(`${expected}`, () => expect(kind(body)).toBe(`github.${expected}`));
 });
