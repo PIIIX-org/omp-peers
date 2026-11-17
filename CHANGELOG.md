@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Test infrastructure
+
+- The feature-scenario runner prints `START scenario X` and `PASS scenario X in N.Ns` unbuffered and enforces a per-scenario timeout (default 240 s, `FEATURES_SMOKE_SCENARIO_TIMEOUT` seconds) that names the scenario on expiry; CI has step-level timeouts. The watchdog scenario waits for the delivery outcome as well as the emitted alert (they are recorded by two separate state updates).
+
 ### Dashboard
 
 - Add `/peers dashboard [--group <name>] [--stale-after <seconds>] [--panels sessions,groups,locks,tasks,decisions] [--once]`: a read-only terminal view of sessions (busy, context, jobs, quiescence, inbound and control state, pause, error turns, registry age), groups, locks, the task board and open decisions. In the TUI it is an overlay (`q`/`Esc` close, `Tab`/`Shift-Tab` panels, `r` refresh, `g` group filter, `?` help, arrow and page keys scroll) that refreshes every 5 s from a timer cleared on close; with `--once`, in RPC or print mode it returns the same panels as one text snapshot. It is read-only by construction (a five-member host view and only state readers, never a sender or writer): opening or refreshing never wakes or controls a session, and tests compare the bytes and mtimes of every state file. Missing values are `unknown`, registry rows older than `--stale-after` (default 60 s) are `[stale]`, every field is stripped of terminal escapes, screened for credentials (`(withheld)`) and capped, and transcripts, message bodies, sockets and process ids are never read or shown. There is no web view, no server and no listening socket. Adds optional `cwd`, `activeJobs`, `activeSubagents` and `isSettled` to the feature host's `PeerView`.

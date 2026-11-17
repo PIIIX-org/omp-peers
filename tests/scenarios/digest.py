@@ -180,7 +180,8 @@ def run(h):
     out = h.say(master, f"/peers digest set at 00:{target.minute:02d}")
     assert "the schedule applies from the next slot; no digest is produced now" in out, out
     assert [e["kind"] for e in stored()["history"]] == ["manual", "manual"]
-    wait_for(lambda: [e for e in stored()["history"] if e["kind"] != "manual"], seconds=int((target - datetime.datetime.now(datetime.timezone.utc)).total_seconds()) + 60)
+    # The slot claim writes the history entry first; its delivery text and `pending` are written by a second update after rendering.
+    wait_for(lambda: [e for e in stored()["history"] if e["kind"] != "manual" and e["delivery"] == "queued for the master's next agent start" and stored().get("pending") == e["id"]], seconds=int((target - datetime.datetime.now(datetime.timezone.utc)).total_seconds()) + 60)
     scheduled = [e for e in stored()["history"] if e["kind"] != "manual"]
     assert [(e["kind"], e["slot"], e["delivery"]) for e in scheduled] == [("scheduled", slot, "queued for the master's next agent start")], scheduled
     assert stored()["last"]["slot"] == slot and stored()["pending"] == scheduled[0]["id"]
