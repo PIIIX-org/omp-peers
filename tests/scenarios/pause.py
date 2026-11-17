@@ -9,7 +9,8 @@ import time
 from smoke import wait_for
 
 NOT_DELIVERED = "not delivered: worker-b is paused; resend after its user resumes it"
-NO_REMOTE_RESUME = "resume is only available as /peers resume in the paused session itself"
+NOT_MASTER = "sender is not the master session"
+USER_PAUSED = "paused by its user: only that user can resume it with /peers resume"
 
 
 def rpc(row, request):
@@ -79,15 +80,18 @@ def run(h):
     assert_not_woken(h, worker, start, requests)
     print("PASS master message and prompt, a raw watcher-style message and an unknown op are refused; the worker received nothing")
 
-    for claimed in ({"id": "completion-watcher", "name": "Completion watcher"}, {"id": h.row(master)["id"], "name": "master"}, None):
+    for claimed in ({"id": "completion-watcher", "name": "Completion watcher"}, None):
         attempt = rpc(row, {"op": "resume", **({"from": claimed} if claimed else {})})
-        assert attempt == {"ok": False, "error": NO_REMOTE_RESUME}, (claimed, attempt)
+        assert attempt == {"ok": False, "error": NOT_MASTER}, (claimed, attempt)
+    master_attempt = rpc(row, {"op": "resume", "from": {"id": h.row(master)["id"], "name": "master"}})
+    assert master_attempt == {"ok": False, "error": USER_PAUSED}, master_attempt
     assert rpc(row, {"op": "status"})["info"]["paused"] is True
     h.say(worker, "/peers lock")
-    assert h.say(master, f"/peers do {wid} resume") == f"worker-b ({wid}): failed: {NO_REMOTE_RESUME}"
+    assert h.say(master, f"/peers do {wid} resume") == f"worker-b ({wid}): failed: peer is locked (control refused)"
     h.say(worker, "/peers unlock")
+    assert h.say(master, f"/peers do {wid} resume") == f"worker-b ({wid}): failed: {USER_PAUSED}"
     assert h.row(worker)["paused"] is True
-    print("PASS no remote caller, including the master, can resume: forged, master-claimed, unauthenticated and locked attempts leave it paused")
+    print("PASS a user's pause is not cleared by anyone else: forged, unauthenticated, master-claimed and locked attempts leave it paused")
 
     session_file = worker.call("get_state")["sessionFile"]
     worker.close()
@@ -104,13 +108,17 @@ def run(h):
     assert wid not in json.loads((h.state / "pause.json").read_text())["sessions"]
     assert h.say(master, f"/peers do {wid} pause second window") == f"worker-b ({wid}): ok (paused)"
     wait_for(lambda: h.row(worker)["paused"] is True)
+    assert h.say(master, f"/peers do {wid} resume") == f"worker-b ({wid}): ok (resumed)"
+    wait_for(lambda: h.row(worker)["paused"] is False)
+    assert h.say(worker, "/peers pause third window").startswith(f"paused worker-b ({wid})")
+    wait_for(lambda: h.row(worker)["paused"] is True)
     remote = h.say(master, f"/peers do {wid} resume")
-    assert remote == f"worker-b ({wid}): failed: {NO_REMOTE_RESUME}", remote
+    assert remote == f"worker-b ({wid}): failed: {USER_PAUSED}", remote
     assert h.row(worker)["paused"] is True
     assert h.say(worker, "/peers resume").startswith(f"resumed worker-b ({wid})")
     wait_for(lambda: h.row(worker)["paused"] is False)
     assert h.say(worker, "/peers resume").endswith("is not paused")
-    print("PASS the master can pause another session but only its own user resumes it; a second /peers resume says it is not paused")
+    print("PASS the master clears its own pause but not the user's; a second /peers resume says it is not paused")
 
     requests = len(h.gateway.requests)
     start = len(worker.frames)

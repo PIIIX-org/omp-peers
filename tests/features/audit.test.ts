@@ -261,6 +261,9 @@ describe("content policy", () => {
 			[{ ok: false, error: "peer is locked (control refused)" }, "refused", "locked"],
 			[{ ok: false, error: "sender is not the master session" }, "refused", "not-master"],
 			[{ ok: false, error: "peer refuses inbound requests" }, "refused", "inbound-refused"],
+			[{ ok: false, error: "paused by its user: only that user can resume it with /peers resume" }, "refused", "not-resumable"],
+			[{ ok: false, error: "paused after a restart because it was idle: only its user can resume it" }, "refused", "not-resumable"],
+			[{ ok: false, error: "resume is not available to subagents" }, "refused", "not-master"],
 			[{ ok: false, error: 'setting "auth.x" is protected and cannot be changed remotely' }, "refused", "protected-setting"],
 			[{ ok: false, status: "refused", paused: true, error: "session is paused" }, "refused", "paused"],
 			[{ ok: false, status: "deferred", paused: true, error: "session is paused" }, "refused", "paused"],
@@ -286,6 +289,7 @@ describe("content policy", () => {
 		expect(classifyResponse("shutdown", { ok: true })).toEqual({ outcome: "deferred" });
 		expect(classifyResponse("abort", { ok: true })).toEqual({ outcome: "ok" });
 		expect(classifyResponse("pause", { ok: true, paused: true, pausedSince: "x" })).toEqual({ outcome: "ok" });
+		expect(classifyResponse("resume", { ok: true, paused: false, cleared: true })).toEqual({ outcome: "ok" });
 		expect(classifyResponse("prompt", { ok: true, queued: false })).toEqual({ outcome: "ok" });
 	});
 });

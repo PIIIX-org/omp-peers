@@ -28,7 +28,7 @@ const PEER_ID_RE = /^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
 const MASTER_ONLY = "only the master session may change the membership of other sessions; run /peers master first (a session may add or remove itself)";
 
 /** Ops only the master may send and a locked session refuses; the same set the receiver checks. */
-export const CONTROL_OPS = new Set(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "pause"]);
+export const CONTROL_OPS = new Set(["prompt", "abort", "compact", "model", "effort", "subagents", "setting", "rename", "tail", "shutdown", "pause", "resume"]);
 /** Ops a broadcast or `preview` may name. */
 const PREVIEW_OPS: readonly string[] = ["message", "status", ...CONTROL_OPS];
 

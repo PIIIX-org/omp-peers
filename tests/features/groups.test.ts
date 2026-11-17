@@ -103,7 +103,7 @@ describe("membership commands", () => {
 	});
 
 	test("usage and name validation", async () => {
-		const usage = "usage: /peers groups list | add <group> <peer> | remove <group> <peer> | delete <group> | members <group> | preview <group> [message|status|prompt|abort|compact|model|effort|subagents|setting|rename|tail|shutdown|pause]";
+		const usage = "usage: /peers groups list | add <group> <peer> | remove <group> <peer> | delete <group> | members <group> | preview <group> [message|status|prompt|abort|compact|model|effort|subagents|setting|rename|tail|shutdown|pause|resume]";
 		for (const bad of ["", "bogus", "add frontend", "remove a b c", "delete", "list extra", "members", "preview", "preview a b c", "preview frontend nonsense"]) {
 			expect(await say(bad)).toBe(usage);
 		}

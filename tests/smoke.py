@@ -448,8 +448,10 @@ def main():
             master, worker = peers
             master_id, worker_id = ids[master.proc.pid], ids[worker.proc.pid]
             saved_dir = agent / "peer-sessions"
-            assert not list(saved_dir.glob("*.json")), "default sessions must not persist peer metadata"
-            print("PASS default sessions write no peer-sessions metadata")
+            for session_id in (master_id, worker_id):
+                record = json.loads((saved_dir / f"{session_id}.json").read_text())
+                assert (record["name"], record["restoreMaster"], record["routingPolicy"], record["clean"], record["managed"]) == ("", False, "keep", False, False), record
+            print("PASS default sessions write only their run record (clean: false while running, no name or preference)")
             master.command("/peers list", worker_id)
             worker.command(f"/peers do {master_id} rename forbidden", "Not the master")
             master.command("/peers master", "now the master")
@@ -459,7 +461,7 @@ def main():
             master.command(f"/peers do {worker_id} rename smoke-worker", "ok")
             wait_for(lambda: (saved_dir / f"{worker_id}.json").exists())
             assert json.loads((saved_dir / f"{worker_id}.json").read_text())["name"] == "smoke-worker"
-            assert not (saved_dir / f"{master_id}.json").exists(), "unnamed session still has no metadata"
+            assert json.loads((saved_dir / f"{master_id}.json").read_text())["name"] == "", "unnamed session still has no name stored"
             master.command(f"/peers do {worker_id} status", "smoke-worker")
             worker.command("/peers refuse", "refuse")
             master.command(f"/peers do {worker_id} status", "refuses inbound")

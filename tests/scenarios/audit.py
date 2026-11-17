@@ -194,7 +194,7 @@ def run(h):
     assert h.say(master, f"/peers do {wid} pause {reason}") == f"worker-b ({wid}): ok (paused)"
     not_delivered = f"not delivered: worker-b is paused; resend after its user resumes it ({wid})"
     assert h.say(master, f"/peers do {wid} prompt run the suite").splitlines()[-1] == not_delivered
-    assert h.say(worker, "/peers resume") == f"resumed worker-b ({wid}): wake-triggering messages and prompts are accepted again"
+    assert h.say(worker, "/peers resume") == f"resumed worker-b ({wid}) (it was paused by the master): wake-triggering messages and prompts are accepted again"
     wait_for(lambda: h.row(worker)["paused"] is False)
 
     start = len(master.frames)

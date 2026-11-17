@@ -486,7 +486,7 @@ describe("runtime at the boundary", () => {
 		await runBoundary(rt, ctx); // transient: retried until the last check, only then logged
 		expect(ctx.pendingTimers()).toBe(1);
 		rt.onHostCompaction(false);
-		await pauseSession(home, A, A, NOW);
+		await pauseSession(home, A, "user", NOW);
 		await ctx.fire();
 		expect(ctx.calls).toBe(0);
 		expect(log().filter(l => l.startsWith("skipped")).map(l => l.split(" 9")[0])).toEqual(["skipped: async job running", "skipped: paused"]);
@@ -840,7 +840,7 @@ describe("status", () => {
 		expect(await rt.command(["status"], host())).toContain("this session: no session context yet");
 		const ctx = fakeCtx();
 		rt.bind(ctx);
-		await pauseSession(home, A, A, NOW);
+		await pauseSession(home, A, "user", NOW);
 		const out = await rt.command(["status"], host());
 		expect(out).toContain("(paused)");
 		expect(out).toContain("this session's limiter: no attempt yet; 0 attempt(s) in the last hour");

@@ -943,7 +943,7 @@ describe("recipients are never woken while paused, and delivery text is capped",
 	const PAUSED = "not delivered: worker-b is paused (only its user can resume it)";
 
 	test("a recipient paused in the pause state file is never messaged even when its registry row says it is not paused; check says so and writes nothing", async () => {
-		await pauseSession(home, B, B, now, "waiting");
+		await pauseSession(home, B, "user", now, "waiting");
 		await ticks();
 		await soak(29);
 		advance(1);

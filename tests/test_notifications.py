@@ -38,6 +38,10 @@ class NotificationRoutingChecks(unittest.TestCase):
         self.assertIn("PASS lifecycle", result.stdout)
         self.assertNotIn("MaxListenersExceededWarning", result.stderr)
 
+    def test_restart_rule_and_resume_policy_through_the_extension(self):
+        result = self.run_harness("restart_rule.ts")
+        self.assertIn("PASS restart rule and resume policy", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
