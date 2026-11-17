@@ -15,6 +15,7 @@ const host: FeatureHost = {
 	peers: async () => [],
 	groupsOf: () => [],
 	resolveGroup: async () => ({ recipients: [], skipped: [] }),
+	resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }), applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	send: async () => ({ status: "offline" }),
 };
 for (const round of ["first", "second"]) {
