@@ -2,6 +2,7 @@
 // Copyright (c) 2026 PIIIX-org contributors
 import type { zod } from "@oh-my-pi/pi-coding-agent";
 import type { Report } from "../reports";
+import { autocompact } from "./autocompact";
 import { board } from "./board";
 import { deps } from "./deps";
 import { digest } from "./digest";
@@ -13,6 +14,7 @@ import { locks } from "./locks";
 import { pause, resume } from "./pause";
 import { rules } from "./rules";
 import { templates } from "./templates";
+import { watchdog } from "./watchdog";
 
 /** An LLM tool a feature contributes. The extension registers it; the feature never imports host runtime values. */
 export interface ToolSpec {
@@ -41,4 +43,4 @@ export interface Feature {
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, digest];
+export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, watchdog, autocompact, digest];
