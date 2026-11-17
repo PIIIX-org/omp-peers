@@ -37,16 +37,31 @@ export default function fixture(pi) {
 '''
 
 
+GUARD_REFUSAL = "network guard: refused"
+GUARD_PRELOAD = str(REPO / "tests" / "netguard.ts")
+
+
+def plugin_link(env, cwd):
+    """`omp plugin link` under the guard (BUN_OPTIONS preload: the subcommand takes no `-e`); fails on any refusal."""
+    result = subprocess.run([OMP, "plugin", "link", str(REPO)], env={**env, "BUN_OPTIONS": "--preload " + GUARD_PRELOAD},
+                            cwd=cwd, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert GUARD_REFUSAL not in result.stdout + result.stderr, "plugin link attempted outbound network access:\n" + result.stderr
+    return result
+
+
 class Peer:
-    def __init__(self, env, cwd, resume=None):
+    def __init__(self, env, cwd, resume=None, extra_args=()):
         self.frames = []
         self.responses = queue.Queue()
         session_args = ["--session", resume] if resume else []
+        # Every OMP the smoke harnesses start refuses non-loopback connections (tests/netguard.ts).
+        guard = ["-e", str(REPO / "tests" / "netguard_ext.ts")]
         self.proc = subprocess.Popen(
             [OMP, "--mode", "rpc", "--no-title", "--no-tools",
              "--no-skills", "--no-rules", "--no-context-files", "--no-lsp",
              "--model", "smoke/first", "--system-prompt", "Offline plugin smoke.",
-             *session_args],
+             *session_args, *guard, *extra_args],
             env=env, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True,
         )
@@ -58,6 +73,20 @@ class Peer:
         for reader in self.readers:
             reader.start()
         self.seq = 0
+        try:
+            self.probe_guard()
+        except BaseException:
+            self.close()
+            raise
+
+    def probe_guard(self):
+        """Prove `-e tests/netguard_ext.ts` is wired: the OMP process must refuse a non-loopback connection itself."""
+        self.call("get_state")
+        self.command("/netguard-probe", "netguard-probe:refused")
+
+    def refusals(self):
+        """Network-guard refusals the OMP process reported on stderr (the probe's own refusal is not reported)."""
+        return [line.rstrip() for line in self.errors if GUARD_REFUSAL in line]
 
     def read(self):
         for line in self.proc.stdout:
@@ -112,6 +141,20 @@ class Peer:
             reader.join(timeout=5)
         for stream in (self.proc.stdout, self.proc.stderr):
             stream.close()
+        refused = self.refusals()
+        assert not refused, "OMP process attempted outbound network access:\n" + "\n".join(refused)
+
+
+def close_peers(peers):
+    """Close every still-open peer, then raise if any attempted outbound network access or failed to close cleanly."""
+    failures = []
+    for peer in reversed(peers):
+        if not peer.proc.stdin.closed:
+            try:
+                peer.close()
+            except AssertionError as error:
+                failures.append(str(error))
+    assert not failures, "\n".join(failures)
 
 
 def wait_for(predicate, seconds=15):
@@ -388,11 +431,7 @@ def main():
                "XDG_CACHE_HOME": str(home / "cache"),
                "XDG_STATE_HOME": str(home / "state")}
         try:
-            installed = subprocess.run(
-                [OMP, "plugin", "link", str(REPO)], env=env, cwd=root,
-                capture_output=True, text=True, timeout=60,
-            )
-            assert installed.returncode == 0, installed.stdout + installed.stderr
+            installed = plugin_link(env, root)
             print("PASS OMP plugin link:", installed.stdout.strip())
             for _ in range(2):
                 peer = Peer(env, root)
@@ -613,8 +652,7 @@ def main():
                 except subprocess.TimeoutExpired:
                     watcher.kill()
                     watcher.communicate(timeout=5)
-            for peer in peers:
-                peer.close()
+            close_peers(peers)
     print("PASS temporary home removed; no real sessions or credentials used")
 
 
