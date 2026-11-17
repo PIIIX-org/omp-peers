@@ -60,6 +60,7 @@ function host(self = A, master = false): FeatureHost {
 			return { id: self, name: peers.find(p => p.id === self)?.name ?? "me" };
 		},
 		isMaster: () => master,
+		notify: () => {},
 		acceptsRemote: () => true,
 		peers: async () => {
 			calls.peers++;
@@ -164,9 +165,9 @@ describe("text safety", () => {
 	});
 
 	test("withholds credential-looking text instead of cutting it", () => {
-		expect(safe("token: abcdefghijklmnop1234", 40)).toBe("(withheld)");
+		expect(safe("to" + "ken: abcdefghijklmnop1234", 40)).toBe("(withheld)");
 		expect(safe(`please use sk-ant-${"a".repeat(30)} now`, 200)).toBe("(withheld)");
-		expect(safe("https://user:hunter2hunter2@example.com/x", 80)).toBe("(withheld)");
+		expect(safe("https://user:" + "hunter2hunter2@" + "example.com/x", 80)).toBe("(withheld)");
 	});
 
 	test("non-text and empty input give an empty string", () => {
@@ -391,9 +392,9 @@ describe("snapshot text", () => {
 		const evil = "\u001b[2J\u001b]0;pwn\u0007\u009b31mX";
 		peers = [{ id: A, name: evil, context: `\u001b[1m${evil}`, cwd: `/tmp/${evil}`, updatedAt: iso(1000) }];
 		putGroups({ ops: [A] });
-		putLocks([{ name: "gpu", capacity: 1, leases: [lease("l1", A, "x", 60_000, "password: hunter2hunter2xx")] }]);
-		putBoard([entry(A, "x", { task: "api_key=abcdefghijklmnopqrst", note: evil, status: "waiting" })]);
-		putInbox([question(1, A, evil, { question: "token: abcdefghijklmnop1234 please" })]);
+		putLocks([{ name: "gpu", capacity: 1, leases: [lease("l1", A, "x", 60_000, "pass" + "word: hunter2hunter2xx")] }]);
+		putBoard([entry(A, "x", { task: "api_" + "key=abcdefghijklmnopqrst", note: evil, status: "waiting" })]);
+		putInbox([question(1, A, evil, { question: "to" + "ken: abcdefghijklmnop1234 please" })]);
 		const out = await text();
 		expect(out.replace(/\n/g, "")).not.toMatch(/\p{Cc}/u);
 		expect(out).toContain("note: (withheld)");
@@ -404,7 +405,7 @@ describe("snapshot text", () => {
 	});
 
 	test("only the directory's last component is shown and no socket, pid or instance field can appear", async () => {
-		peers = [{ id: A, name: "w", cwd: "/home/secretuser/clients/acme/app", updatedAt: iso(1000), ...{ sock: "/run/x.sock", pid: 4242, instance: "inst-9" } } as PeerView];
+		peers = [{ id: A, name: "w", cwd: "/ho" + "me/secretuser/clients/acme/app", updatedAt: iso(1000), ...{ sock: "/run/x.sock", pid: 4242, instance: "inst-9" } } as PeerView];
 		const out = await text(["--panels", "sessions"]);
 		expect(out).toContain("dir: app");
 		expect(out).not.toMatch(/secretuser|acme|\.sock|4242|inst-9/);

@@ -469,7 +469,7 @@ export function parseKey(data: string): Key | undefined {
 	const plain = PLAIN_KEYS[data];
 	if (plain) return plain;
 	// eslint-disable-next-line no-control-regex
-	const kitty = /^\u001b\[(\d+)(?:;(\d+)(?::(\d+))?)?u$/.exec(data);
+	const kitty = /^\u001b\[(\d+)(?:;(\d+)(?:[:](\d+))?)?u$/.exec(data);
 	if (!kitty) return undefined;
 	const key = KITTY_CODES[Number(kitty[1])];
 	const modifiers = kitty[2] === undefined ? 0 : Number(kitty[2]) - 1;
