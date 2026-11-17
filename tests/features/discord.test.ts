@@ -62,6 +62,7 @@ function host(master = true): FeatureHost {
 		self: () => spy("self", { id: MASTER, name: "master" }),
 		isMaster: () => master,
 		notify: text => void notes.push(text),
+		usageNow: () => spy("usageNow", undefined),
 		acceptsRemote: () => spy("acceptsRemote", true),
 		peers: async () => spy("peers", peerList),
 		groupsOf: () => spy("groupsOf", []),
