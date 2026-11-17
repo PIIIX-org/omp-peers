@@ -52,6 +52,7 @@ function host(self: string, master = self === "master"): FeatureHost {
 		acceptsRemote: () => true,
 		peers: async () => (await roster()).filter(p => !p.duplicateSession.length || p.canonicalId === p.id).map(p => ({ id: logicalId(p), name: p.name })),
 		groupsOf: peerId => groupsOf(home, peerId),
+		usageNow: () => undefined,
 		resolveGroup: async (name, op) => {
 			const result = resolvePeerTargets(`group:${name}`, await roster(), selfId, self, groupTargeting(home, op));
 			return { recipients: result.peers.map(p => ({ id: logicalId(p), name: p.name })), skipped: result.skipped ?? [], error: result.error };

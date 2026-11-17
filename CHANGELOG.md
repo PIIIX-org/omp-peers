@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Usage and cost
+
+- Add `/peers usage on|off|status|list|set|price|unprice`: a session publishes, only after its own user runs `on`, one optional registry field `usage` made of the host's running numeric totals (`sessionManager.getUsageStatistics()`: input, output, cache read and write tokens, the host's catalog-price cost, plus the current model, whether its provider is a subscription login, and the session start). No transcript, message text or provider request is involved; totals are cumulative per session file, so restarts and duplicate registrations never double count, and subagent usage is part of its parent's totals. The master's `list` (other sessions are master-only) shows each session with separate `subscription`, `estimate` (host catalog cost, or a user-configured per-model price table, with an optional user-supplied currency rate) and `billed` (always `unknown`: the host exposes no billed amount) labels, `unknown` for sessions that published nothing or lack counters, totals that say how many sessions they cover, and `stale` rows. Private `usage.json` (64 publishers, 32 prices), `usageSummary`/`formatUsage` are pure for later digests. Adds `PeerView.usage`/`updatedAt` and `FeatureHost.usageNow()`.
+
 ### Session templates
 
 - Add `/peers templates add|show|list|remove|apply|launch` (private `templates.json`, 32 templates): a template names an optional model, a role prompt, up to 8 rules and up to 8 groups. It is applied only to the session that runs `apply <name> --yes`: the model is switched only if available with credentials (never substituted), the role and rules become session-scoped rules and the groups are joined, all or nothing (rollback deletes a group only if this run created it). `show` and `apply` without `--yes` print the same read-only plan; `launch` prints the shell line and starts nothing. `OMP_PEERS_TEMPLATE=<name>` in a new session only shows the plan: environment variables are inherited by programs the session starts, so they never authorize an apply.
