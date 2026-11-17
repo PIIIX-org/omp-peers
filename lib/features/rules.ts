@@ -179,7 +179,7 @@ function normalizeText(raw: string): { text?: string; error?: string } {
 	return { text };
 }
 
-async function resolvePeer(host: FeatureHost, spec: string, allowOffline: boolean): Promise<{ id?: string; error?: string }> {
+export async function resolvePeer(host: FeatureHost, spec: string, allowOffline: boolean): Promise<{ id?: string; error?: string }> {
 	const s = spec.toLowerCase();
 	const peers = await host.peers();
 	const byId = peers.find(peer => peer.id === s);

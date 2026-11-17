@@ -8,6 +8,16 @@ export interface PeerView {
 	name: string;
 	/** Whether the peer accepts requests from others (published inbound/control state); undefined when unknown. */
 	acceptsRemote?: boolean;
+	/** Published busy state (a turn is running); undefined when unknown. */
+	busy?: boolean;
+	/** Published context usage text such as `1234 (56%)`; empty or undefined when the peer has no figure. */
+	context?: string;
+	/** Published explicit pause; undefined on registrations from versions without pause. */
+	paused?: boolean;
+	/** Consecutive assistant turns that ended in an error, counted by the peer since its process started; undefined on versions that do not publish it. */
+	recentErrorTurns?: number;
+	/** ISO time of the peer's last registry write; undefined when unknown. */
+	updatedAt?: string;
 }
 
 /** Outcome of delivering one message to one peer through the extension's normal send path. */
