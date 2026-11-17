@@ -542,22 +542,26 @@ describe("github event kinds", () => {
 	];
 	for (const [expected, body] of cases) test(`${expected}`, () => expect(kind(body)).toBe(`github.${expected}`));
 
-	test("a workflow_job payload that carries a top-level deployment is a deployment", () => {
-		expect(kind({ action: "completed", workflow_job: obj, deployment: obj })).toBe("github.deployment");
+	test("a workflow_job payload that carries a top-level deployment stays a workflow_job", () => {
+		expect(kind({ action: "completed", workflow_job: obj, deployment: obj })).toBe("github.workflow_job");
 		expect(kind({ action: "completed", workflow_job: obj })).toBe("github.workflow_job");
+		expect(kind({ action: "created", deployment: obj })).toBe("github.deployment");
 	});
 
-	test("a workflow_run is a deployment_review only when it comes with a reviewers array", () => {
-		expect(kind({ action: "requested", workflow_run: obj, reviewers: [] })).toBe("github.deployment_review");
+	test("a workflow_run is a deployment_review when `since` is present, whether or not reviewers is", () => {
+		expect(kind({ action: "approved", workflow_run: obj, since: "2026-01-01T00:00:00Z" })).toBe("github.deployment_review");
+		expect(kind({ action: "rejected", workflow_run: obj, since: "2026-01-01T00:00:00Z", reviewers: [] })).toBe("github.deployment_review");
+		expect(kind({ action: "requested", workflow_run: obj, reviewers: [], since: "x" })).toBe("github.deployment_review");
 		expect(kind({ action: "requested", workflow_run: obj })).toBe("github.workflow_run");
-		expect(kind({ action: "requested", workflow_run: obj, reviewers: "nobody" })).toBe("github.workflow_run");
-		expect(kind({ action: "requested", workflow_run: obj, reviewers: {} })).toBe("github.workflow_run");
+		expect(kind({ action: "requested", workflow_run: obj, reviewers: [] })).toBe("github.workflow_run"); // no `since`: not a deployment_review
+		expect(kind({ action: "requested", workflow_run: obj, since: 5 })).toBe("github.workflow_run");
 	});
 
-	test("the order is most specific first: deployment_status over deployment over workflow_job over workflow_run", () => {
+	test("the order is most specific first: deployment_review, deployment_status, workflow_job, deployment, workflow_run", () => {
 		expect(kind({ deployment_status: obj, deployment: obj, workflow_job: obj, workflow_run: obj })).toBe("github.deployment_status");
-		expect(kind({ deployment: obj, workflow_job: obj, workflow_run: obj })).toBe("github.deployment");
-		expect(kind({ workflow_job: obj, workflow_run: obj })).toBe("github.workflow_run");
-		expect(kind({ reviewers: [], deployment: obj, workflow_run: obj })).toBe("github.deployment_review");
+		expect(kind({ deployment: obj, workflow_job: obj, workflow_run: obj })).toBe("github.workflow_job");
+		expect(kind({ deployment: obj, workflow_run: obj })).toBe("github.deployment");
+		expect(kind({ workflow_job: obj, workflow_run: obj })).toBe("github.workflow_job");
+		expect(kind({ since: "x", deployment: obj, workflow_run: obj })).toBe("github.deployment_review");
 	});
 });

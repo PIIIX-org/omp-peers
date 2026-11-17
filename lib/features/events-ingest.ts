@@ -201,8 +201,11 @@ const pick = (...values: unknown[]): unknown => values.find(value => value !== u
 const GITHUB_KINDS: Array<[(body: Record<string, unknown>) => boolean, string]> = [
 	// Most specific first: a payload often carries the objects of the more general kinds (a deployment_status holds a
 	// deployment and often a workflow_run; a review thread holds a pull_request).
-	[b => isPlain(b.workflow_run) && Array.isArray(b.reviewers), "deployment_review"],
+	// `since` is required on every deployment_review and appears in no other event; `reviewers` is optional on approved/rejected.
+	[b => typeof b.since === "string" && isPlain(b.workflow_run), "deployment_review"],
 	[b => isPlain(b.deployment_status), "deployment_status"],
+	// A workflow_job for a job that deploys carries a top-level `deployment`: it stays a workflow_job.
+	[b => isPlain(b.workflow_job), "workflow_job"],
 	[b => isPlain(b.deployment), "deployment"],
 	[b => isPlain(b.pull_request) && isPlain(b.thread), "pull_request_review_thread"],
 	[b => isPlain(b.pull_request) && isPlain(b.review), "pull_request_review"],
@@ -213,7 +216,6 @@ const GITHUB_KINDS: Array<[(body: Record<string, unknown>) => boolean, string]> 
 	[b => isPlain(b.discussion) && isPlain(b.comment), "discussion_comment"],
 	[b => isPlain(b.discussion), "discussion"],
 	[b => isPlain(b.workflow_run), "workflow_run"],
-	[b => isPlain(b.workflow_job), "workflow_job"],
 	[b => isPlain(b.check_run), "check_run"],
 	[b => isPlain(b.check_suite), "check_suite"],
 	[b => isPlain(b.release), "release"],
