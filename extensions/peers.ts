@@ -28,6 +28,7 @@ import { formatActivity, initializeActivityHost, readActivity, type PeerActivity
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, logicalId, matchesWriter, resolvePeerTargets, skippedLine, stablePeerId, type IdentityStatus, type Skipped } from "../lib/identity";
 import { FEATURES } from "../lib/features";
+import { openDashboard, parseOptions as parseDashboardOptions, readOnlyView } from "../lib/features/dashboard";
 import { autoCompactRuntime } from "../lib/features/autocompact";
 import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInput } from "../lib/features/audit";
 import type { FeatureHost, ModelApply, ModelCheck, SendResult } from "../lib/features/host";
@@ -35,6 +36,7 @@ import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
 import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
 import { readRemoteMessage } from "../lib/features/hosts_wire";
 import { startupTemplate } from "../lib/features/templates";
+import { usageForRegistry, type PublishedUsage, type UsageSource } from "../lib/features/usage";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
@@ -152,6 +154,8 @@ interface PeerInfo extends PeerActivity {
 	/** Explicit pause: wake-triggering requests are refused. Absent on registrations from older versions. */
 	paused?: boolean;
 	pausedSince?: string;
+	/** Token counters this session's user chose to publish (`/peers usage on`); absent means unknown, never zero. */
+	usage?: PublishedUsage;
 	/** Consecutive assistant turns that ended in an error, counted since this process started (the watchdog reads it). Absent on registrations from older versions. */
 	recentErrorTurns?: number;
 }
@@ -308,6 +312,25 @@ function writeJson(file: string, value: unknown): void {
 	fs.renameSync(tmp, file);
 }
 
+/** Numeric aggregates only: the host's running usage totals and the model/provider facts needed to label them. No message text is read. */
+function usageSourceOf(ctx: ExtensionContext | undefined): UsageSource | undefined {
+	if (!ctx) return undefined;
+	try {
+		const manager = ctx.sessionManager;
+		const model = ctx.models.current();
+		const header = manager.getHeader();
+		return {
+			stats: typeof manager.getUsageStatistics === "function" ? manager.getUsageStatistics() : undefined,
+			model: model ? `${model.provider}/${model.id}` : undefined,
+			subscription: model && typeof ctx.modelRegistry.isUsingSubscription === "function" ? ctx.modelRegistry.isUsingSubscription(model) : undefined,
+			since: header?.timestamp,
+			forked: typeof header?.parentSession === "string",
+		};
+	} catch {
+		return undefined; // a host without these APIs leaves usage unknown
+	}
+}
+
 function selfInfo(pi: ExtensionAPI): PeerInfo {
 	const ctx = state.ctx;
 	const usage = ctx?.getContextUsage?.() as { tokens?: number; percent?: number } | undefined;
@@ -339,6 +362,7 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 		routingPolicy: state.saved.routingPolicy,
 		paused: pause.paused,
 		pausedSince: pause.since === undefined ? undefined : new Date(pause.since).toISOString(),
+		usage: usageForRegistry(os.homedir(), state.id, () => usageSourceOf(ctx)),
 		recentErrorTurns: state.errorTurns,
 	};
 }
@@ -918,7 +942,7 @@ export default function peers(pi: ExtensionAPI) {
 			notify: text => ctx.ui.notify(text, "info"),
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
-				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse", busy: p.busy, context: p.context, paused: p.paused, recentErrorTurns: p.recentErrorTurns, updatedAt: p.updatedAt })),
+				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse", busy: p.busy, context: p.context, paused: p.paused, recentErrorTurns: p.recentErrorTurns, usage: p.usage, updatedAt: p.updatedAt, cwd: p.cwd, activeJobs: p.activity?.activeJobs, activeSubagents: p.activity?.activeSubagents, isSettled: p.isSettled })),
 			groupsOf: peerId => groupsOf(os.homedir(), peerId),
 			resolveGroup: async (name, op) => {
 				const { peers, error, skipped } = await resolveTargets(`group:${name}`, op);
@@ -926,6 +950,7 @@ export default function peers(pi: ExtensionAPI) {
 			},
 			send: (to, req) => sendTo(to, req.text, req.dependency === true),
 			acceptsRemote: () => state.inbound === "accept" && state.control,
+			usageNow: () => usageSourceOf(ctx),
 			resolveModel: async selector => (await checkModel(pi, ctx, selector)).check,
 			applyModel: async (selector): Promise<ModelApply> => {
 				const { check, model } = await checkModel(pi, ctx, selector);
@@ -1164,6 +1189,15 @@ export default function peers(pi: ExtensionAPI) {
 			const m = masterId();
 			const say = (s: string) => ctx.ui.notify(s, "info");
 			if (!state.sessionLock?.acquired) return say(state.identityError || "session identity unavailable");
+			// The live overlay only in a terminal UI; `--once`, RPC and print get the same renderer as one plain-text snapshot below.
+			if (sub === "dashboard" && ctx.hasUI && ctx.mode === "tui") {
+				const parsed = parseDashboardOptions(rest);
+				if (!parsed.ok) return say(parsed.error);
+				if (!parsed.once) {
+					const timers = { setInterval: (callback: () => void, ms: number) => ctx.setInterval(callback, ms), clearTimer: (timer: unknown) => ctx.clearTimer(timer as never) };
+					return openDashboard(ctx.ui, readOnlyView(featureHost(ctx)), parsed.options, timers);
+				}
+			}
 			const feature = FEATURES.find(f => f.name === sub);
 			if (feature) {
 				const out = await feature.command(rest, featureHost(ctx));

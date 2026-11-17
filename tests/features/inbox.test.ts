@@ -36,6 +36,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 		acceptsRemote: () => true,
 		peers: async () => live.map(id => ({ id, name: NAMES[id] })),
 		groupsOf: () => [],
+		usageNow: () => undefined,
 		notify: () => {},
 		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }), applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
