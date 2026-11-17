@@ -44,10 +44,15 @@ describe("notifications journal", () => {
 		const ended = await child(script.replace("n.start();", "n.start(); n.end('x'); "));
 		expect(ended.code, ended.err).toBe(0);
 		expect(JSON.parse(ended.out)).toEqual({ available: false });
-		// With a reader holding the FIFO open: the open succeeds, fstat refuses it, nothing is written.
-		const reader = Bun.spawn(["sh", "-c", `exec 3<'${journal}'; sleep 3`], { stdout: "ignore", stderr: "ignore", timeout: 5_000 });
-		const withReader = await child(script.replace("n.start();", "n.start(); n.end('x'); "));
-		reader.kill();
+		// With a reader holding the FIFO open: the open succeeds, fstat refuses it, nothing is written. A non-blocking read-open in this
+		// process returns at once, so the reader exists before the child starts (no sleep, no race).
+		const readerFd = fs.openSync(journal, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+		let withReader: Awaited<ReturnType<typeof child>>;
+		try {
+			withReader = await child(script.replace("n.start();", "n.start(); n.end('x'); "));
+		} finally {
+			fs.closeSync(readerFd);
+		}
 		expect(withReader.code, withReader.err).toBe(0);
 		expect(JSON.parse(withReader.out)).toEqual({ available: false });
 		// A regular journal is appended as before.

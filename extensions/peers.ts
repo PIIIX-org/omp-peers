@@ -308,16 +308,14 @@ function readJson<T>(file: string): T | undefined {
 /** Atomic replace through a temp file that only this call can have created (random name, O_EXCL, no symlink or FIFO can be pre-placed). */
 function writeJson(file: string, value: unknown): void {
 	const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-	const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
 	try {
-		fs.writeSync(fd, JSON.stringify(value));
-	} catch (error) {
-		fs.closeSync(fd);
-		fs.rmSync(tmp, { force: true });
-		throw error;
-	}
-	fs.closeSync(fd);
-	try {
+		const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+		try {
+			// writeFileSync loops until everything is written; a single writeSync could short-write on a full disk and rename half a JSON.
+			fs.writeFileSync(fd, JSON.stringify(value));
+		} finally {
+			fs.closeSync(fd);
+		}
 		fs.renameSync(tmp, file);
 	} catch (error) {
 		fs.rmSync(tmp, { force: true });
