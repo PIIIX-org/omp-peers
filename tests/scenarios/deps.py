@@ -46,7 +46,7 @@ def run(h):
 
     def message(trigger, rule, unit, prompt):
         return [
-            f'Dependency trigger {trigger} (rule {rule}, authorized by the user at the master session): worker-a ({sid}) reported DONE for unit "{unit}" (the sender identity is claimed, not authenticated).',
+            f'Dependency trigger {trigger} (rule {rule}, authorized by the user at the master session): session {sid} reported DONE for unit "{unit}" (the sender identity is claimed, not authenticated).',
             f"Task: {prompt}",
         ]
 
