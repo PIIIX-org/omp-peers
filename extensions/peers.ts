@@ -33,6 +33,7 @@ import { autoCompactRuntime } from "../lib/features/autocompact";
 import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInput } from "../lib/features/audit";
 import type { FeatureHost, ModelApply, ModelCheck, SendResult } from "../lib/features/host";
 import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
+import { readRegularFile } from "../lib/features/store";
 import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
 import { startupTemplate } from "../lib/features/templates";
 import { usageForRegistry, type PublishedUsage, type UsageSource } from "../lib/features/usage";
@@ -295,7 +296,7 @@ function alive(pid: number): boolean {
 
 function readJson<T>(file: string): T | undefined {
 	try {
-		return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+		return JSON.parse(readRegularFile(file)) as T;
 	} catch {
 		return undefined;
 	}
