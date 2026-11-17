@@ -304,10 +304,24 @@ function readJson<T>(file: string): T | undefined {
 	}
 }
 
+/** Atomic replace through a temp file that only this call can have created (random name, O_EXCL, no symlink or FIFO can be pre-placed). */
 function writeJson(file: string, value: unknown): void {
-	const tmp = `${file}.${process.pid}.tmp`;
-	fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
-	fs.renameSync(tmp, file);
+	const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+	const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+	try {
+		fs.writeSync(fd, JSON.stringify(value));
+	} catch (error) {
+		fs.closeSync(fd);
+		fs.rmSync(tmp, { force: true });
+		throw error;
+	}
+	fs.closeSync(fd);
+	try {
+		fs.renameSync(tmp, file);
+	} catch (error) {
+		fs.rmSync(tmp, { force: true });
+		throw error;
+	}
 }
 
 /** Numeric aggregates only: the host's running usage totals and the model/provider facts needed to label them. No message text is read. */

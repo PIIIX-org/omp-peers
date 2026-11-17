@@ -56,7 +56,9 @@ export class Notifications {
 		let fd: number | undefined;
 		try {
 			fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-			fd = fs.openSync(path.join(directory, `${id}.jsonl`), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, 0o600);
+			// O_NONBLOCK: a FIFO planted at this path fails the open at once (ENXIO without a reader); with a reader, fstat refuses it.
+			fd = fs.openSync(path.join(directory, `${id}.jsonl`), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+			if (!fs.fstatSync(fd).isFile()) throw new Error("notifications journal is not a regular file");
 			fs.writeSync(fd, JSON.stringify({ version: 1, ...event, timestamp: Date.now() / 1000 }) + "\n");
 			fs.fsyncSync(fd);
 			this.available = true;
