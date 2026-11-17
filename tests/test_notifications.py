@@ -22,9 +22,11 @@ class NotificationRoutingChecks(unittest.TestCase):
                    "PI_CODING_AGENT_DIR": str(home / ".omp/agent"),
                    "XDG_CONFIG_HOME": str(home / "config"), "XDG_DATA_HOME": str(home / "data"),
                    "XDG_CACHE_HOME": str(home / "cache"), "XDG_STATE_HOME": str(home / "state")}
-            result = subprocess.run([bun, str(REPO / "tests" / script)],
+            # Launched from Python, so the spawn wrapper does not apply: preload the outbound-network guard explicitly.
+            result = subprocess.run([bun, "--preload", str(REPO / "tests" / "netguard.ts"), str(REPO / "tests" / script)],
                                     env=env, cwd=root, capture_output=True, text=True, timeout=45)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("network guard: refused", result.stderr)
             return result
 
     def test_ordinary_peer_route_and_exact_turn_receipts(self):
