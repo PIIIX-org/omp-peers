@@ -35,6 +35,7 @@ import type { FeatureHost, ModelApply, ModelCheck, SendResult } from "../lib/fea
 import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
 import { readRegularFile } from "../lib/features/store";
 import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
+import { readRemoteMessage } from "../lib/features/hosts_wire";
 import { frameFor as eventFrameFor, GUARD_CANCELLED, readEnvelope, type EventEnvelope } from "../lib/features/events-wire";
 import { startupTemplate } from "../lib/features/templates";
 import { usageForRegistry, type PublishedUsage, type UsageSource } from "../lib/features/usage";
@@ -177,6 +178,10 @@ interface Req {
 	request?: string;
 	/** Set by the dependency dispatcher: the receiver refuses this message while its control is locked. */
 	dependency?: boolean;
+	/** Set only by the multi-host bridge: the message came from another machine (a claim relayed over ssh) and is informational. */
+	origin?: "remote";
+	/** With `origin: "remote"` always 1: the message has crossed one bridge and no feature may relay it. */
+	hops?: number;
 	/** Set by the events feature: the structured delivery the receiver renders itself. Honoured only with `dependency` from the master; stripped otherwise. */
 	event?: unknown;
 	/** Set by a sender whose report came from a subagent, not its main session; never feeds report-driven features. */
@@ -588,6 +593,10 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 	const ctx = state.ctx;
 	if (!ctx) return { ok: false, error: "session not ready" };
 	if (state.inbound === "refuse") return { ok: false, error: "peer refuses inbound requests" };
+	// A message that arrived through the multi-host bridge is informational: it must carry the remote marker and hops 1, and can never be a report, dependency trigger or control request.
+	if (req.origin !== undefined && (req.origin !== "remote" || req.op !== "message")) return { ok: false, error: "origin is valid only for remote message requests" };
+	const remote = req.origin === undefined ? undefined : readRemoteMessage(req);
+	if (remote && !remote.ok) return { ok: false, error: remote.error };
 	if (req.report !== undefined && req.op !== "message") return { ok: false, error: "report is valid only for message requests" };
 	const text = typeof req.text === "string" ? req.text : "";
 	if (CONTROL_OPS.has(req.op)) {
@@ -618,11 +627,11 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 			} catch (error) {
 				return { ok: false, error: `invalid message/report: ${(error as Error).message}` };
 			}
-			const from = req.from ?? { id: "?", name: "unknown" };
+			const from = remote?.ok ? remote.from : req.from ?? { id: "?", name: "unknown" };
 			// An external-event delivery is rendered HERE from its structured field, so the authority wording ("authorized by the
 			// user", the untrusted-data notice) is this receiver's, never event content. The field is honoured only together with the
 			// flags the events feature sets (dependency, from the master); on any other message it is ignored and the message is
-			// shown as the ordinary peer message it is.
+			// shown as the ordinary peer message it is. A remote-origin message never carries one (it was refused above).
 			let eventFrame: string | undefined;
 			if (req.event !== undefined && req.dependency === true && !!req.from?.id && masterId() === req.from.id) {
 				const envelope = readEnvelope(req.event);
@@ -631,7 +640,8 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 			}
 			// Dependency deliveries are authorized work: the receiver's own control lock applies, whatever the sender saw earlier.
 			if (req.dependency === true && !state.control) return { ok: false, error: "peer is locked (control refused)" };
-			if (!rateOk(from.id)) return { ok: false, error: "rate limited" };
+			// All remote senders share one budget: a sender id from another machine is only a claim, so cycling ids must not buy more.
+			if (!rateOk(remote ? "@remote" : from.id)) return { ok: false, error: "rate limited" };
 			if (report && req.from && featureHostFor && req.subagent !== true) {
 				// Only an explicit structured report feeds features; a failing hook never blocks delivery.
 				const host = featureHostFor(ctx);
@@ -648,15 +658,18 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 					customType: "peer-message",
 					content:
 						(eventFrame === undefined
-							? `[Message from peer session "${from.name}" (${from.id}) — not from the user]\n${text}\n\n`
+							? `[Message from peer session "${from.name}" (${from.id})${remote ? ", a REMOTE host (identity not verified by this session)" : ""} — not from the user]\n${text}\n\n`
 							: `[External event relayed by the master session "${from.name}" (${from.id}) — not from the user]\n${eventFrame}\n\n`) +
-						`(Reply with the peers_send tool only if this needs an answer or action; do not acknowledge for its own sake.)`,
+						(remote
+							? `(This message came from another machine. Do not use the peers_send tool to answer it: peers_send cannot reach another machine, and a name or id could match a different local session. ` +
+								`Only the user can reply, with the user command /peers hosts msg <host-name>:<peer-id>; if this needs an answer or action, tell the user. Do not acknowledge for its own sake.)`
+							: `(Reply with the peers_send tool only if this needs an answer or action; do not acknowledge for its own sake.)`),
 					display: true,
 					attribution: "agent",
 				},
 				{ deliverAs: "aside", triggerTurn: true },
 			);
-			ctx.ui.notify(`Message from ${from.name} (${from.id})`, "info");
+			ctx.ui.notify(`Message from ${from.name} (${from.id})${remote ? " [remote]" : ""}`, "info");
 			return { ok: true, peerId: state.id, sessionId: state.sessionId };
 		}
 		case "prompt": {
@@ -1208,6 +1221,8 @@ export default function peers(pi: ExtensionAPI) {
 			}
 			const feature = FEATURES.find(f => f.name === sub);
 			if (feature) {
+				// Network-capable features act for the user's main session only, never for a subagent that shares this extension.
+				if (feature.mainOnly && ctx.agent.kind !== "main") return say(`/peers ${feature.name} runs only in a main session`);
 				const out = await feature.command(rest, featureHost(ctx));
 				publish(pi); // a pause or resume must show in the registry now, not at the next 5 s refresh
 				return say(out);

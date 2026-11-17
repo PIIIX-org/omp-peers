@@ -11,6 +11,7 @@ import { discord } from "./discord";
 import { events } from "./events";
 import { groups } from "./groups";
 import type { FeatureHost } from "./host";
+import { hosts } from "./hosts";
 import { audit } from "./audit";
 import { inbox } from "./inbox";
 import { locks } from "./locks";
@@ -36,6 +37,8 @@ export interface Feature {
 	name: string;
 	/** `args` are the whitespace-split tokens after the feature name. Returns text shown to the user. */
 	command(args: string[], host: FeatureHost): Promise<string>;
+	/** Set for a feature whose command reaches outside this machine: the extension runs it only in a main (user-driven) session, never a subagent's. */
+	mainOnly?: boolean;
 	/** Context added before this session's next agent start; undefined adds nothing. May throw. */
 	agentContext?(host: FeatureHost): string | undefined | Promise<string | undefined>;
 	/** A structured report this session accepted; `from` is the sender's claimed identity, not authenticated. May reject. */
@@ -47,4 +50,4 @@ export interface Feature {
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, watchdog, autocompact, digest, usage, dashboard, discord, events];
+export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, watchdog, autocompact, digest, usage, dashboard, discord, events, hosts];
