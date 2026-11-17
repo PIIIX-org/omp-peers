@@ -132,8 +132,10 @@ def main():
             try:
                 load(path).run(h)
             finally:
-                signal.alarm(0)
-                h.close()
+                try:
+                    signal.alarm(0)
+                finally:
+                    h.close()
         print(f"PASS scenario {path.stem} in {time.monotonic() - started:.1f}s; disposable processes, home and gateway removed", flush=True)
 
 
