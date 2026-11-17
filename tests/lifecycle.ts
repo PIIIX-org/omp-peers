@@ -42,7 +42,8 @@ const api = {
 } as unknown as ExtensionAPI;
 
 async function emit(name: string, context: ExtensionContext): Promise<void> {
-	for (const fn of hooks.get(name) ?? []) await fn({ type: name }, context);
+	const event = name === "turn_end" ? { type: name, message: { role: "assistant", stopReason: "stop" } } : { type: name };
+	for (const fn of hooks.get(name) ?? []) await fn(event, context);
 }
 async function command(args: string, context: ExtensionContext): Promise<string> {
 	await commands.get("peers")!(args, context);

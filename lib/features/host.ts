@@ -15,7 +15,15 @@ export interface PeerView {
 	refusesInbound?: boolean;
 	/** The `usage` value the peer published in its registry row, unvalidated (undefined when it published none); only the usage feature interprets it. */
 	usage?: unknown;
-	/** When the peer's registry row was last written (ISO), as published; undefined when absent. */
+	/** Published busy state (a turn is running); undefined when unknown. */
+	busy?: boolean;
+	/** Published context usage text such as `1234 (56%)`; empty or undefined when the peer has no figure. */
+	context?: string;
+	/** Published explicit pause; undefined on registrations from versions without pause. */
+	paused?: boolean;
+	/** Consecutive assistant turns that ended in an error, counted by the peer since its process started; undefined on versions that do not publish it. */
+	recentErrorTurns?: number;
+	/** ISO time of the peer's last registry write; undefined when unknown. */
 	updatedAt?: string;
 }
 

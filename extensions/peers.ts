@@ -28,6 +28,7 @@ import { formatActivity, initializeActivityHost, readActivity, type PeerActivity
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, logicalId, matchesWriter, resolvePeerTargets, skippedLine, stablePeerId, type IdentityStatus, type Skipped } from "../lib/identity";
 import { FEATURES } from "../lib/features";
+import { autoCompactRuntime } from "../lib/features/autocompact";
 import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInput } from "../lib/features/audit";
 import type { FeatureHost, ModelApply, ModelCheck, SendResult } from "../lib/features/host";
 import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
@@ -153,6 +154,8 @@ interface PeerInfo extends PeerActivity {
 	pausedSince?: string;
 	/** Token counters this session's user chose to publish (`/peers usage on`); absent means unknown, never zero. */
 	usage?: PublishedUsage;
+	/** Consecutive assistant turns that ended in an error, counted since this process started (the watchdog reads it). Absent on registrations from older versions. */
+	recentErrorTurns?: number;
 }
 interface Req {
 	op: string;
@@ -198,6 +201,7 @@ const state = {
 	forcedTier: undefined as Tier | undefined,
 	timer: undefined as unknown,
 	rate: new Map<string, number[]>(),
+	errorTurns: 0,
 };
 let exitHooked = false;
 const sockPath = () => path.join(ROOT, `${state.id}.sock`);
@@ -252,6 +256,7 @@ function bindIdentity(sessionId: string): void {
 	notifications.bind(sessionId);
 	state.id = stablePeerId(sessionId);
 	state.saved = { name: "", restoreMaster: false, routingPolicy: "keep" };
+	state.errorTurns = 0;
 	state.identityError = "";
 	for (const dir of [ROOT, SESSION_ROOT]) {
 		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -352,6 +357,7 @@ function selfInfo(pi: ExtensionAPI): PeerInfo {
 		paused: pause.paused,
 		pausedSince: pause.since === undefined ? undefined : new Date(pause.since).toISOString(),
 		usage: usageForRegistry(os.homedir(), state.id, () => usageSourceOf(ctx)),
+		recentErrorTurns: state.errorTurns,
 	};
 }
 
@@ -825,6 +831,7 @@ export default function peers(pi: ExtensionAPI) {
 		state.manager = ctx.sessionManager;
 		bindIdentity(ctx.sessionManager.getSessionId());
 		state.ctx = ctx;
+		autoCompactRuntime.bind(ctx);
 		return true;
 	};
 	const refresh = (ctx: ExtensionContext) => {
@@ -842,12 +849,38 @@ export default function peers(pi: ExtensionAPI) {
 		ctx.ui.setStatus("peers", `peers:${n}${m === state.id ? " ★master" : m ? ` master:${m}` : ""}${readPause(os.homedir(), state.id).paused ? " paused" : ""}`);
 	};
 
+	// Periodic feature work (the watchdog) rides the 5 s refresh, runs only in the master session and never overlaps itself.
+	// A failing tick warns once per feature and never breaks the refresh.
+	let ticking = false;
+	const warnedTicks = new Set<string>();
+	const runTicks = async (ctx: ExtensionContext) => {
+		if (ticking || !state.sessionLock?.acquired || state.identityError || masterId() !== state.id) return;
+		ticking = true;
+		try {
+			const host = featureHost(ctx);
+			for (const feature of FEATURES) {
+				try {
+					await feature.tick?.(host);
+				} catch (error) {
+					if (warnedTicks.has(feature.name)) continue;
+					warnedTicks.add(feature.name);
+					ctx.ui.notify(`peers ${feature.name}: periodic check failed: ${(error as Error).message}`, "warning");
+				}
+			}
+		} finally {
+			ticking = false;
+		}
+	};
+
 	pi.on("session_start", async (_e, ctx) => {
 		if (ctx.mode === "print" || ctx.mode === "json" || !bind(ctx)) return;
 		await initializeActivityHost();
 		refresh(ctx);
 		if (state.timer) ctx.clearTimer(state.timer as never);
-		state.timer = ctx.setInterval(() => refresh(state.ctx ?? ctx), 5_000);
+		state.timer = ctx.setInterval(() => {
+			refresh(state.ctx ?? ctx);
+			void runTicks(state.ctx ?? ctx);
+		}, 5_000);
 		// A template named in the environment is only shown, never applied: the variable is inherited by every program this session starts.
 		if (process.env.OMP_PEERS_TEMPLATE?.trim()) {
 			const text = state.sessionLock?.acquired
@@ -859,8 +892,12 @@ export default function peers(pi: ExtensionAPI) {
 	const refreshAfterEvent = async (_event: unknown, ctx: ExtensionContext) => {
 		if (ctx.agent.kind === "main" && state.server) refresh(ctx);
 	};
-	pi.on("session_switch", refreshAfterEvent);
+	pi.on("session_switch", async (event, ctx) => {
+		if (ctx.agent.kind === "main") autoCompactRuntime.onSessionChange(ctx);
+		await refreshAfterEvent(event, ctx);
+	});
 	pi.on("agent_start", async (_event, ctx) => {
+		autoCompactRuntime.onAgentStart(ctx);
 		if (ctx.agent.kind === "main" && state.server && bind(ctx)) notifications.start();
 		await refreshAfterEvent(_event, ctx);
 	});
@@ -868,7 +905,13 @@ export default function peers(pi: ExtensionAPI) {
 		if (ctx.agent.kind === "main" && state.server && bind(ctx)) notifications.end(selfInfo(pi).name);
 		await refreshAfterEvent(_event, ctx);
 	});
-	pi.on("turn_end", refreshAfterEvent);
+	pi.on("turn_end", async (event, ctx) => {
+		// Metadata only: the stop reason of this session's own assistant turns, never their content.
+		if (ctx.agent.kind === "main" && state.manager === ctx.sessionManager && event.message.role === "assistant") {
+			state.errorTurns = event.message.stopReason === "error" ? state.errorTurns + 1 : 0;
+		}
+		await refreshAfterEvent(event, ctx);
+	});
 	// Track the session's current task tier from the prompt it is about to work on (the master's explicit tier wins).
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind !== "main" || event.reason === "revive" || !event.prompt) return;
@@ -887,7 +930,7 @@ export default function peers(pi: ExtensionAPI) {
 			isMaster: () => masterId() === id,
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
-				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse", usage: p.usage, updatedAt: p.updatedAt })),
+				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse", busy: p.busy, context: p.context, paused: p.paused, recentErrorTurns: p.recentErrorTurns, usage: p.usage, updatedAt: p.updatedAt })),
 			groupsOf: peerId => groupsOf(os.homedir(), peerId),
 			resolveGroup: async (name, op) => {
 				const { peers, error, skipped } = await resolveTargets(`group:${name}`, op);
@@ -910,6 +953,16 @@ export default function peers(pi: ExtensionAPI) {
 		};
 	};
 	featureHostFor = featureHost;
+	// Opt-in auto-compact (/peers autocompact): evaluated only after the main agent's whole run ended, never from turn_end.
+	pi.on("agent_end", async (_event, ctx) => {
+		if (ctx.agent.kind === "main" && state.server && bind(ctx)) autoCompactRuntime.onAgentEnd(ctx, featureHost(ctx));
+	});
+	pi.on("auto_compaction_start", async (_event, ctx) => {
+		if (ctx.agent.kind === "main") autoCompactRuntime.onHostCompaction(true);
+	});
+	pi.on("auto_compaction_end", async (_event, ctx) => {
+		if (ctx.agent.kind === "main") autoCompactRuntime.onHostCompaction(false);
+	});
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		const host = featureHost(ctx);
@@ -954,6 +1007,7 @@ export default function peers(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_e, ctx) => {
 		// A pinned process releases its identity only when the pinned session shuts down.
 		if (ctx.agent.kind !== "main" || (state.manager && state.manager !== ctx.sessionManager)) return;
+		autoCompactRuntime.onSessionChange(ctx);
 		teardown();
 		state.manager = undefined;
 		if (state.timer) ctx.clearTimer(state.timer as never);
