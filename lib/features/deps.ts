@@ -194,7 +194,7 @@ function label(id: string, live: PeerView[]): string {
 }
 
 /** Exact id or exact (case-sensitive) name of a live session. Never guesses on ambiguity. */
-function resolveLive(spec: string, live: PeerView[]): { id?: string; error?: string } {
+export function resolveLive(spec: string, live: PeerView[]): { id?: string; error?: string } {
 	const byId = live.find(peer => peer.id === spec);
 	if (byId) return { id: byId.id };
 	const named = live.filter(peer => peer.name === spec);
@@ -262,7 +262,7 @@ function targetBlockers(host: FeatureHost, rule: DepRule, live: PeerView[]): str
 }
 
 /** Failures after which the message may still have arrived; a retry could deliver it twice. */
-const ambiguous = (reason: string): boolean => /^(?:timeout|connection closed|bad response|response too large)$/.test(reason) || /^unreachable \((?!ECONNREFUSED|ENOENT)/.test(reason);
+export const ambiguous = (reason: string): boolean => /^(?:timeout|connection closed|bad response|response too large)$/.test(reason) || /^unreachable \((?!ECONNREFUSED|ENOENT)/.test(reason);
 
 // ---- Operations --------------------------------------------------------------------------------
 
