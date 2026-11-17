@@ -16,6 +16,8 @@ import { MAX_EVENT_BYTES, NAME_RE, openRegular, parseJsonBytes, readBounded, val
 export const MAX_SPOOL_FILES = 20;
 /** Directory entries looked at per tick, so a directory full of junk cannot stall the tick. */
 export const MAX_SPOOL_SCAN = 200;
+/** A spool file older than this (by modification time) is dropped unread: events expire after 72 hours everywhere else too. */
+export const MAX_SPOOL_AGE_MS = 72 * 3_600_000;
 const FILE_RE = /^ev-\d{13}-[0-9a-f]{16}\.json$/;
 
 /**
@@ -81,15 +83,16 @@ export function writeSpoolEvent(home: string, source: string, raw: unknown, now:
 }
 
 /** One spool file the master looked at: either bytes to process or the reason it must be rejected. */
-export type SpoolEntry = { name: string; body: Buffer } | { name: string; reject: RejectReason };
+export type SpoolEntry = { name: string; body: Buffer } | { name: string; reject: RejectReason } | { name: string; expired: true };
 
 /**
  * Master side: look at up to MAX_SPOOL_SCAN directory entries and read up to MAX_SPOOL_FILES eligible files. Only
  * names the producer writes are considered; symlinks, FIFOs, directories and everything else are ignored (counted,
  * never followed or removed). A regular file that is oversize, foreign-owned or writable by group or others is
- * returned as a rejection without being read.
+ * returned as a rejection without being read, and one whose modification time is 72 hours or more before `now` is
+ * reported as expired without being read.
  */
-export function scanSpool(dir: string, uid: number | undefined = currentUid()): { entries: SpoolEntry[]; ignored: number } {
+export function scanSpool(dir: string, uid: number | undefined = currentUid(), now: number = Date.now()): { entries: SpoolEntry[]; ignored: number } {
 	const entries: SpoolEntry[] = [];
 	let ignored = 0;
 	const names: string[] = [];
@@ -114,6 +117,7 @@ export function scanSpool(dir: string, uid: number | undefined = currentUid()): 
 		try {
 			if (uid !== undefined && opened.stat.uid !== uid) entries.push({ name, reject: "file not owned by user" });
 			else if ((opened.stat.mode & 0o022) !== 0) entries.push({ name, reject: "file mode unsafe" });
+			else if (now - opened.stat.mtimeMs >= MAX_SPOOL_AGE_MS) entries.push({ name, expired: true });
 			else if (opened.stat.size > MAX_EVENT_BYTES) entries.push({ name, reject: "too large" });
 			else entries.push({ name, body: Buffer.from(readBounded(opened.fd, MAX_EVENT_BYTES)) });
 		} finally {

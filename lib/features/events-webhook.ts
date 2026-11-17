@@ -33,7 +33,7 @@ export interface WebhookApp {
 	/** A request failed authentication; `why` is a fixed word. Called for every failure: the feature rate-limits what it records. */
 	denied(name: string, why: "missing signature" | "bad signature" | "no usable secret"): void;
 	/** An authenticated body: returns the HTTP status to send. */
-	accept(name: string, headers: { event?: string; delivery?: string }, body: Buffer): Promise<number>;
+	accept(name: string, body: Buffer): Promise<number>;
 	/** False once the listener must stop (the session is no longer master, or events were turned off). */
 	alive(): boolean;
 }
@@ -109,7 +109,7 @@ export function startWebhook(port: number, app: WebhookApp, limits: WebhookLimit
 		socket.on("close", () => open.delete(socket));
 		socket.on("error", () => socket.destroy());
 		const timer = setTimeout(() => {
-			if (!socket.writableEnded) reply(socket, 408);
+			finish(408);
 			setTimeout(() => socket.destroy(), 100).unref();
 		}, limits.requestTimeoutMs);
 		socket.on("close", () => clearTimeout(timer));
@@ -155,7 +155,7 @@ export function startWebhook(port: number, app: WebhookApp, limits: WebhookLimit
 				return 401;
 			}
 			// Authenticated: only now is the body parsed, by the feature.
-			return app.accept(name, { event: parsed.headers.get("x-github-event"), delivery: parsed.headers.get("x-github-delivery") }, body);
+			return app.accept(name, body);
 		};
 		socket.on("data", (chunk: Buffer) => {
 			if (done) return;

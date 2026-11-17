@@ -14,7 +14,7 @@
   "files": ["extensions", "lib", "tools", "docs", "scripts/omp-peers-event.ts", "tests/identity.test.ts", "tests/smoke.py", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "lint": "eslint extensions/*.ts \"lib/**/*.ts\" tests/*.test.ts tests/features/*.ts",
+    "lint": "eslint extensions/*.ts \"lib/**/*.ts\" scripts/*.ts tests/*.test.ts tests/features/*.ts",
     "test:watcher": "python3 -m unittest discover -s tests -p 'test_*.py'",
     "test:smoke": "python3 tests/smoke.py",
     "test:activity": "bun test tests/activity.test.ts",

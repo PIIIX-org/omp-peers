@@ -87,8 +87,8 @@ export interface FeatureHost {
 	/**
 	 * Send an ordinary peer message to the live session with stable id `to`. It takes the same path as
 	 * `peers_send`, so the receiver's inbound refuse, lock and rate limit apply unchanged. Never resumes a
-	 * session that is not live. `dependency: true` marks authorized work (a dependency trigger): the RECEIVER then
-	 * also refuses it while its own control is locked, so a lock set after the sender's preflight still holds.
+	 * session that is not live. `dependency: true` marks a delivery the master initiated on its own authority (a dependency trigger, an external
+	 * event): the RECEIVER then also refuses it while its own control is locked, so a lock set after the sender's preflight still holds.
 	 */
 	send(to: string, req: { text: string; dependency?: boolean }): Promise<SendResult>;
 	/**

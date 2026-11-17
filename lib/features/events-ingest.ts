@@ -9,7 +9,7 @@
  * string that survives is stripped of control characters and ANSI sequences, screened for credentials and
  * measured in bytes (`Buffer.byteLength`), so the stored and delivered text is bounded and printable.
  */
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs";
 import { looksLikeSecret } from "./secrets";
 
@@ -88,7 +88,21 @@ export function capBytes(text: string, max: number): string {
 	return out;
 }
 
-const containsDeliveryPrefix = (text: string): boolean => text.replace(/\s+/g, "").toLowerCase().includes(DELIVERY_PREFIX.replace(/\s+/g, ""));
+/** Look-alike letters (Cyrillic, Greek) folded to Latin; NFKD already folds full-width and accented forms. */
+const CONFUSABLES: Record<string, string> = {
+	"а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "і": "i", "ј": "j", "у": "y", "х": "x", "ѕ": "s", "һ": "h", "ԁ": "d", "ԛ": "q", "ԝ": "w",
+	"α": "a", "ε": "e", "ο": "o", "ρ": "p", "ι": "i", "ν": "v", "υ": "u", "κ": "k", "τ": "t", "η": "n", "χ": "x", "β": "b", "ɡ": "g", "ӏ": "l",
+};
+const RESERVED_PHRASES = [DELIVERY_PREFIX, "event work dispatch", "authorized by the user"];
+/** Lower-case, strip accents, fold look-alikes and keep only letters, digits and `[`: spacing, punctuation and zero-width tricks vanish. */
+const fold = (text: string): string =>
+	[...text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()].map(char => CONFUSABLES[char] ?? char).join("").replace(/[^a-z0-9[]/g, "");
+const FOLDED_RESERVED = RESERVED_PHRASES.map(fold);
+/** Whether `text` contains a phrase the plugin's own frames start with or use to claim authority; such text is never accepted as event content. */
+const containsReserved = (text: string): boolean => {
+	const folded = fold(text);
+	return FOLDED_RESERVED.some(phrase => folded.includes(phrase));
+};
 
 // ---- Strict generic validation -----------------------------------------------------------------
 
@@ -107,7 +121,7 @@ export function validateGeneric(value: unknown): Parsed {
 	if (typeof summary !== "string" || !summary || Buffer.byteLength(summary) > MAX_SUMMARY_BYTES) return reject("bad summary");
 	const cleanSummary = cleanText(summary);
 	if (!cleanSummary) return reject("bad summary");
-	if (containsDeliveryPrefix(cleanSummary)) return reject("reserved text");
+	if (containsReserved(cleanSummary)) return reject("reserved text");
 	const out: Record<string, FieldValue> = {};
 	if (fields !== undefined) {
 		if (!isPlain(fields)) return reject("bad fields");
@@ -119,7 +133,7 @@ export function validateGeneric(value: unknown): Parsed {
 				if (!raw || Buffer.byteLength(raw) > MAX_FIELD_VALUE_BYTES) return reject("bad fields");
 				const clean = cleanText(raw);
 				if (!clean) return reject("bad fields");
-				if (containsDeliveryPrefix(clean)) return reject("reserved text");
+				if (containsReserved(clean)) return reject("reserved text");
 				out[key] = looksLikeSecret(clean) || looksLikeSecret(`${key}=${clean}`) || looksLikeSecret(`${key}: ${clean}`) ? WITHHELD : clean;
 			} else if (typeof raw === "boolean" || (typeof raw === "number" && Number.isFinite(raw))) {
 				out[key] = raw;
@@ -144,14 +158,37 @@ export function parseJsonBytes(bytes: Uint8Array): { ok: true; value: unknown } 
 const textOf = (value: unknown, max: number): string | undefined => (typeof value === "string" && value ? capBytes(cleanText(value), max) || undefined : undefined);
 const pick = (...values: unknown[]): unknown => values.find(value => value !== undefined && value !== null);
 
+/** Payload shape -> GitHub event name, in priority order. The type comes from the SIGNED body, never from a header. */
+const GITHUB_KINDS: Array<[(body: Record<string, unknown>) => boolean, string]> = [
+	[b => isPlain(b.pull_request) && isPlain(b.review), "pull_request_review"],
+	[b => isPlain(b.pull_request) && isPlain(b.comment), "pull_request_review_comment"],
+	[b => isPlain(b.pull_request), "pull_request"],
+	[b => isPlain(b.issue) && isPlain(b.comment), "issue_comment"],
+	[b => isPlain(b.issue), "issues"],
+	[b => isPlain(b.workflow_run), "workflow_run"],
+	[b => isPlain(b.workflow_job), "workflow_job"],
+	[b => isPlain(b.check_run), "check_run"],
+	[b => isPlain(b.check_suite), "check_suite"],
+	[b => isPlain(b.release), "release"],
+	[b => isPlain(b.deployment_status), "deployment_status"],
+	[b => isPlain(b.deployment), "deployment"],
+	[b => isPlain(b.discussion), "discussion"],
+	[b => typeof b.ref === "string" && Array.isArray(b.commits) && isPlain(b.pusher), "push"],
+	[b => typeof b.zen === "string" && b.hook_id !== undefined, "ping"],
+];
+
 /**
- * Pure mapping from a GitHub webhook (`X-GitHub-Event`, `X-GitHub-Delivery`, JSON body) to the generic shape. Only
- * a whitelist of body fields is read (repository.full_name, action, sender.login, number, title, html_url, each
- * looked up at the top level and under pull_request or issue); anything else in the body is ignored, never
- * forwarded. The result goes through the same strict validation and sanitising as every other event.
+ * Pure mapping from a signed GitHub webhook body to the generic shape. NOTHING unsigned is used: the event id is a
+ * hash of the raw signed bytes (so a replayed or re-delivered body is a duplicate, and altering `X-GitHub-Delivery`
+ * or `X-GitHub-Event` can neither burn another event's id nor change its type), and the type is derived from the
+ * body's own structure (`github.<kind>`, or `github.event` when the shape is not recognised). Only a whitelist of body
+ * fields is read (repository.full_name, action, sender.login, number, title, html_url, each looked up at the top
+ * level and under pull_request or issue); anything else in the body is ignored, never forwarded. The result goes
+ * through the same strict validation and sanitising as every other event.
  */
-export function githubToEvent(headers: { event?: string; delivery?: string }, body: unknown): Parsed {
-	if (typeof headers.event !== "string" || !/^[a-z_]{1,32}$/.test(headers.event) || !isPlain(body)) return reject("bad github event");
+export function githubToEvent(body: unknown, raw: Uint8Array): Parsed {
+	if (!isPlain(body)) return reject("bad github event");
+	const kind = GITHUB_KINDS.find(([matches]) => matches(body))?.[1] ?? "event";
 	const nested = (key: string): Record<string, unknown> => (isPlain(body[key]) ? (body[key] as Record<string, unknown>) : {});
 	const pull = nested("pull_request");
 	const issue = nested("issue");
@@ -168,8 +205,8 @@ export function githubToEvent(headers: { event?: string; delivery?: string }, bo
 	if (typeof number === "number" && Number.isSafeInteger(number) && number >= 0) fields.number = number;
 	if (title) fields.title = title;
 	if (typeof url === "string" && /^https:\/\/[!-~]{1,112}$/.test(url)) fields.url = url;
-	const summary = capBytes(`${headers.event}${action ? ` ${action}` : ""}${repository ? ` in ${repository}` : ""}${sender ? ` by ${sender}` : ""}`, MAX_SUMMARY_BYTES);
-	return validateGeneric({ id: headers.delivery, type: `github.${headers.event}`, summary, fields });
+	const summary = capBytes(`${kind}${action ? ` ${action}` : ""}${repository ? ` in ${repository}` : ""}${sender ? ` by ${sender}` : ""}`, MAX_SUMMARY_BYTES);
+	return validateGeneric({ id: `gh-${createHash("sha256").update(raw).digest("hex").slice(0, 32)}`, type: `github.${kind}`, summary, fields });
 }
 
 // ---- HMAC verification -------------------------------------------------------------------------

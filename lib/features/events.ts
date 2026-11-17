@@ -25,6 +25,7 @@ import type { FeatureHost, PeerView } from "./host";
 import type { Feature } from "./index";
 import { PAUSED_ERROR, readPause } from "./pause";
 import { GROUP_RE } from "./rules";
+import { AT_RE, hostZone, localMinute, validateZone } from "./schedule";
 import { looksLikeSecret } from "./secrets";
 import { privateDir, readState, stateRoot, updateState } from "./store";
 
@@ -128,6 +129,15 @@ export interface Counters {
 	failed: number;
 }
 
+/** A daily window, in an IANA zone's wall clock, during which `info` deliveries are held. */
+export interface Quiet {
+	/** `HH:MM`, inclusive. */
+	start: string;
+	/** `HH:MM`, exclusive; earlier than `start` means the window crosses midnight. */
+	end: string;
+	timezone: string;
+}
+
 export interface EventsState {
 	version: 1;
 	nextItemId: number;
@@ -135,6 +145,8 @@ export interface EventsState {
 	cli: boolean;
 	/** The loopback listener port, when the listener is on. */
 	webhookPort: number | null;
+	/** Quiet hours: while active, `info` items stay queued; null = off. */
+	quiet: Quiet | null;
 	sources: Source[];
 	routes: Route[];
 	/** Hashes of (source, event id) with the time first seen. */
@@ -151,7 +163,7 @@ export interface EventsState {
 export const eventsFile = (home: string) => path.join(stateRoot(home), "events.json");
 
 const emptyState = (): EventsState => ({
-	version: 1, nextItemId: 1, cli: false, webhookPort: null, sources: [], routes: [], seen: [], ingested: [], hits: {}, queue: [], log: [],
+	version: 1, nextItemId: 1, cli: false, webhookPort: null, quiet: null, sources: [], routes: [], seen: [], ingested: [], hits: {}, queue: [], log: [],
 	counters: { accepted: 0, delivered: 0, duplicate: 0, rejected: 0, dropped: 0, failed: 0 },
 });
 
@@ -170,6 +182,9 @@ function validateState(value: unknown): EventsState {
 	const s = value as Partial<EventsState> | null;
 	if (!s || typeof s !== "object" || s.version !== 1) bad("unsupported version (expected 1)");
 	const state = s as EventsState;
+	const quiet = (state as Partial<EventsState>).quiet;
+	if (quiet === undefined) state.quiet = null;
+	else if (quiet !== null && !(typeof quiet === "object" && AT_RE.test(quiet.start) && AT_RE.test(quiet.end) && quiet.start !== quiet.end && typeof quiet.timezone === "string" && validateZone(quiet.timezone) === quiet.timezone)) bad("malformed quiet hours");
 	if (!isCount(state.nextItemId) || state.nextItemId < 1 || typeof state.cli !== "boolean" || !(state.webhookPort === null || (Number.isInteger(state.webhookPort) && state.webhookPort >= MIN_PORT && state.webhookPort <= 65535))) bad("malformed fields");
 	if (![state.sources, state.routes, state.seen, state.ingested, state.queue, state.log].every(Array.isArray) || typeof state.hits !== "object" || !state.hits || Array.isArray(state.hits)) bad("malformed fields");
 	if (state.sources.length > MAX_SOURCES || state.routes.length > MAX_ROUTES || state.seen.length > MAX_SEEN || state.queue.length > MAX_QUEUE || state.log.length > MAX_LOG || state.ingested.length > GLOBAL_PER_HOUR) bad("a list exceeds its limit");
@@ -229,6 +244,20 @@ const update = <R>(host: FeatureHost, fn: (draft: EventsState) => { changed: boo
 	});
 
 const isOn = (state: EventsState): boolean => state.cli || state.webhookPort !== null;
+
+const minutesOf = (at: string): number => Number(at.slice(0, 2)) * 60 + Number(at.slice(3));
+
+/**
+ * Whether `now` falls in the quiet window: the zone's wall clock reads at least `start` and before `end` (start
+ * inclusive, end exclusive; a window whose end is earlier than its start crosses midnight). The window is defined in
+ * wall-clock time, so on a DST day a time that does not exist is simply never inside it and a repeated time is inside both times.
+ */
+export function inQuiet(quiet: Quiet | null, now: number): boolean {
+	if (!quiet) return false;
+	const at = minutesOf(localMinute(quiet.timezone, now).slice(11));
+	const [from, to] = [minutesOf(quiet.start), minutesOf(quiet.end)];
+	return from < to ? at >= from && at < to : at >= from || at < to;
+}
 const oneLine = (raw: string, max = MAX_REASON): string => capBytes(cleanText(raw), max) || "unknown reason";
 const eventKey = (source: string, id: string): string => createHash("sha256").update(`${source}\0${id}`).digest("hex").slice(0, 32);
 
@@ -290,10 +319,23 @@ interface Attempt {
 	final: Array<{ to: string; reason: string }>;
 	/** A send ended without proof either way; the item is closed rather than retried. */
 	unknown: boolean;
+	/** Events were turned off, this session stopped being the master (or quiet hours began) before a send: the rest was not sent and the item is put back unchanged. */
+	aborted: boolean;
+}
+
+/** Whether delivering `mode` items is still allowed right now: master, events on and, for info, outside quiet hours. Read fresh. */
+function mayDeliver(host: FeatureHost, mode: Item["mode"]): boolean {
+	try {
+		if (!host.isMaster()) return false;
+		const state = readEvents(host);
+		return isOn(state) && (mode === "work" || !inQuiet(state.quiet, host.now()));
+	} catch {
+		return false;
+	}
 }
 
 async function attempt(host: FeatureHost, item: Item): Promise<Attempt> {
-	const out: Attempt = { delivered: [], failed: [], final: [], unknown: false };
+	const out: Attempt = { delivered: [], failed: [], final: [], unknown: false, aborted: false };
 	const group = item.to.startsWith("group:");
 	let peers: PeerView[];
 	let targets: string[];
@@ -315,8 +357,14 @@ async function attempt(host: FeatureHost, item: Item): Promise<Attempt> {
 			(group ? out.final : out.failed).push({ to: id, reason: blocked });
 			continue;
 		}
+		// Checked again before EVERY send: `off`, a master handoff or the start of quiet hours stops the rest of a batch or group.
+		if (!mayDeliver(host, item.mode)) {
+			out.aborted = true;
+			break;
+		}
 		try {
-			const sent = await host.send(id, { text, ...(item.mode === "work" ? { dependency: true } : {}) });
+			// `dependency: true` for info too: the receiver then also refuses while its own control is locked, even if the lock was set after our check.
+			const sent = await host.send(id, { text, dependency: true });
 			if (sent.status === "delivered") out.delivered.push(id);
 			else {
 				const reason = sent.status === "offline" ? "not running" : sent.reason === PAUSED_ERROR ? "paused" : oneLine(sent.reason);
@@ -330,7 +378,7 @@ async function attempt(host: FeatureHost, item: Item): Promise<Attempt> {
 	return out;
 }
 
-type Settled = "done" | "retry" | "exhausted" | "unknown";
+type Settled = "done" | "retry" | "exhausted" | "unknown" | "aborted";
 
 /** Record `result` for the claimed `item` (a draft inside the state lock) and decide whether it is finished, retried or given up. */
 function settle(state: EventsState, item: Item, result: Attempt, now: number): Settled {
@@ -343,8 +391,21 @@ function settle(state: EventsState, item: Item, result: Attempt, now: number): S
 		note(state, now, { ...base, outcome: "failed: outcome unknown (may have been delivered)" });
 		return "unknown";
 	}
+	if (result.aborted) {
+		// Nothing about this attempt counts: the item goes back as it was (minus what was already delivered).
+		item.delivered = [...item.delivered, ...result.delivered];
+		item.status = item.mode === "work" ? "awaiting" : "queued";
+		item.attempts--;
+		delete item.claimedAt;
+		return "aborted";
+	}
 	if (!result.failed.length) {
 		remove();
+		return "done";
+	}
+	if (!state.routes.some(route => route.name === item.route)) {
+		remove();
+		note(state, now, { ...base, outcome: "dropped: route removed" });
 		return "done";
 	}
 	if (item.attempts >= MAX_ATTEMPTS) {
@@ -380,12 +441,14 @@ function sweep(state: EventsState, now: number): boolean {
 const isDue = (item: Item, now: number): boolean => item.status === "queued" && item.nextAt <= now;
 const needsSweep = (state: EventsState, now: number): boolean => state.queue.some(item => (item.status === "sending" ? now - (item.claimedAt ?? 0) >= SENDING_TTL_MS : now - item.createdAt >= WINDOW_MS));
 
-/** Claim the next due info item under the lock, so two processes never send the same one. */
-async function claimNext(host: FeatureHost): Promise<Item | undefined> {
+/** Claim the next due info item (not for a target in `exclude`) under the lock, so two processes never send the same one. */
+async function claimNext(host: FeatureHost, exclude: Set<string>): Promise<Item | undefined> {
 	const now = host.now();
+	if (!host.isMaster()) return undefined;
 	return update<Item | undefined>(host, draft => {
 		const swept = sweep(draft, now);
-		const item = draft.queue.find(candidate => isDue(candidate, now));
+		// Re-checked under the lock: off, or quiet hours, between the tick's read and this claim must not start a delivery.
+		const item = isOn(draft) && !inQuiet(draft.quiet, now) ? draft.queue.find(candidate => isDue(candidate, now) && !exclude.has(candidate.to)) : undefined;
 		if (item) {
 			item.status = "sending";
 			item.claimedAt = now;
@@ -494,6 +557,15 @@ export function recordRejected(host: FeatureHost, source: string | undefined, re
 	});
 }
 
+/** Record an item that was dropped before it was ever queued (an expired spool file). */
+function recordDropped(host: FeatureHost, reason: "expired"): Promise<void> {
+	const now = host.now();
+	return update<void>(host, state => {
+		note(state, now, { source: "-", id: "-", outcome: `dropped: ${reason}` });
+		return { changed: true, result: undefined };
+	});
+}
+
 // ---- Webhook lifecycle -------------------------------------------------------------------------
 
 interface Running {
@@ -533,11 +605,11 @@ function webhookApp(ctx: { host: FeatureHost }, port: number): WebhookApp {
 			denials.lastRecorded = now;
 			void recordRejected(ctx.host, name, why === "no usable secret" ? "secret file unusable" : "bad signature").catch(() => {});
 		},
-		accept: async (name, headers, body) => {
+		accept: async (name, body) => {
 			const json = parseJsonBytes(body);
 			const out = await ingestEvent(ctx.host, "webhook", name, source => {
 				if (!json.ok) return { ok: false, reason: json.reason };
-				return source.adapter === "github" ? githubToEvent(headers, json.value) : validateGeneric(json.value);
+				return source.adapter === "github" ? githubToEvent(json.value, body) : validateGeneric(json.value);
 			});
 			if (out.outcome === "queued") return 202;
 			if (out.outcome === "duplicate") return 200;
@@ -612,8 +684,9 @@ async function readSpool(host: FeatureHost): Promise<void> {
 		return;
 	}
 	spoolError = undefined;
-	for (const entry of scanSpool(dir).entries) {
-		if ("reject" in entry) await recordRejected(host, undefined, entry.reject);
+	for (const entry of scanSpool(dir, undefined, host.now()).entries) {
+		if ("expired" in entry) await recordDropped(host, "expired");
+		else if ("reject" in entry) await recordRejected(host, undefined, entry.reject);
 		else {
 			const envelope = parseEnvelope(entry.body);
 			if (!envelope.ok) await recordRejected(host, envelope.source, envelope.reason);
@@ -641,9 +714,12 @@ export async function tick(host: FeatureHost): Promise<void> {
 	await syncListener(host, state.webhookPort);
 	if (state.cli) await readSpool(host);
 	const started = host.now();
-	for (let sent = 0; sent < MAX_DELIVERIES_PER_TICK && host.now() - started < TICK_BUDGET_MS; sent++) {
-		const item = await claimNext(host);
+	// One item per target per tick keeps a backlog under the receiver's per-sender rate limit (20 a minute, 12 ticks a minute).
+	const served = new Set<string>();
+	for (let sent = 0; sent < MAX_DELIVERIES_PER_TICK && host.now() - started < TICK_BUDGET_MS && host.isMaster(); sent++) {
+		const item = await claimNext(host, served);
 		if (!item) break;
+		served.add(item.to);
 		await finish(host, item, await attempt(host, item));
 	}
 }
@@ -688,6 +764,14 @@ function describeSource(home: string, source: Source): string {
 	return `${source.name}  webhook, ${source.adapter}  POST /events/${source.name}  secret file ${source.secretFile} (${secret?.ok ? "usable" : `NOT usable: ${secret?.error ?? "none"}`})`;
 }
 
+function quietLine(state: EventsState, now: number): string {
+	const { quiet } = state;
+	if (!quiet) return "quiet hours: off";
+	const active = inQuiet(quiet, now);
+	const held = state.queue.filter(item => item.mode === "info" && item.status === "queued").length;
+	return `quiet hours: ${quiet.start}-${quiet.end} ${quiet.timezone} daily; ${active ? `ACTIVE now, ${held} info item${held === 1 ? " is" : "s are"} held` : "not active now"}`;
+}
+
 function renderStatus(host: FeatureHost, state: EventsState): string {
 	const now = host.now();
 	const master = host.isMaster() ? "this session is the master" : "this session is not the master; events are read and delivered only by the master";
@@ -699,6 +783,7 @@ function renderStatus(host: FeatureHost, state: EventsState): string {
 		`sources ${state.sources.length}/${MAX_SOURCES}${state.sources.length ? "" : ": none"}`,
 		...state.sources.map(source => `  ${describeSource(host.home, source)}`),
 		`routes ${state.routes.length}/${MAX_ROUTES} (see /peers events routes)`,
+		quietLine(state, now),
 		`queue ${state.queue.length}/${MAX_QUEUE}: ${state.queue.filter(i => i.status === "awaiting").length} awaiting approval, ${state.queue.filter(i => i.status === "queued").length} queued, ${state.queue.filter(i => i.status === "sending").length} sending`,
 		`dedupe: ${state.seen.filter(([, at]) => now - at < WINDOW_MS).length}/${MAX_SEEN} event ids kept for up to 72 h`,
 		`global cap: ${state.ingested.filter(at => now - at < HOUR_MS).length}/${GLOBAL_PER_HOUR} events accepted in the last hour`,
@@ -718,6 +803,7 @@ function renderRoutes(state: EventsState, now: number): string {
 }
 
 async function renderPending(host: FeatureHost, state: EventsState): Promise<string> {
+	const now = host.now();
 	const live = await livePeers(host);
 	if (!state.queue.length) return "no event items are queued or awaiting approval";
 	const lines = [
@@ -725,7 +811,8 @@ async function renderPending(host: FeatureHost, state: EventsState): Promise<str
 	];
 	for (const item of state.queue) {
 		lines.push(`  ${item.id}  ${item.status} (${item.mode})  route ${item.route}  attempts ${item.attempts}/${MAX_ATTEMPTS}  expires ${iso(item.createdAt + WINDOW_MS)}  -> ${targetLabel(item.to, live)}`);
-		if (item.status === "queued" && item.attempts > 0) lines.push(`      next attempt ${iso(item.nextAt)}`);
+		if (item.status === "queued" && inQuiet(state.quiet, now)) lines.push("      held by quiet hours; nothing is sent until the window ends");
+		else if (item.status === "queued" && item.attempts > 0) lines.push(`      next attempt ${iso(item.nextAt)}`);
 		lines.push(`      message (exactly):`, ...framed(item).map(line => `    ${line}`));
 		if (item.status === "awaiting") lines.push(...(await targetLines(host, item.to, live)).map(line => `      ${line}`));
 	}
@@ -746,7 +833,7 @@ function renderLog(state: EventsState): string {
 const USAGE =
 	"usage: /peers events status | on cli | on webhook <port> | off | source add <name> [--kind cli|webhook] [--adapter generic|github] [--secret-file <absolute path>] | source remove <name> | source list | " +
 	"route add <name> --source <source> [--type <type>] [--field k=v ...] --to <peer|group:name> [--mode info|work] [--max-per-hour N] [--task <text...>] | route remove <name> | routes | " +
-	"pending | approve <id> | reject <id> | log | test [--source <source>] [--file <event.json>] [--event <name> --delivery <id>]";
+	"pending | approve <id> | reject <id> | log | quiet set <HH:MM-HH:MM> [--tz <IANA zone>] | quiet off | quiet status | test [--source <source>] [--file <event.json>]";
 
 /** Option parsing for `--flag value` lists: `multi` flags may repeat, `rest` takes every remaining word. */
 function parseOptions(words: string[], single: string[], multi: string[], rest: string[]): { opts: Record<string, string>; multi: Record<string, string[]>; error?: string } {
@@ -916,6 +1003,7 @@ async function approve(host: FeatureHost, idSpec: string): Promise<string> {
 		case "retry": lines.push(`${id} is still awaiting approval (attempt ${item.attempts} of ${MAX_ATTEMPTS}); fix the cause and approve it again, or /peers events reject ${id}`); break;
 		case "exhausted": lines.push(`${id} used all ${MAX_ATTEMPTS} attempts and was dropped (failed: retries exhausted)`); break;
 		case "unknown": lines.push(`${id} outcome unknown: the send ended without proof either way, so it may have arrived and it is not retried (failed: outcome unknown)`); break;
+		case "aborted": lines.push(`${id} was not sent: events were turned off, or this session stopped being the master, while it was being delivered; it is still awaiting approval`); break;
 		case undefined: lines.push(`${id}: the claim was taken over by another process; see /peers events log`); break;
 		default:
 	}
@@ -978,26 +1066,54 @@ async function turnOff(host: FeatureHost): Promise<string> {
 	return `${kept.was ? "external events OFF" : "external events are already off"}: the listener is stopped and the spool is no longer read; ${kept.kept} queued or awaiting item${kept.kept === 1 ? " is" : "s are"} kept, cannot be approved or delivered while off, and expire 72 h after they were queued`;
 }
 
+async function quietCommand(host: FeatureHost, words: string[]): Promise<string> {
+	const [action, ...rest] = words;
+	if (action === "status" && !rest.length) return quietLine(readEvents(host), host.now());
+	if (action !== "set" && action !== "off") return USAGE;
+	if (!host.isMaster()) return `error: ${MASTER_ONLY}`;
+	if (action === "off") {
+		if (rest.length) return USAGE;
+		return update<string>(host, state => {
+			const was = state.quiet !== null;
+			state.quiet = null;
+			return { changed: was, result: was ? "quiet hours off: queued info items are delivered at the next tick" : "quiet hours are already off" };
+		});
+	}
+	const [range, ...flags] = rest;
+	const match = range === undefined ? null : /^(\d\d:\d\d)-(\d\d:\d\d)$/.exec(range);
+	if (!match || !AT_RE.test(match[1]) || !AT_RE.test(match[2])) return "error: the window is HH:MM-HH:MM on a 24 hour clock, for example 22:00-07:00";
+	if (match[1] === match[2]) return "error: the window must start and end at different times";
+	const { opts, error } = parseOptions(flags, ["--tz"], [], []);
+	if (error) return `error: ${error}`;
+	const timezone = opts["--tz"] === undefined ? hostZone() : validateZone(opts["--tz"]);
+	if (!timezone) return `error: "${(opts["--tz"] ?? "").slice(0, 64)}" is not an IANA time zone such as Europe/Berlin`;
+	const quiet: Quiet = { start: match[1], end: match[2], timezone };
+	await update<void>(host, state => ({ changed: true, result: void (state.quiet = quiet) }));
+	return `quiet hours set: ${quiet.start}-${quiet.end} ${timezone}, daily (start inclusive, end exclusive${quiet.start > quiet.end ? ", crossing midnight" : ""}); while active, info items stay queued (nothing is dropped, woken or sent) and are delivered after it ends, within the 72 h expiry; work approvals are not affected`;
+}
+
 async function testEvent(host: FeatureHost, words: string[]): Promise<string> {
-	const { opts, error } = parseOptions(words, ["--source", "--file", "--event", "--delivery"], [], []);
+	const { opts, error } = parseOptions(words, ["--source", "--file"], [], []);
 	if (error) return `error: ${error}`;
 	const state = readEvents(host);
 	const source = opts["--source"] ? state.sources.find(candidate => candidate.name === opts["--source"]) : state.sources.length === 1 ? state.sources[0] : undefined;
 	if (!source) return state.sources.length ? `error: choose --source <name> (${state.sources.map(candidate => candidate.name).join(", ")})` : "error: no sources are configured; add one with /peers events source add";
-	let json: { ok: true; value: unknown } | { ok: false; reason: RejectReason };
+	let bytes: Uint8Array;
 	if (opts["--file"]) {
 		const opened = openRegular(opts["--file"]);
 		if ("error" in opened) return `error: cannot read ${opts["--file"].slice(0, 200)}: ${opened.error}`;
 		try {
-			json = parseJsonBytes(readBounded(opened.fd, MAX_EVENT_BYTES + 1));
+			bytes = readBounded(opened.fd, MAX_EVENT_BYTES + 1);
 		} finally {
 			fs.closeSync(opened.fd);
 		}
-	} else json = { ok: true, value: { id: "test-1", type: "test", summary: "sample event" } };
-	const parsed: Parsed = !json.ok ? json : source.adapter === "github" ? githubToEvent({ event: opts["--event"] ?? "ping", delivery: opts["--delivery"] ?? "test-1" }, json.value) : validateGeneric(json.value);
+	} else bytes = Buffer.from(JSON.stringify({ id: "test-1", type: "test", summary: "sample event" }));
+	const json = parseJsonBytes(bytes);
+	const parsed: Parsed = !json.ok ? json : source.adapter === "github" ? githubToEvent(json.value, bytes) : validateGeneric(json.value);
 	const now = host.now();
 	const live = await livePeers(host);
 	const on = source.kind === "cli" ? state.cli : state.webhookPort !== null;
+	const quiet = inQuiet(state.quiet, now);
 	const lines = [
 		`test of source ${source.name} (${source.kind}, ${source.adapter}): nothing was queued, delivered or recorded, and the event id was not remembered`,
 		on ? `ingress: ${source.kind === "cli" ? "spool reader" : "webhook listener"} is on` : `ingress: ${source.kind === "cli" ? "spool reader" : "webhook listener"} is OFF, so a real event would be rejected: source disabled`,
@@ -1020,7 +1136,7 @@ async function testEvent(host: FeatureHost, words: string[]): Promise<string> {
 		lines.push(
 			route.mode === "work"
 				? `route ${route.name} (work): would queue ${item.id} awaiting your approval; nothing is sent until /peers events approve ${item.id}. Approval would send (exactly):`
-				: `route ${route.name} (info): would be delivered automatically. Message (exactly):`,
+				: `route ${route.name} (info): would be ${quiet ? "queued and held by quiet hours until the window ends, then delivered automatically" : "delivered automatically"}. Message (exactly):`,
 			...framed(item),
 			...(await targetLines(host, route.to, live)),
 		);
@@ -1064,6 +1180,8 @@ async function command(args: string[], host: FeatureHost): Promise<string> {
 				return rest.length === 1 ? await rejectItem(host, rest[0]) : USAGE;
 			case "log":
 				return rest.length ? USAGE : renderLog(readEvents(host));
+			case "quiet":
+				return await quietCommand(host, rest);
 			case "test":
 				return await testEvent(host, rest);
 			default:

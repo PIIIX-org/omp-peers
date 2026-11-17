@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 PIIIX-org contributors
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-	agentContext, events, eventsFile, frameFor, GLOBAL_PER_HOUR, HOUR_MS, ingestEvent, MAX_QUEUE, MAX_ROUTES, MAX_SEEN, MAX_SOURCES, readEvents, RETRY_DELAYS_MS, stopEvents, tick, WINDOW_MS, type EventsState, type Item,
+	agentContext, events, eventsFile, frameFor, inQuiet, GLOBAL_PER_HOUR, HOUR_MS, ingestEvent, MAX_QUEUE, MAX_ROUTES, MAX_SEEN, MAX_SOURCES, readEvents, RETRY_DELAYS_MS, stopEvents, tick, WINDOW_MS, type EventsState, type Item,
 } from "../../lib/features/events";
 import { validateGeneric } from "../../lib/features/events-ingest";
-import { spoolDir, writeSpoolEvent } from "../../lib/features/events-spool";
+import { MAX_SPOOL_AGE_MS, spoolDir, writeSpoolEvent } from "../../lib/features/events-spool";
 import { FEATURES } from "../../lib/features";
 import { addMember } from "../../lib/features/groups";
 import { sendSkipReason } from "../../lib/features/groups";
@@ -262,7 +263,7 @@ describe("info delivery", () => {
 		await configured();
 		expect(writeSpoolEvent(home, "ci", good, now).ok).toBe(true);
 		await tick(host());
-		expect(sent).toEqual([{ to: A, text: frame(), dependency: false }]);
+		expect(sent).toEqual([{ to: A, text: frame(), dependency: true }]);
 		expect(fs.readdirSync(spoolDir(home))).toEqual([]);
 		expect(stored().queue).toEqual([]);
 		expect(logOutcomes()).toEqual([`ci/evt-1/r1->${A}: delivered`]);
@@ -371,6 +372,7 @@ describe("rate caps", () => {
 	test("the per-route cap drops the excess with a recorded reason and delivers within the cap", async () => {
 		await configured("--max-per-hour 2");
 		for (const id of ["e1", "e2", "e3"]) await ingest({ ...good, id });
+		await tick(host());
 		await tick(host());
 		expect(sent).toHaveLength(2);
 		expect(logOutcomes().filter(line => line.includes("dropped"))).toEqual(["ci/e3/r1: dropped: route rate limit"]);
@@ -503,13 +505,26 @@ describe("retries and failures", () => {
 		expect(logOutcomes()).toEqual(["ci/evt-1/r1: failed: outcome unknown (may have been delivered)"]);
 	});
 
-	test("at most 10 items are delivered per tick", async () => {
+	test("one item per target per tick, and at most 10 items per tick", async () => {
 		await configured();
-		for (let i = 0; i < 12; i++) await ingest({ ...good, id: `e${i}` });
+		for (let i = 0; i < 3; i++) await ingest({ ...good, id: `e${i}` });
+		await tick(host());
+		expect(sent).toHaveLength(1);
+		await tick(host());
+		await tick(host());
+		expect(sent).toHaveLength(3);
+		// Twelve targets, one event matching all twelve routes: ten go out in the first tick, the rest in the next.
+		const peers = Array.from({ length: 12 }, (_, i) => ({ id: `p${(0x100 + i).toString(16).padStart(16, "0")}`, name: `w${i}` }));
+		live = [...live, ...peers];
+		await run("route remove r1");
+		for (const [i, peer] of peers.entries()) await run(`route add m${i} --source ci --type many --to ${peer.id}`);
+		sent = [];
+		await ingest({ ...good, id: "many-1", type: "many" });
 		await tick(host());
 		expect(sent).toHaveLength(10);
 		await tick(host());
 		expect(sent).toHaveLength(12);
+		expect(new Set(sent.map(entry => entry.to)).size).toBe(12);
 	});
 });
 
@@ -524,7 +539,7 @@ describe("targets: paused, locked, refusing, absent", () => {
 		await resumeSession(home, A);
 		now += RETRY_DELAYS_MS[0];
 		await tick(host());
-		expect(sent).toEqual([{ to: A, text: frame(), dependency: false }]);
+		expect(sent).toEqual([{ to: A, text: frame(), dependency: true }]);
 	});
 
 	test("a session that stays paused loses the event after three attempts and is never messaged", async () => {
@@ -914,15 +929,16 @@ describe("test command (dry run)", () => {
 		expect(await run("test --source nope")).toBe("error: choose --source <name> (ci)");
 	});
 
-	test("the github adapter takes --event and --delivery", async () => {
+	test("the github adapter's id is a hash of the file bytes and its type comes from the body", async () => {
 		const file = path.join(home, "secret");
 		fs.writeFileSync(file, `${SECRET}\n`, { mode: 0o600 });
 		await run(`source add gh --kind webhook --adapter github --secret-file ${file}`);
 		await run("route add gr --source gh --type github.pull_request --field action=opened --to worker-a");
 		const body = path.join(home, "pr.json");
 		fs.writeFileSync(body, JSON.stringify({ action: "opened", number: 7, repository: { full_name: "octo/repo" }, sender: { login: "alice" }, pull_request: { title: "Fix" } }));
-		const out = await run(`test --source gh --file ${body} --event pull_request --delivery d-1`);
-		expect(out).toContain("event: valid; id d-1, type github.pull_request");
+		const out = await run(`test --source gh --file ${body}`);
+		expect(out).toContain(`event: valid; id gh-${createHash("sha256").update(fs.readFileSync(body)).digest("hex").slice(0, 32)}, type github.pull_request`);
+		expect(await run(`test --source gh --file ${body} --event pull_request`)).toBe('error: unexpected "--event"');
 		expect(out).toContain("route gr (info): would be delivered automatically");
 		expect(out).toContain("[external event from gh] github.pull_request: pull_request opened in octo/repo by alice");
 	});
@@ -1006,5 +1022,336 @@ describe("concurrency across real processes", () => {
 		const texts = sentLog().map(line => JSON.parse(line).text as string);
 		expect(texts.filter(text => text.includes("event id: e1"))).toHaveLength(1);
 		expect(texts.filter(text => text.includes("event id: e2"))).toHaveLength(1);
+	});
+});
+
+describe("delivery stops when events are off, the session is not the master, or quiet hours begin", () => {
+	const delivered = (): SendResult => ({ status: "delivered" });
+
+	test("off in the middle of a batch: no further item is claimed or sent, and it stays queued", async () => {
+		await configured();
+		await run("route add r2 --source ci --to worker-b");
+		await ingest();
+		sendResult = async to => {
+			if (to === A) expect(await run("off")).toContain("external events OFF");
+			return delivered();
+		};
+		await tick(host());
+		expect(sent.map(s => s.to)).toEqual([A]);
+		expect(stored().queue.map(item => [item.id, item.status])).toEqual([["i2", "queued"]]);
+		await tick(host());
+		expect(sent).toHaveLength(1);
+		await run("on cli");
+		await tick(host());
+		expect(sent.map(s => s.to)).toEqual([A, B]);
+	});
+
+	test("off in the middle of a group: the rest of the members are not sent, and a later delivery skips the ones that have it", async () => {
+		for (const id of [A, B, C]) await addMember(home, "team", id, { self: MASTER, master: true });
+		await run("source add ci");
+		await run("route add g --source ci --to group:team");
+		await run("on cli");
+		await ingest();
+		sendResult = async to => {
+			if (to === A) await run("off");
+			return delivered();
+		};
+		await tick(host());
+		expect(sent.map(s => s.to)).toEqual([A]);
+		expect(stored().queue[0]).toMatchObject({ status: "queued", attempts: 0, delivered: [A] });
+		expect(logOutcomes()).toEqual([`ci/evt-1/g->${A}: delivered`]);
+		sendResult = delivered;
+		await run("on cli");
+		await tick(host());
+		expect(sent.map(s => s.to)).toEqual([A, B, C]);
+		expect(stored().queue).toEqual([]);
+	});
+
+	test("losing the master role in the middle of a batch: nothing more is sent by this session", async () => {
+		await configured();
+		await run("route add r2 --source ci --to worker-b");
+		await ingest();
+		const opts = { master: true };
+		sendResult = () => {
+			opts.master = false;
+			return delivered();
+		};
+		await tick(host(opts));
+		expect(sent.map(s => s.to)).toEqual([A]);
+		expect(stored().queue.map(item => item.id)).toEqual(["i2"]);
+		await tick(host(opts));
+		expect(sent).toHaveLength(1);
+		opts.master = true;
+		sendResult = delivered;
+		await tick(host(opts));
+		expect(sent.map(s => s.to)).toEqual([A, B]);
+	});
+
+	test("losing the master role between two members of a group stops the group", async () => {
+		for (const id of [A, B, C]) await addMember(home, "team", id, { self: MASTER, master: true });
+		await run("source add ci");
+		await run("route add g --source ci --to group:team");
+		await run("on cli");
+		await ingest();
+		const opts = { master: true };
+		sendResult = () => {
+			opts.master = false;
+			return delivered();
+		};
+		await tick(host(opts));
+		expect(sent).toHaveLength(1);
+		expect(stored().queue[0]).toMatchObject({ status: "queued", attempts: 0 });
+	});
+
+	test("a work approval is also stopped when events go off before the send", async () => {
+		await configuredWork();
+		await ingest();
+		// The only gate between the claim and the send is the per-send check: turn events off right after the claim.
+		const opts = { master: true };
+		const h = host(opts);
+		const peers = h.peers;
+		h.peers = async () => {
+			opts.master = false;
+			return peers();
+		};
+		const out = await events.command(["approve", "i1"], h);
+		expect(out).toContain("i1 was not sent");
+		expect(sent).toEqual([]);
+		expect(stored().queue[0]).toMatchObject({ id: "i1", status: "awaiting", attempts: 0 });
+	});
+
+	test("a delivery that fails after the route was removed is dropped, not retried", async () => {
+		await configured();
+		await ingest();
+		sendResult = async () => {
+			await run("route remove r1");
+			return { status: "failed", reason: "rate limited" };
+		};
+		await tick(host());
+		expect(stored().queue).toEqual([]);
+		expect(logOutcomes().at(-1)).toBe("ci/evt-1/r1: dropped: route removed");
+	});
+});
+
+describe("quiet hours", () => {
+	const at = (iso: string) => Date.parse(`${iso}Z`);
+
+	beforeEach(async () => {
+		await configured();
+	});
+
+	test("off by default; set is master-only and validates the window and the zone", async () => {
+		expect(await run("quiet status")).toBe("quiet hours: off");
+		expect(await run("quiet set 22:00-07:00 --tz UTC", host({ master: false }))).toBe("error: only the master session may change external-event settings or approve work; run /peers master first");
+		expect(await run("quiet off", host({ master: false }))).toStartWith("error: only the master session");
+		for (const range of ["22:00", "22-07", "24:00-07:00", "22:00-07:60", "7:00-9:00", "22:00-22:00", "22:00-07:00-08:00"]) expect(await run(`quiet set ${range} --tz UTC`)).toStartWith("error: the window");
+		expect(await run("quiet set 22:00-22:00 --tz UTC")).toBe("error: the window must start and end at different times");
+		for (const zone of ["Nope/Zone", "+01:00", "UTC+1x", "../etc", "x".repeat(70)]) expect(await run(`quiet set 22:00-07:00 --tz ${zone}`)).toContain("is not an IANA time zone");
+		expect(await run("quiet set 22:00-07:00 --tz")).toBe("error: --tz needs a value");
+		expect(await run("quiet set 22:00-07:00 --wat x")).toBe('error: unexpected "--wat"');
+		expect(await run("quiet")).toStartWith("usage:");
+		expect(stored().quiet).toBeNull();
+	});
+
+	test("set stores a canonical zone, defaults to the host zone and says what it does", async () => {
+		expect(await run("quiet set 22:00-07:00 --tz europe/berlin")).toContain("22:00-07:00 Europe/Berlin,");
+		expect(await run("quiet set 22:00-07:00 --tz Europe/Berlin")).toBe("quiet hours set: 22:00-07:00 Europe/Berlin, daily (start inclusive, end exclusive, crossing midnight); while active, info items stay queued (nothing is dropped, woken or sent) and are delivered after it ends, within the 72 h expiry; work approvals are not affected");
+		expect(stored().quiet).toEqual({ start: "22:00", end: "07:00", timezone: "Europe/Berlin" });
+		expect(await run("quiet set 09:00-17:00")).toContain("quiet hours set: 09:00-17:00 ");
+		expect(stored().quiet?.timezone).toBe(new Intl.DateTimeFormat().resolvedOptions().timeZone);
+		expect(await run("quiet set 09:00-17:00 --tz UTC")).not.toContain("crossing midnight");
+	});
+
+	test("the window is start-inclusive, end-exclusive and may cross midnight", () => {
+		const night = { start: "22:00", end: "07:00", timezone: "UTC" };
+		expect(inQuiet(night, at("2023-11-14T21:59:59"))).toBe(false);
+		expect(inQuiet(night, at("2023-11-14T22:00:00"))).toBe(true);
+		expect(inQuiet(night, at("2023-11-15T00:00:00"))).toBe(true);
+		expect(inQuiet(night, at("2023-11-15T06:59:59"))).toBe(true);
+		expect(inQuiet(night, at("2023-11-15T07:00:00"))).toBe(false);
+		expect(inQuiet(night, at("2023-11-15T12:00:00"))).toBe(false);
+		const day = { start: "09:00", end: "17:00", timezone: "UTC" };
+		expect(inQuiet(day, at("2023-11-14T08:59:00"))).toBe(false);
+		expect(inQuiet(day, at("2023-11-14T09:00:00"))).toBe(true);
+		expect(inQuiet(day, at("2023-11-14T16:59:00"))).toBe(true);
+		expect(inQuiet(day, at("2023-11-14T17:00:00"))).toBe(false);
+		expect(inQuiet(null, at("2023-11-14T12:00:00"))).toBe(false);
+		// The zone decides, not UTC.
+		const berlin = { start: "22:00", end: "07:00", timezone: "Europe/Berlin" };
+		expect(inQuiet(berlin, at("2023-11-14T20:59:00"))).toBe(false); // 21:59 in Berlin
+		expect(inQuiet(berlin, at("2023-11-14T21:00:00"))).toBe(true); // 22:00 in Berlin
+	});
+
+	test("DST days: wall-clock windows follow the zone's clock through the gap and the repeated hour", () => {
+		const ny = (start: string, end: string) => ({ start, end, timezone: "America/New_York" });
+		// 2023-03-12: 02:00 EST jumps to 03:00 EDT at 07:00Z.
+		const spring = ny("02:30", "03:30");
+		expect(inQuiet(spring, at("2023-03-12T06:59:00"))).toBe(false); // 01:59 EST
+		expect(inQuiet(spring, at("2023-03-12T07:00:00"))).toBe(true); // 03:00 EDT
+		expect(inQuiet(spring, at("2023-03-12T07:29:00"))).toBe(true);
+		expect(inQuiet(spring, at("2023-03-12T07:30:00"))).toBe(false); // 03:30 EDT
+		// 2023-11-05: 02:00 EDT falls back to 01:00 EST at 06:00Z, so 01:30 happens twice.
+		const fall = ny("01:30", "02:30");
+		expect(inQuiet(fall, at("2023-11-05T05:29:00"))).toBe(false); // 01:29 EDT
+		expect(inQuiet(fall, at("2023-11-05T05:30:00"))).toBe(true); // 01:30 EDT
+		expect(inQuiet(fall, at("2023-11-05T06:30:00"))).toBe(true); // 01:30 EST, the second time
+		expect(inQuiet(fall, at("2023-11-05T07:29:00"))).toBe(true); // 02:29 EST
+		expect(inQuiet(fall, at("2023-11-05T07:30:00"))).toBe(false); // 02:30 EST
+	});
+
+	test("during the window info items stay queued, nothing is sent, dropped or attempted; after it they are delivered", async () => {
+		await run("quiet set 22:00-07:00 --tz UTC");
+		now = at("2023-11-14T22:30:00");
+		await ingest();
+		await tick(host());
+		await tick(host());
+		expect(sent).toEqual([]);
+		expect(stored().queue[0]).toMatchObject({ status: "queued", attempts: 0 });
+		expect(await run("status")).toContain("quiet hours: 22:00-07:00 UTC daily; ACTIVE now, 1 info item is held");
+		expect(await run("pending")).toContain("held by quiet hours; nothing is sent until the window ends");
+		now = at("2023-11-15T06:59:59");
+		await tick(host());
+		expect(sent).toEqual([]);
+		now = at("2023-11-15T07:00:00");
+		await tick(host());
+		expect(sent).toEqual([{ to: A, text: frame(), dependency: true }]);
+		expect(await run("status")).toContain("quiet hours: 22:00-07:00 UTC daily; not active now");
+		expect(logOutcomes()).toEqual([`ci/evt-1/r1->${A}: delivered`]);
+	});
+
+	test("events keep being accepted during the window: the spool is read, duplicates are dropped, caps still apply", async () => {
+		await run("quiet set 22:00-07:00 --tz UTC");
+		now = at("2023-11-14T23:00:00");
+		writeSpoolEvent(home, "ci", good, now);
+		await tick(host());
+		expect(fs.readdirSync(spoolDir(home))).toEqual([]);
+		expect(stored().queue).toHaveLength(1);
+		expect(await ingest()).toEqual({ outcome: "duplicate" });
+		expect(sent).toEqual([]);
+	});
+
+	test("a retry that falls due during the window waits for it, and the held time does not use up an attempt", async () => {
+		await run("quiet set 22:00-07:00 --tz UTC");
+		now = at("2023-11-14T21:59:00");
+		sendResult = () => ({ status: "failed", reason: "rate limited" });
+		await ingest();
+		await tick(host());
+		expect(sent).toHaveLength(1);
+		expect(stored().queue[0]).toMatchObject({ attempts: 1, nextAt: now + RETRY_DELAYS_MS[0] });
+		now = at("2023-11-14T22:30:00");
+		await tick(host());
+		expect(sent).toHaveLength(1);
+		sendResult = () => ({ status: "delivered" });
+		now = at("2023-11-15T07:00:00");
+		await tick(host());
+		expect(sent).toHaveLength(2);
+		expect(stored().queue).toEqual([]);
+	});
+
+	test("quiet hours beginning in the middle of a group stop the rest of it", async () => {
+		for (const id of [A, B, C]) await addMember(home, "team", id, { self: MASTER, master: true });
+		await run("route remove r1");
+		await run("route add g --source ci --to group:team");
+		now = at("2023-11-14T21:59:00");
+		await ingest();
+		sendResult = async to => {
+			if (to === A) {
+				now = at("2023-11-14T22:00:00");
+				await run("quiet set 22:00-07:00 --tz UTC");
+			}
+			return { status: "delivered" };
+		};
+		await tick(host());
+		expect(sent.map(s => s.to)).toEqual([A]);
+		expect(stored().queue[0]).toMatchObject({ status: "queued", attempts: 0, delivered: [A] });
+		sendResult = () => ({ status: "delivered" });
+		now = at("2023-11-15T07:00:00");
+		await tick(host());
+		expect(sent.map(s => s.to)).toEqual([A, B, C]);
+	});
+
+	test("turning quiet hours off releases held items at the next tick", async () => {
+		await run("quiet set 22:00-07:00 --tz UTC");
+		now = at("2023-11-14T23:00:00");
+		await ingest();
+		await tick(host());
+		expect(sent).toEqual([]);
+		expect(await run("quiet off")).toBe("quiet hours off: queued info items are delivered at the next tick");
+		expect(await run("quiet off")).toBe("quiet hours are already off");
+		await tick(host());
+		expect(sent).toHaveLength(1);
+	});
+
+	test("held items still expire after 72 hours, even while the window is active", async () => {
+		await run("quiet set 00:00-23:59 --tz UTC");
+		now = at("2023-11-14T12:00:00");
+		await ingest();
+		await tick(host());
+		expect(stored().queue).toHaveLength(1);
+		now += WINDOW_MS - 1;
+		await tick(host());
+		expect(stored().queue).toHaveLength(1);
+		now += 1;
+		expect(inQuiet(stored().quiet, now)).toBe(true);
+		await tick(host());
+		expect(stored().queue).toEqual([]);
+		expect(logOutcomes().at(-1)).toBe("ci/evt-1/r1: dropped: expired");
+		expect(sent).toEqual([]);
+	});
+
+	test("work approvals are not affected by quiet hours", async () => {
+		await run("route remove r1");
+		await run("route add w1 --source ci --to worker-a --mode work --task Run the checks");
+		await run("quiet set 00:00-23:59 --tz UTC");
+		now = at("2023-11-14T12:00:00");
+		await ingest();
+		await tick(host());
+		expect(sent).toEqual([]);
+		expect(await run("approve i1")).toContain("i1 delivered to worker-a");
+		expect(sent).toHaveLength(1);
+		expect(sent[0].dependency).toBe(true);
+	});
+
+	test("test and status mirror the window; read-only commands write nothing", async () => {
+		await run("quiet set 22:00-07:00 --tz UTC");
+		now = at("2023-11-14T23:00:00");
+		expect(await run("test")).toContain("route r1 (info): would be queued and held by quiet hours until the window ends, then delivered automatically. Message (exactly):");
+		const bytes = fs.readFileSync(eventsFile(home), "utf8");
+		fs.utimesSync(eventsFile(home), 1_000, 1_000);
+		const before = fs.statSync(eventsFile(home)).mtimeMs;
+		for (const cmd of ["quiet status", "status", "pending", "test"]) await run(cmd, host({ master: false }));
+		expect(fs.readFileSync(eventsFile(home), "utf8")).toBe(bytes);
+		expect(fs.statSync(eventsFile(home)).mtimeMs).toBe(before);
+	});
+
+	test("an invalid stored window is refused, and a state file from before quiet hours still loads", async () => {
+		const state = stored();
+		fs.writeFileSync(eventsFile(home), JSON.stringify({ ...state, quiet: { start: "22:00", end: "22:00", timezone: "UTC" } }));
+		expect(await run("status")).toContain("events.json is invalid: malformed quiet hours");
+		fs.writeFileSync(eventsFile(home), JSON.stringify({ ...state, quiet: { start: "22:00", end: "07:00", timezone: "europe/berlin" } }));
+		expect(await run("status")).toContain("malformed quiet hours");
+		const legacy: Partial<EventsState> = { ...state };
+		delete legacy.quiet;
+		fs.writeFileSync(eventsFile(home), JSON.stringify(legacy));
+		expect(await run("quiet status")).toBe("quiet hours: off");
+	});
+});
+
+describe("spool file age", () => {
+	test("a spool file 72 hours old or more is dropped unread with a log entry; a younger one is read", async () => {
+		await configured();
+		const dir = spoolDir(home);
+		const put = (id: string, mtimeMs: number) => {
+			writeSpoolEvent(home, "ci", { ...good, id }, now);
+			const file = fs.readdirSync(dir).find(name => fs.readFileSync(path.join(dir, name), "utf8").includes(`"${id}"`))!;
+			fs.utimesSync(path.join(dir, file), mtimeMs / 1000, mtimeMs / 1000);
+		};
+		put("old-1", now - MAX_SPOOL_AGE_MS);
+		put("young-1", now - MAX_SPOOL_AGE_MS + 1000);
+		await tick(host());
+		expect(fs.readdirSync(dir)).toEqual([]);
+		expect(logOutcomes()).toEqual(["-/-: dropped: expired", `ci/young-1/r1->${A}: delivered`]);
+		expect(sent).toHaveLength(1);
+		expect(sent[0].text).toContain("event id: young-1");
 	});
 });
