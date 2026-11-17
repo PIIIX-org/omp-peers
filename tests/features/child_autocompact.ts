@@ -15,6 +15,8 @@ const host: FeatureHost = {
 	acceptsRemote: () => true,
 	peers: async () => [],
 	groupsOf: () => [],
+	resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
+	applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async () => ({ status: "offline" }),
 };

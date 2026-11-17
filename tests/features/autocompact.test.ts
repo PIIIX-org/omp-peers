@@ -42,6 +42,8 @@ function host(self = A, live: PeerView[] = LIVE): FeatureHost {
 			if (found instanceof Error) throw found;
 			return found;
 		},
+		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
+		applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		send: async () => ({ status: "offline" }),
 	};
@@ -373,11 +375,12 @@ const tickLoop = () => new Promise<void>(resolve => setImmediate(resolve));
 const log = () => stored().log.map(e => `${e.outcome}${e.reason ? `: ${e.reason}` : ""}${e.percent === undefined ? "" : ` ${e.percent}`}${e.after === undefined ? "" : ` -> ${e.after}`}`);
 
 describe("runtime at the boundary", () => {
-	test("off by default: an agent end with context at 99% does nothing and writes nothing", async () => {
+	test("off by default: an agent end with context at 99% schedules no timer, reads no host state and writes nothing", async () => {
 		const rt = new AutoCompactRuntime();
-		const ctx = fakeCtx();
+		const ctx = fakeCtx({ setTimeout: () => { throw new Error("a disabled policy must not schedule anything"); } });
 		ctx.usage = 99;
-		await runBoundary(rt, ctx);
+		rt.onAgentEnd(ctx, host());
+		expect(ctx.pendingTimers()).toBe(0);
 		expect(ctx.calls).toBe(0);
 		expect(fs.existsSync(file())).toBe(false);
 	});
@@ -776,7 +779,9 @@ describe("runtime at the boundary", () => {
 		await enable(A);
 		fs.writeFileSync(file(), "{ corrupt");
 		const ctx = fakeCtx();
-		await runBoundary(new AutoCompactRuntime(), ctx);
+		const rt = new AutoCompactRuntime();
+		rt.onAgentEnd(ctx, host());
+		expect(ctx.pendingTimers()).toBe(0); // nothing is scheduled while the policy cannot be read
 		expect(ctx.calls).toBe(0);
 		expect(fs.readFileSync(file(), "utf8")).toBe("{ corrupt");
 	});

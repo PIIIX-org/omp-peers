@@ -365,6 +365,12 @@ export class AutoCompactRuntime {
 	/** The main agent's whole run ended: the only place the policy is evaluated. */
 	onAgentEnd(ctx: AutoCompactCtx, host: FeatureHost): void {
 		if (ctx.agent.kind !== "main" || ctx.mode === "print" || ctx.mode === "json") return;
+		// Off (the default), or an unreadable file: do nothing at all, not even a timer, for every run end.
+		try {
+			if (!readState(autocompactFile(host.home), emptyState, validate).enabled) return;
+		} catch {
+			return;
+		}
 		this.epoch++;
 		this.boundary = true;
 		this.checks = 0;
