@@ -22,6 +22,7 @@ const host: FeatureHost = {
 	resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	usageNow: () => undefined,
+	notify: () => {},
 	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async () => ({ status: "delivered" }),
 };

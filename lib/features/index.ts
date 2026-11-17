@@ -5,6 +5,7 @@ import type { Report } from "../reports";
 import { autocompact } from "./autocompact";
 import { board } from "./board";
 import { deps } from "./deps";
+import { digest } from "./digest";
 import { groups } from "./groups";
 import type { FeatureHost } from "./host";
 import { audit } from "./audit";
@@ -33,7 +34,7 @@ export interface Feature {
 	/** `args` are the whitespace-split tokens after the feature name. Returns text shown to the user. */
 	command(args: string[], host: FeatureHost): Promise<string>;
 	/** Context added before this session's next agent start; undefined adds nothing. May throw. */
-	agentContext?(host: FeatureHost): string | undefined;
+	agentContext?(host: FeatureHost): string | undefined | Promise<string | undefined>;
 	/** A structured report this session accepted; `from` is the sender's claimed identity, not authenticated. May reject. */
 	onReport?(report: Report, from: { id: string; name: string }, host: FeatureHost): Promise<void>;
 	/** LLM tools registered once at extension load; each call receives the calling session's host. */
@@ -43,4 +44,4 @@ export interface Feature {
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, watchdog, autocompact, usage];
+export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, watchdog, autocompact, digest, usage];

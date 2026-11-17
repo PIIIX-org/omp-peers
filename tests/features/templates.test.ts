@@ -62,6 +62,7 @@ function host(id: string): FeatureHost {
 		peers: async () => Object.values(sessions).map(s => ({ id: s.id, name: s.name })),
 		groupsOf: peerId => groupsOf(home, peerId),
 		usageNow: () => undefined,
+		notify: () => {},
 		resolveGroup: async () => ({ recipients: [], skipped: [] }), // not exercised by this suite
 		send: async () => ({ status: "offline" }),
 		resolveModel: async selector => {

@@ -51,6 +51,7 @@ function host(self = MASTER, opts: { master?: boolean; accepts?: boolean } = {})
 		peers: async () => live,
 		groupsOf: () => [],
 		usageNow: () => undefined,
+		notify: () => {},
 		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		resolveGroup: async () => ({ recipients: [], skipped: [] }),

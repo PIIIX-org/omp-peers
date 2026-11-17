@@ -18,6 +18,7 @@ const host: FeatureHost = {
 	peers: async () => [{ id: self, name: `child-${tag}` }],
 	groupsOf: peerId => groupsOf(home, peerId),
 	usageNow: () => undefined,
+	notify: () => {},
 	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async () => ({ status: "offline" }),
 	resolveModel: async selector => ({ ok: true, model: `prov/${selector}`, current: "prov/old" }),
