@@ -19,6 +19,8 @@ const host: FeatureHost = {
 		{ id, name: "worker", busy: true, updatedAt: new Date(T0).toISOString() },
 	],
 	groupsOf: () => [],
+	resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
+	applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	resolveGroup: async () => ({ recipients: [], skipped: [] }),
 	send: async () => ({ status: "delivered" }),
 };

@@ -61,6 +61,8 @@ function host(): FeatureHost {
 			if (groupsFail) throw new Error(groupsFail);
 			return groups[id] ?? [];
 		},
+		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
+		applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		resolveGroup: async () => ({ recipients: [], skipped: [] }),
 		send: async (to, req) => {
 			sent.push({ to, text: req.text });
