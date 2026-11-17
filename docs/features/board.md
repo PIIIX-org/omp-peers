@@ -55,13 +55,13 @@ The board keeps itself small. Every write (`assign`, `set`, or an accepted repor
 - **Never pruned:** any entry whose status is owed work (`assigned`, `in-progress`, `blocked`, `waiting`, `decision`), whether or not its session is running, and any `unknown` entry of a running session. The entry being written is never pruned.
 - **Prunable:** `done` entries, and `unknown` entries whose session is not running. If the live registry cannot be read, only `done` entries are prunable (liveness is never guessed).
 - **By age:** prunable entries last updated at least `board.pruneDays` ago (default 7; `0` turns the age rule off; at most 3650) are dropped on the next write.
-- **At the cap:** when a write would add a NEW session to a board that is at `board.maxEntries` (default 200; 10 to 1000), the oldest prunable entries are dropped, oldest first and ties by session ID, until the new entry fits. If nothing is prunable the write is refused (`board limit reached (N entries) and no finished entry can be pruned; clear an entry first`; a report shows a warning in the receiving session). Lowering the cap below the stored size never drops pending entries.
+- **At the cap:** when a write would add a NEW session to a board that is at `board.maxEntries` (default 200; 10 to 1000), the oldest prunable entries are dropped, oldest first and ties by session ID, until the new entry fits. If nothing is prunable the write is refused (`board limit reached (N entries) and not enough finished entries can be pruned; clear an entry first`; a report shows a warning in the receiving session). Lowering the cap below the stored size never drops pending entries.
 - `assign` and `set` say `; pruned N old finished entries` when they dropped any.
 
 ```json
 { "board": { "maxEntries": 300, "pruneDays": 14 } }
 ```
 
-An unusable value falls back to its default (200 / 7). Pruned entries are gone; `clear` still removes any entry by hand.
+An unusable value falls back to its default (200 / 7) and is never silent: `list`, `assign` and `set` (also when refused) print a `warning:` line naming the setting, and a report that is recorded shows it as a notification in the receiving session. Pruned entries are gone; `clear` still removes any entry by hand.
 
 Limits: a report is recorded by the session that receives it, so a report sent to a session with inbound requests refused is not recorded.

@@ -243,7 +243,7 @@ function resolve(spec: string, live: PeerView[], entries: BoardEntry[]): Resolve
 
 // ---- Operations --------------------------------------------------------------------------------
 
-export type BoardResult = { ok: true; entry: BoardEntry; /** Old finished entries dropped by this write. */ pruned?: number } | { ok: false; error: string };
+export type BoardResult = { ok: true; entry: BoardEntry; /** Old finished entries dropped by this write. */ pruned?: number; /** Unusable board.maxEntries/pruneDays values the defaults replaced. */ warnings?: string[] } | { ok: false; error: string; warnings?: string[] };
 
 function upsert(entries: BoardEntry[], entry: BoardEntry): BoardEntry[] {
 	return entries.some(e => e.session === entry.session) ? entries.map(e => (e.session === entry.session ? entry : e)) : [...entries, entry];
@@ -255,7 +255,8 @@ function pruned(entries: BoardEntry[], config: PruneConfig, incoming: string, no
 	return { entries: drop.size ? entries.filter(entry => !drop.has(entry)) : entries, dropped: drop.size };
 }
 
-const fullMessage = (cap: number) => `board limit reached (${cap} entries) and no finished entry can be pruned; clear an entry first`;
+const fullMessage = (cap: number) => `board limit reached (${cap} entries) and not enough finished entries can be pruned; clear an entry first`;
+const withWarnings = (config: PruneConfig) => (config.warnings.length ? { warnings: config.warnings } : {});
 
 /** Master only. Records the assignment; sends nothing and wakes nobody. */
 export async function assignTask(host: FeatureHost, spec: string, rawTask: string): Promise<BoardResult> {
@@ -274,9 +275,9 @@ export async function assignTask(host: FeatureHost, spec: string, rawTask: strin
 	return updateState<BoardState, BoardResult>(boardFile(host.home), emptyState, validateState, current => {
 		const existing = current.entries.find(e => e.session === id);
 		const kept = pruned(current.entries, config, id, updatedAt, running);
-		if (!existing && kept.entries.length >= config.maxEntries) return { result: { ok: false, error: fullMessage(config.maxEntries) } };
+		if (!existing && kept.entries.length >= config.maxEntries) return { result: { ok: false, error: fullMessage(config.maxEntries), ...withWarnings(config) } };
 		const entry: BoardEntry = { session: id, name: name || existing?.name || "", task: text, status: "assigned", source: "assignment", updatedAt, updatedBy };
-		return { state: { version: 1, entries: upsert(kept.entries, entry) }, result: { ok: true, entry, ...(kept.dropped ? { pruned: kept.dropped } : {}) } };
+		return { state: { version: 1, entries: upsert(kept.entries, entry) }, result: { ok: true, entry, ...(kept.dropped ? { pruned: kept.dropped } : {}), ...withWarnings(config) } };
 	});
 }
 
@@ -308,7 +309,7 @@ export async function setStatus(host: FeatureHost, spec: string, status: string,
 		// A note describes one status; a new status starts without the previous note.
 		if (note) entry.note = note;
 		else delete entry.note;
-		return { state: { version: 1, entries: upsert(kept.entries, entry) }, result: { ok: true, entry, ...(kept.dropped ? { pruned: kept.dropped } : {}) } };
+		return { state: { version: 1, entries: upsert(kept.entries, entry) }, result: { ok: true, entry, ...(kept.dropped ? { pruned: kept.dropped } : {}), ...withWarnings(config) } };
 	});
 }
 
@@ -336,6 +337,8 @@ export async function recordReport(host: FeatureHost, report: Report, from: { id
 	const name = cleanName(from.name);
 	const updatedAt = host.now();
 	const config = pruneConfig(host.home);
+	// An unusable setting must not silently change what is pruned: tell the receiving session (once per recorded report).
+	for (const warning of config.warnings) host.notify(`board: ${warning}`);
 	let running: Set<string> | undefined;
 	try {
 		running = new Set((await host.peers()).map(peer => peer.id));
@@ -401,7 +404,9 @@ function renderEntries(entries: BoardEntry[], live: PeerView[], now: number, hou
 	});
 }
 
-const prunedNote = (result: { pruned?: number }) => (result.pruned ? `; pruned ${result.pruned} old finished entr${result.pruned === 1 ? "y" : "ies"}` : "");
+const prunedNote = (result: { pruned?: number; warnings?: string[] }) =>
+	(result.pruned ? `; pruned ${result.pruned} old finished entr${result.pruned === 1 ? "y" : "ies"}` : "") + (result.warnings?.length ? `\n${result.warnings.map(w => `warning: ${w}`).join("\n")}` : "");
+const failure = (result: { error: string; warnings?: string[] }) => `error: ${result.error}${result.warnings?.length ? `\n${result.warnings.map(w => `warning: ${w}`).join("\n")}` : ""}`;
 
 const USAGE = "usage: /peers board [list] | assign <peer> <task> | set <peer> <status> [note] | clear <peer> | stale [<hours>]";
 
@@ -414,21 +419,22 @@ async function command(args: string[], host: FeatureHost): Promise<string> {
 				const { hours, warning } = staleConfig(host.home);
 				const entries = readBoard(host).entries;
 				const header = `${entries.length} board entr${entries.length === 1 ? "y" : "ies"}; stale after ${hours}h without an update (done never goes stale); statuses are claims by the writer, not verified`;
-				if (!entries.length) return [warning ?? "", "no board entries"].filter(Boolean).join("\n");
-				return [header, ...(warning ? [warning] : []), ...renderEntries(entries, await host.peers(), host.now(), hours)].join("\n");
+				const prune = pruneConfig(host.home).warnings;
+				if (!entries.length) return [warning ?? "", ...prune, "no board entries"].filter(Boolean).join("\n");
+				return [header, ...(warning ? [warning] : []), ...prune, ...renderEntries(entries, await host.peers(), host.now(), hours)].join("\n");
 			}
 			case "assign": {
 				const [peer, ...task] = rest;
 				if (!peer || !task.length) return USAGE;
 				const result = await assignTask(host, peer, task.join(" "));
-				if (!result.ok) return `error: ${result.error}`;
+				if (!result.ok) return failure(result);
 				return `assigned ${result.entry.name ? `${result.entry.name} ` : ""}(${result.entry.session}): ${result.entry.task}; recorded only: nothing was sent to that session${prunedNote(result)}`;
 			}
 			case "set": {
 				const [peer, status, ...note] = rest;
 				if (!peer || !status) return USAGE;
 				const result = await setStatus(host, peer, status, note.join(" "));
-				if (!result.ok) return `error: ${result.error}`;
+				if (!result.ok) return failure(result);
 				return `set ${result.entry.name ? `${result.entry.name} ` : ""}(${result.entry.session}) to ${result.entry.status}; recorded only: nothing was sent to that session${prunedNote(result)}`;
 			}
 			case "clear": {

@@ -331,8 +331,8 @@ describe("command output", () => {
 
 	test("a board full of pending work is capped: new entries are rejected and nothing is lost", async () => {
 		putEntries(200, "blocked");
-		expect(await assignTask(master(), "worker-a", "one more")).toEqual({ ok: false, error: "board limit reached (200 entries) and no finished entry can be pruned; clear an entry first" });
-		await expect(recordReport(master(), done, { id: A, name: "worker-a" })).rejects.toThrow("board limit reached (200 entries) and no finished entry can be pruned; clear an entry first; report from");
+		expect(await assignTask(master(), "worker-a", "one more")).toEqual({ ok: false, error: "board limit reached (200 entries) and not enough finished entries can be pruned; clear an entry first" });
+		await expect(recordReport(master(), done, { id: A, name: "worker-a" })).rejects.toThrow("board limit reached (200 entries) and not enough finished entries can be pruned; clear an entry first; report from");
 		expect(stored().entries).toHaveLength(200);
 		expect(stored().entries.every(e => e.status === "blocked")).toBe(true);
 	});
@@ -401,8 +401,8 @@ describe("auto-prune of old finished entries", () => {
 		putBoard([
 			...Array.from({ length: 4 }, (_, i) => ({ session: sid(i + 1), status: "blocked" as BoardStatus, updatedAt: T0 + i })),
 			{ session: sid(20), status: "done", updatedAt: T0 + 50 },
+			{ session: sid(22), status: "done", updatedAt: T0 + 10 }, // same time as 21 but stored first: the lower id (21) must still go first
 			{ session: sid(21), status: "done", updatedAt: T0 + 10 },
-			{ session: sid(22), status: "done", updatedAt: T0 + 10 }, // same time as 21: the lower id goes first
 			{ session: sid(23), status: "done", updatedAt: T0 + 30 },
 			{ session: sid(24), status: "assigned", updatedAt: T0 + 5 },
 			{ session: sid(25), status: "decision", updatedAt: T0 + 6 },
@@ -473,8 +473,29 @@ describe("auto-prune of old finished entries", () => {
 	test("lowering the cap below the stored size never drops pending entries; new sessions are refused until room appears", async () => {
 		putConfig({ maxEntries: 10 });
 		putEntries(20, "blocked");
-		expect(await assignTask(master(), "worker-a", "nope")).toEqual({ ok: false, error: "board limit reached (10 entries) and no finished entry can be pruned; clear an entry first" });
+		expect(await assignTask(master(), "worker-a", "nope")).toEqual({ ok: false, error: "board limit reached (10 entries) and not enough finished entries can be pruned; clear an entry first" });
 		expect(stored().entries).toHaveLength(20);
+	});
+
+	test("an unusable prune setting is shown by list, assign, set, a refusal and the report path instead of silently changing what is pruned", async () => {
+		putConfig({ maxEntries: 5, pruneDays: -1 });
+		const warnings = ["board.maxEntries must be an integer from 10 to 1000; using 200", "board.pruneDays must be a number from 0 (never by age) to 3650; using 7"];
+		const shown = warnings.map(w => `warning: ${w}`).join("\n");
+		expect(await run("list")).toBe([...warnings, "no board entries"].join("\n"));
+		expect(await run("assign worker-a job")).toBe(`assigned worker-a (${A}): job; recorded only: nothing was sent to that session\n${shown}`);
+		expect(await run("set worker-a blocked")).toBe(`set worker-a (${A}) to blocked; recorded only: nothing was sent to that session\n${shown}`);
+		expect(await run("list")).toContain(warnings[0]);
+		const notes: string[] = [];
+		await recordReport({ ...master(), notify: (text: string) => void notes.push(text) }, done, { id: B, name: "worker-b" });
+		expect(notes).toEqual(warnings.map(w => `board: ${w}`));
+		// A refused write carries them too.
+		putConfig({ maxEntries: 5 });
+		putEntries(200, "blocked");
+		expect(await run("assign worker-b nope")).toBe(`error: board limit reached (200 entries) and not enough finished entries can be pruned; clear an entry first\nwarning: ${warnings[0]}`);
+		// Valid settings print nothing extra.
+		putConfig({ maxEntries: 50, pruneDays: 3 });
+		putBoard([]);
+		expect(await run("assign worker-a job")).toBe(`assigned worker-a (${A}): job; recorded only: nothing was sent to that session`);
 	});
 
 	test("pruning is not done by read-only commands", async () => {
