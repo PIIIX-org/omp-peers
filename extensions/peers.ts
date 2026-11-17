@@ -905,6 +905,7 @@ export default function peers(pi: ExtensionAPI) {
 			now: Date.now,
 			self: () => ({ id, name: pi.getSessionName() || state.saved.name || path.basename(ctx.cwd) }),
 			isMaster: () => masterId() === id,
+			notify: text => ctx.ui.notify(text, "info"),
 			peers: async () => (await listPeers())
 				.filter(p => !p.duplicateSession.length || p.canonicalId === p.id)
 				.map(p => ({ id: logicalId(p), name: p.name, acceptsRemote: p.inbound === "accept" && p.control, refusesInbound: p.inbound === "refuse", busy: p.busy, context: p.context, paused: p.paused, recentErrorTurns: p.recentErrorTurns, updatedAt: p.updatedAt })),
@@ -945,7 +946,7 @@ export default function peers(pi: ExtensionAPI) {
 		const blocks: string[] = [];
 		for (const feature of FEATURES) {
 			try {
-				const block = feature.agentContext?.(host);
+				const block = await feature.agentContext?.(host);
 				if (block) blocks.push(block);
 			} catch (error) {
 				ctx.ui.notify(`peers ${feature.name}: not injected: ${(error as Error).message}`, "warning");

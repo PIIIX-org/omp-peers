@@ -20,6 +20,7 @@ const host: FeatureHost = {
 	acceptsRemote: () => true,
 	peers: async () => [{ id: MASTER, name: "master" }, { id: "p00000000000000a1", name: "worker-a" }, { id: "p00000000000000b2", name: "worker-b" }],
 	groupsOf: () => [],
+	notify: () => {},
 	resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	resolveGroup: async () => ({ recipients: [], skipped: [] }),
