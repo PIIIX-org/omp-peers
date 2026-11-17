@@ -1285,7 +1285,10 @@ describe("endpoint", () => {
 		clock += 1;
 		await tick();
 		expect(fake.requests[1].url).toBe(`https://discord.com/api/v10/channels/${CHANNEL}/messages`);
-		expect(fs.readFileSync(path.join(REPO, "package.json"), "utf8")).not.toContain("setTestEndpoint");
+		// The scenario-only endpoint extension is not part of the published package.
+		const files: unknown = Reflect.get(JSON.parse(fs.readFileSync(path.join(REPO, "package.json"), "utf8")), "files");
+		expect(Array.isArray(files)).toBe(true);
+		for (const entry of Array.isArray(files) ? files : []) expect(String(entry), String(entry)).not.toMatch(/^tests\/?$|scenarios|_discord_endpoint_ext/);
 	});
 
 	test("with the test endpoint a webhook keeps its validated path and only the origin changes", async () => {

@@ -254,26 +254,27 @@ def scenario(h, discord):
     discord.say(USER, "!peers list")
     discord.say(USER, "!peers prompt do something")
     discord.say(USER, f"!peers msg {wid} hello")
+    discord.say(USER, "!peers pause")
     # Turning the bridge off and on keeps the cursor and makes the next tick poll at once instead of 15 s after the baseline.
     assert h.say(master, "/peers discord off").startswith("discord bridge off: sending and polling stopped; 0 queued message(s) discarded")
     assert state()["cursor"] == cursor
     assert h.say(master, "/peers discord on").startswith("discord bridge on (bot):")
     assert state()["cursor"] == cursor
-    wait_for(lambda: len(discord.posts()) >= 4, seconds=40)
+    wait_for(lambda: len(discord.posts()) >= 5, seconds=45)
     ledger = contents()
     lines = ledger[1].split("\n")
     assert lines[0] == "sessions: 2" and sorted(lines[1:]) == sorted([f"{mid} idle", f"{wid} idle"]), ledger[1]
     assert discord.gets()[1]["path"] == f"/api/v10/channels/{CHANNEL}/messages?limit=20&after={cursor}", discord.gets()[1]["path"]
     # The ledger is exact: the redacted report, then one reply per allowlisted command in order. The pre-existing command, the stranger, the bot
     # and the subagent's report produced nothing, and nothing was re-sent.
-    assert ledger == [redacted, ledger[1], UNKNOWN, UNKNOWN], ledger
+    assert ledger == [redacted, ledger[1], UNKNOWN, UNKNOWN, UNKNOWN], ledger
     assert all(json.loads(p["body"])["allowed_mentions"] == {"parse": []} and p["path"] == f"/api/v10/channels/{CHANNEL}/messages" for p in discord.posts())
     # The only frames a quiet session emits are its own periodic status-bar updates: no turn, no message, no notice, no error.
     received = [f for f in worker.frames[worker_frames:] if not (f.get("type") == "extension_ui_request" and f.get("method") == "setStatus")]
     assert received == [], received
     assert h.row(worker).get("paused") is not True
     assert len(h.gateway.requests) == asks, "a Discord command reached a model"
-    print("PASS inbound: history, a stranger and a bot ignored; list answered once; prompt and msg get the fixed unknown reply; no session or model was reached; exact post ledger")
+    print("PASS inbound: history, a stranger and a bot ignored; list answered once; prompt, msg and pause get the fixed unknown reply; no session was paused or reached and no model was called; exact post ledger")
 
     # ---- Webhook mode and off from a non-master session --------------------------------------------------------
     assert h.say(worker, "/peers discord off").startswith("discord bridge off: sending and polling stopped; 0 queued message(s) discarded")
@@ -291,13 +292,13 @@ def scenario(h, discord):
     status = h.say(master, "/peers discord status")
     assert f"credential: readable (…/webhooks/{WEBHOOK_ID}/<redacted>)" in status and WEBHOOK_TOKEN not in status, status
     report("Webhook unit", "Offline checks passed")
-    wait_for(lambda: len(discord.posts()) >= 5, seconds=30)
-    post = discord.posts()[4]
+    wait_for(lambda: len(discord.posts()) >= 6, seconds=30)
+    post = discord.posts()[5]
     assert post["path"] == f"/api/webhooks/{WEBHOOK_ID}/{WEBHOOK_TOKEN}", post["path"]
     assert "authorization" not in post["headers"]
     assert json.loads(post["body"]) == {"content": f"**DONE** {wid}: Webhook unit: Offline checks passed", "allowed_mentions": {"parse": []}}
     assert h.say(master, "/peers discord test") == "test message delivered"
-    assert json.loads(discord.posts()[5]["body"])["content"] == FIXED_TEST
+    assert json.loads(discord.posts()[6]["body"])["content"] == FIXED_TEST
     # The off-time report was never queued, so it is not in the ledger; and with the bridge off or in webhook mode nothing polls.
     assert contents() == ledger + [f"**DONE** {wid}: Webhook unit: Offline checks passed", FIXED_TEST]
     assert len(discord.gets()) == gets
@@ -314,7 +315,7 @@ def scenario(h, discord):
     report("After stop", "Nothing should go out now")
     assert state()["queue"] == [], "a report was queued while the bridge was stopped"
     posts_now, gets_now = len(discord.posts()), len(discord.gets())
-    assert posts_now == 7  # the six ledger posts and the refused 401 test post
+    assert posts_now == 8  # the seven ledger posts and the refused 401 test post
     assert h.say(master, "/peers discord status").splitlines()[:2] == ["discord bridge: off (opt-in; /peers discord on enables it)", "stopped: auth failed: bridge stopped"]
     one_tick_passed(master)
     assert len(discord.posts()) == posts_now and len(discord.gets()) == gets_now
