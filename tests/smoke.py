@@ -38,15 +38,17 @@ export default function fixture(pi) {
 
 
 class Peer:
-    def __init__(self, env, cwd, resume=None):
+    def __init__(self, env, cwd, resume=None, extra_args=()):
         self.frames = []
         self.responses = queue.Queue()
         session_args = ["--session", resume] if resume else []
+        # Every OMP the smoke harnesses start refuses non-loopback connections (tests/netguard.ts).
+        guard = ["-e", str(REPO / "tests" / "netguard_ext.ts")]
         self.proc = subprocess.Popen(
             [OMP, "--mode", "rpc", "--no-title", "--no-tools",
              "--no-skills", "--no-rules", "--no-context-files", "--no-lsp",
              "--model", "smoke/first", "--system-prompt", "Offline plugin smoke.",
-             *session_args],
+             *session_args, *guard, *extra_args],
             env=env, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True,
         )

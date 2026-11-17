@@ -1,0 +1,3 @@
+# Every `bun test` run refuses outbound connections to non-loopback addresses (see tests/netguard.ts).
+[test]
+preload = ["./tests/netguard.ts"]
