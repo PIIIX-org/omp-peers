@@ -11,10 +11,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import HTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -114,15 +116,25 @@ def main():
     wanted = set(sys.argv[1:])
     paths = sorted(p for p in SCENARIOS.glob("*.py") if not p.name.startswith("_") and (not wanted or p.stem in wanted))
     assert paths, "no scenarios selected"
+    limit = int(os.environ.get("FEATURES_SMOKE_SCENARIO_TIMEOUT", "240"))
     for path in paths:
+        print(f"START scenario {path.stem}", flush=True)
+        started = time.monotonic()
+
+        def expired(_signal, _frame, name=path.stem):
+            raise TimeoutError(f"scenario {name} exceeded {limit}s")
+
         # A short path keeps Unix socket names below macOS's sockaddr_un limit.
         with tempfile.TemporaryDirectory(prefix="opx-", dir="/tmp") as root:
             h = Harness(root)
+            signal.signal(signal.SIGALRM, expired)
+            signal.alarm(limit)
             try:
                 load(path).run(h)
             finally:
+                signal.alarm(0)
                 h.close()
-        print(f"PASS scenario {path.stem}; disposable processes, home and gateway removed")
+        print(f"PASS scenario {path.stem} in {time.monotonic() - started:.1f}s; disposable processes, home and gateway removed", flush=True)
 
 
 if __name__ == "__main__":
