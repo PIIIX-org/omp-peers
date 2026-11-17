@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (c) 2026 PIIIX-org contributors
-"""/peers watchdog through real OMP processes; the model is a scripted loopback gateway that can hold a turn open."""
+"""/peers watchdog through real OMP processes; the model is a scripted loopback gateway that can hold a turn open.
+
+Every peer runs the test-only clock extension (tests/scenarios/_clock_ext.ts): the one-minute busy threshold is crossed by
+advancing all clocks together instead of waiting for it."""
 import json
 import socketserver
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 from smoke import wait_for
+
+CLOCK = ["-e", str(Path(__file__).with_name("_clock_ext.ts"))]
 
 NOT_DELIVERED = "not delivered: worker-b is paused (only its user can resume it)"
 
@@ -77,7 +83,7 @@ def run(h):
         return [b for _, b in requests[before:]]
 
     try:
-        master, worker, other = h.start(), h.start(), h.start()
+        master, worker, other = h.start(args=CLOCK), h.start(args=CLOCK), h.start(args=CLOCK)
         wid, oid = h.row(worker)["id"], h.row(other)["id"]
         assert h.say(master, "/peers master")
         h.say(master, f"/peers do {wid} rename worker-a")
@@ -150,7 +156,13 @@ def run(h):
         worker_start = len(worker.frames)
         worker.call("prompt", message="HOLD-OPEN please")
         wait_for(lambda: h.row(worker)["busy"] is True)
-        busy_alert = wait_for(lambda: next((a for a in state()["alerts"] if a["condition"] == "busy" and a["emitted"]), None), seconds=100)
+        # The busy clock starts when the master first observes the session busy: wait for that, then move every clock past the
+        # one-minute threshold together (registry rows are stamped by each peer's own clock).
+        wait_for(lambda: wid in state()["busy"])
+        for peer in (master, worker, other):
+            assert h.say(peer, "/clock advance 61").startswith("clock advanced by 61s")
+        # The alert is recorded as emitted first and the delivery outcome is written by a second state update after the send.
+        busy_alert = wait_for(lambda: next((a for a in state()["alerts"] if a["condition"] == "busy" and a["emitted"] and a["notified"]), None), seconds=30)
         assert busy_alert["session"] == wid and busy_alert["limit"] == 1 and busy_alert["value"] >= 1, busy_alert
         assert busy_alert["notified"] == {oid: NOT_DELIVERED}, busy_alert
         status = h.say(master, "/peers watchdog status")
