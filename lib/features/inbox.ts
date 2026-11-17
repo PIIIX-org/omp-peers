@@ -87,7 +87,7 @@ function validateState(value: unknown): InboxState {
 }
 
 /** The inbox as stored; a missing file is an empty inbox. Never writes. */
-export function readInbox(host: FeatureHost): InboxState {
+export function readInbox(host: Pick<FeatureHost, "home">): InboxState {
 	return readState(inboxFile(host.home), emptyState, validateState);
 }
 

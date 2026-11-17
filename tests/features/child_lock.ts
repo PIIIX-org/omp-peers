@@ -14,6 +14,7 @@ const host: FeatureHost = {
 	acceptsRemote: () => true,
 	peers: async () => [],
 	groupsOf: () => [],
+	usageNow: () => undefined,
 	notify: () => {},
 	resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
