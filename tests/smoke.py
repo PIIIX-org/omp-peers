@@ -38,6 +38,16 @@ export default function fixture(pi) {
 
 
 GUARD_REFUSAL = "network guard: refused"
+GUARD_PRELOAD = str(REPO / "tests" / "netguard.ts")
+
+
+def plugin_link(env, cwd):
+    """`omp plugin link` under the guard (BUN_OPTIONS preload: the subcommand takes no `-e`); fails on any refusal."""
+    result = subprocess.run([OMP, "plugin", "link", str(REPO)], env={**env, "BUN_OPTIONS": "--preload " + GUARD_PRELOAD},
+                            cwd=cwd, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert GUARD_REFUSAL not in result.stdout + result.stderr, "plugin link attempted outbound network access:\n" + result.stderr
+    return result
 
 
 class Peer:
@@ -421,11 +431,7 @@ def main():
                "XDG_CACHE_HOME": str(home / "cache"),
                "XDG_STATE_HOME": str(home / "state")}
         try:
-            installed = subprocess.run(
-                [OMP, "plugin", "link", str(REPO)], env=env, cwd=root,
-                capture_output=True, text=True, timeout=60,
-            )
-            assert installed.returncode == 0, installed.stdout + installed.stderr
+            installed = plugin_link(env, root)
             print("PASS OMP plugin link:", installed.stdout.strip())
             for _ in range(2):
                 peer = Peer(env, root)
@@ -646,8 +652,7 @@ def main():
                 except subprocess.TimeoutExpired:
                     watcher.kill()
                     watcher.communicate(timeout=5)
-            for peer in peers:
-                peer.close()
+            close_peers(peers)
     print("PASS temporary home removed; no real sessions or credentials used")
 
 

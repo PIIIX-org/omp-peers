@@ -23,9 +23,12 @@ class PinnedRoutingChecks(unittest.TestCase):
                    "PI_CODING_AGENT_DIR": str(home / ".omp/agent"),
                    "XDG_CONFIG_HOME": str(home / "config"), "XDG_DATA_HOME": str(home / "data"),
                    "XDG_CACHE_HOME": str(home / "cache"), "XDG_STATE_HOME": str(home / "state")}
-            result = subprocess.run([bun, "test", str(REPO / "tests/routing.test.ts")],
+            # cwd is outside the repo, so bunfig.toml's preload does not apply: preload the guard (and its failing hook) explicitly.
+            guard = [arg for name in ("netguard.ts", "netguard_bun_test.ts") for arg in ("--preload", str(REPO / "tests" / name))]
+            result = subprocess.run([bun, "test", *guard, str(REPO / "tests/routing.test.ts")],
                                     env=env, cwd=root, capture_output=True, text=True, timeout=45)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("network guard: refused", result.stderr)
             self.assertIn("PASS offline pinned routing", result.stdout)
 
 

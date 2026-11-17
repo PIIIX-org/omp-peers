@@ -12,7 +12,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import subprocess
 import sys
 import tempfile
 import threading
@@ -21,7 +20,7 @@ from http.server import HTTPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from routing_smoke import FakeGateway
-from smoke import OMP, Peer, REPO, close_peers, wait_for
+from smoke import OMP, Peer, close_peers, plugin_link, wait_for
 
 SCENARIOS = Path(__file__).resolve().parent / "scenarios"
 
@@ -52,9 +51,7 @@ class Harness:
                     "PI_CODING_AGENT_DIR": str(self.agent), "TMPDIR": str(self.home),
                     "XDG_CONFIG_HOME": str(self.home / "config"), "XDG_DATA_HOME": str(self.home / "data"),
                     "XDG_CACHE_HOME": str(self.home / "cache"), "XDG_STATE_HOME": str(self.home / "state")}
-        installed = subprocess.run([OMP, "plugin", "link", str(REPO)], env=self.env, cwd=self.home,
-                                   capture_output=True, text=True, timeout=60)
-        assert installed.returncode == 0, installed.stdout + installed.stderr
+        plugin_link(self.env, self.home)
 
     def start(self, resume=None, env=None, args=()):
         """Start a peer. `env` adds environment variables; such a peer is used as launched (no `new_session`)."""

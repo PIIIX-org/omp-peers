@@ -175,12 +175,20 @@ describe("the preloaded guard", () => {
 		expect(await readAll(() => net.connect(unixPath))).toBe("u");
 	});
 
-	test("an unexpected refusal is kept in the process-global log and cleared by takeViolations", () => {
-		expect(takeViolations()).toEqual([]);
-		expect(() => net.connect(80, "example.com")).toThrow(REFUSED);
-		const logged = takeViolations();
-		expect(logged).toHaveLength(1);
-		expect(logged[0]).toMatch(REFUSED);
+	test("an undeclared refusal is written to stderr and fails the process even when the caller catches it", () => {
+		// Run in a child so the undeclared refusal neither prints in this run nor trips this run's own violation check.
+		const script = `import net from "node:net"; try { net.connect(80, "example.com"); } catch {} console.log("done");`;
+		const child = Bun.spawnSync([process.execPath, "--preload", GUARD_SOURCE, "-e", script], { cwd: os.tmpdir(), stdout: "pipe", stderr: "pipe" });
+		expect(child.stdout.toString().trim()).toBe("done");
+		expect(child.stderr.toString()).toContain("network guard: refused outbound connection to example.com:80");
+		expect(child.exitCode).toBe(1);
+	});
+
+	test("refusals declared with expectViolations leave nothing behind in the global log", async () => {
+		const violations = await expectViolations(() => {
+			expect(() => net.connect(80, "example.com")).toThrow(REFUSED);
+		});
+		expect(violations).toHaveLength(1);
 		expect(takeViolations()).toEqual([]);
 	});
 });
@@ -208,6 +216,8 @@ describe("child processes", () => {
 			() => execSync("echo hello && curl --version"),
 			() => execSync("(cd . ; /usr/bin/scp -V)"),
 			() => Bun.spawnSync(["sh", "-c", "ssh -V"]),
+			() => execSync("curl>/dev/null"),
+			() => execSync("cat </dev/null;/usr/bin/wget<&-"),
 		];
 		for (const attempt of attempts) {
 			expect(await refusedOnce(attempt)).toMatch(REFUSED_PROGRAM);
@@ -242,12 +252,15 @@ describe("child processes", () => {
 
 	test("a child bun without --preload is guarded too; one that already has --preload is left alone", () => {
 		const script = `try { await fetch("https://discord.com/"); console.log("OPEN"); } catch (error) { console.log(String(error.message)); }`;
-		const child = Bun.spawnSync([process.execPath, "-e", script], { cwd: os.tmpdir(), stderr: "pipe" });
+		const child = Bun.spawnSync([process.execPath, "-e", script], { cwd: os.tmpdir(), stdout: "pipe", stderr: "pipe" });
 		expect(child.stdout.toString()).toMatch(/network guard: refused outbound connection to discord\.com/);
 		expect(child.stderr.toString()).toMatch(/network guard: refused outbound connection to discord\.com/);
-		const explicit = Bun.spawnSync([process.execPath, "--preload", GUARD_SOURCE, "-e", script], { cwd: os.tmpdir(), stderr: "pipe" });
+		expect(child.exitCode).toBe(1); // the child caught the refusal and finished normally, yet still fails
+		const explicit = Bun.spawnSync([process.execPath, "--preload", GUARD_SOURCE, "-e", script], { cwd: os.tmpdir(), stdout: "pipe", stderr: "pipe" });
 		expect(explicit.stdout.toString()).toMatch(/refused outbound connection/);
+		expect(explicit.exitCode).toBe(1);
 		const viaNode = spawnSync(process.execPath, ["-e", script], { cwd: os.tmpdir() });
 		expect(viaNode.stdout.toString()).toMatch(/refused outbound connection/);
+		expect(viaNode.status).toBe(1);
 	});
 });

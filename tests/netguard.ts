@@ -20,10 +20,14 @@
  * `--preload` gets `--preload <this file>` so it is guarded too.
  *
  * Refusals are loud even when the caller swallows the error: see tests/netguard_policy.ts (violation log, stderr line).
+ * A process that exits with an undeclared violation on record exits 1, so a guarded child bun that caught the refusal
+ * and otherwise finished cleanly still fails its parent's exit-code check.
  *
  * NOT covered (gaps): dns.lookup/resolve (a refused connect never resolves, but a direct dns call does), dgram/UDP
  * (`Bun.udpSocket`), node:http2, `Bun.$` shell, and network programs launched through other wrappers (`env ssh`, `xargs`,
- * `nohup`, `sudo`).
+ * `nohup`, `sudo`). Processes other than bun/OMP are unguarded: a `node`, `python3` or `npm` child (npm fetches packages)
+ * bypasses every check, and the Python test harnesses make no network calls the guard could see. A refusal recorded after
+ * the last test of a `bun test` run, or after a child's exit hook, is only visible on stderr.
  *
  * It is preloaded for every `bun test` run (bunfig.toml) and loaded into every OMP process the smoke harnesses start
  * (tests/netguard_ext.ts, `omp -e`). It is never imported by plugin code and is not shipped.
@@ -35,7 +39,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
-import { isLoopback, refuse } from "./netguard_policy";
+import { isLoopback, refuse, takeViolations } from "./netguard_policy";
 
 const GUARD = Symbol.for("omp-peers.netguard");
 const SELF = import.meta.path;
@@ -121,7 +125,7 @@ function checkProgram(program: string, cwd: string, searchPath: string | undefin
 	if (network !== undefined && !isFixtureProgram(resolved)) refuse(`network guard: refused network program ${network} (${program})`);
 }
 
-const SHELL_WORD = new RegExp(`(?:^|[\\s;&|()\`$'"])((?:[^\\s;&|()\`'"]*/)?(?:${[...NETWORK_PROGRAMS].join("|")}))(?=$|[\\s;&|()\`'"])`, "g");
+const SHELL_WORD = new RegExp(`(?:^|[\\s;&|()<>\`$'"])((?:[^\\s;&|()<>\`'"]*/)?(?:${[...NETWORK_PROGRAMS].join("|")}))(?=$|[\\s;&|()<>\`'"])`, "g");
 
 /** `sh -c "<script>"`: refuse when the script names a network program as a command word. */
 function checkShellScript(cmd: string[], cwd: string, searchPath: string | undefined): void {
@@ -174,6 +178,10 @@ function install(): void {
 	const marker = globalThis as Record<symbol, unknown>;
 	if (marker[GUARD]) return;
 	marker[GUARD] = true;
+
+	process.on("exit", () => {
+		if (takeViolations().length > 0) process.exitCode = 1; // the refusal was already written to stderr
+	});
 
 	const realFetch = globalThis.fetch;
 	globalThis.fetch = Object.assign(
