@@ -61,6 +61,7 @@ function host(self = A, master = false): FeatureHost {
 		},
 		isMaster: () => master,
 		notify: () => {},
+		usageNow: () => undefined,
 		acceptsRemote: () => true,
 		peers: async () => {
 			calls.peers++;
