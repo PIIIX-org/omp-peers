@@ -3,6 +3,7 @@
 """/peers usage through real OMP processes: opt-in publishing of the host's numeric counters, read by the master."""
 import json
 import re
+import socket
 import stat
 
 from smoke import wait_for
@@ -21,6 +22,20 @@ def normalize(text):
 
 def published(h, peer):
     return wait_for(lambda: h.row(peer).get("usage"))
+
+def rpc(row, request):
+    """Speak the peer socket protocol directly, as any other session or tool could."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(10)
+        conn.connect(row["sock"])
+        conn.sendall(json.dumps(request).encode() + b"\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = conn.recv(65536)
+            assert chunk, "peer closed without a reply"
+            data += chunk
+    return json.loads(data)
+
 
 
 def run(h):
@@ -145,3 +160,14 @@ def run(h):
     assert json.loads((h.state / "usage.json").read_text())["publishers"] == []
     assert len(h.gateway.requests) == requests, "no provider request was made after the one turn"
     print("PASS /peers usage off removes the figures from the registry row and the master lists the session as unknown again")
+
+    # Nothing remote can enable publishing: an unknown op is refused, and a peer message carrying the command text is only text.
+    state_bytes = (h.state / "usage.json").read_bytes()
+    row = h.row(worker)
+    assert rpc(row, {"op": "usage", "text": "on", "from": {"id": "completion-watcher", "name": "Completion watcher"}}) == {"ok": False, "error": 'unknown op "usage"'}
+    sent = rpc(row, {"op": "message", "text": "/peers usage on", "from": {"id": mid, "name": "master"}})
+    assert sent.get("ok") is True, sent
+    wait_for(lambda: len(h.gateway.requests) > requests)  # the text is delivered to the model as a message, not run as a command
+    assert (h.state / "usage.json").read_bytes() == state_bytes and json.loads(state_bytes)["publishers"] == []
+    assert "usage" not in h.row(worker)
+    print("PASS no remote op or peer message can switch publishing on")

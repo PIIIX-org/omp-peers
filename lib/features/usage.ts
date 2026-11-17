@@ -338,7 +338,12 @@ export type Estimate = { ok: true; usd: number } | { ok: false; reason: string }
 /** Estimated cost in USD of `usage` under the configured pricing source. Unknown inputs give a reason, never zero. */
 export function estimateUsd(usage: ReadUsage, config: Pick<UsageConfig, "pricing" | "prices">): Estimate {
 	if (config.pricing === "catalog") {
-		return usage.catalogCost === undefined ? { ok: false, reason: "the host reported no catalog cost" } : { ok: true, usd: usage.catalogCost };
+		if (usage.catalogCost === undefined) return { ok: false, reason: "the host reported no catalog cost" };
+		// The host total is 0 both for a free model and for one with no catalog price: with tokens spent that is not a known cost.
+		if (usage.catalogCost === 0 && COUNTERS.some(counter => (usage.counters[counter] ?? 0) > 0)) {
+			return { ok: false, reason: "host catalog cost is 0 for non-zero tokens (no catalog price, or a free model)" };
+		}
+		return { ok: true, usd: usage.catalogCost };
 	}
 	const price = priceFor(config.prices, usage.model);
 	if (!price) return { ok: false, reason: usage.model ? `no custom price for ${usage.model}` : "the session published no model to price" };

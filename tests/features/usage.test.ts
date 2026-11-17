@@ -111,7 +111,11 @@ describe("cost arithmetic", () => {
 
 	test("catalog uses the host's per-call catalog cost as is and is unknown without it", () => {
 		expect(estimateUsd(usageOf({ catalogCost: 1.2345 }), { pricing: "catalog", prices: {} })).toEqual({ ok: true, usd: 1.2345 });
-		expect(estimateUsd(usageOf({ catalogCost: 0 }), { pricing: "catalog", prices: {} })).toEqual({ ok: true, usd: 0 });
+		expect(estimateUsd(usageOf({ catalogCost: 0, counters: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }), { pricing: "catalog", prices: {} })).toEqual({ ok: true, usd: 0 }); // nothing spent: a known zero
+		// A host cost of 0 beside spent tokens means no catalog price (local/custom model) or a free one: not a known cost.
+		const unpriced = { ok: false as const, reason: "host catalog cost is 0 for non-zero tokens (no catalog price, or a free model)" };
+		expect(estimateUsd(usageOf({ catalogCost: 0 }), { pricing: "catalog", prices: {} })).toEqual(unpriced);
+		expect(estimateUsd(usageOf({ catalogCost: 0, counters: { output: 1 } }), { pricing: "catalog", prices: {} })).toEqual(unpriced);
 		expect(estimateUsd(usageOf(), { pricing: "catalog", prices: {} })).toEqual({ ok: false, reason: "the host reported no catalog cost" });
 	});
 
