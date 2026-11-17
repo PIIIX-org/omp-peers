@@ -256,7 +256,7 @@ describe("answer delivery", () => {
 		const reply = await run("answer q1 yes");
 		expect(stored().entries[0].delivery).toBe("undeliverable: session is paused");
 		expect(reply).toContain("session is paused");
-		expect(reply).toContain("only that session's own user can /peers resume");
+		expect(reply).toContain("(resume policy: see /peers pause status)"); // no pause file in this suite: who paused it is not known
 		expect(checkQuestions(host(A), "q1")).toEqual({ ok: true, text: expect.stringContaining("delivery: undeliverable: session is paused") });
 		outcome = { status: "delivered" };
 		await retryDelivery(master(), "q1");

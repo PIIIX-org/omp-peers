@@ -16,6 +16,7 @@ import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import type { FeatureHost } from "./host";
 import type { Feature } from "./index";
+import { RESUME_REFUSED, SUBAGENT_RESUME_ERROR } from "./pause";
 import { screenText } from "./rules";
 import { acquire, privateDir, readRegularFile, readState, stateRoot, updateState } from "./store";
 
@@ -54,7 +55,7 @@ export type Outcome = "ok" | "refused" | "failed" | "unreachable" | "deferred" |
 /** The only reason texts that are ever stored. */
 export const REASONS = [
 	"not-master", "locked", "inbound-refused", "not-ready", "protected-setting", "invalid-argument", "unavailable-model",
-	"no-credentials", "busy", "paused", "error", "unreachable", "timeout", "connection-closed", "bad-response", "response-too-large",
+	"no-credentials", "busy", "paused", "not-resumable", "error", "unreachable", "timeout", "connection-closed", "bad-response", "response-too-large",
 ] as const;
 export type Reason = (typeof REASONS)[number];
 
@@ -216,6 +217,9 @@ export function classifyResponse(op: string, response: Record<string, unknown>):
 	if (error.startsWith("peer is locked")) return { outcome: "refused", reason: "locked" };
 	if (error.startsWith("sender is not the master")) return { outcome: "refused", reason: "not-master" };
 	if (error.startsWith("peer refuses inbound")) return { outcome: "refused", reason: "inbound-refused" };
+	// The receiver's fixed resume refusals (a pause the master did not set) and the subagent refusal.
+	if (Object.values(RESUME_REFUSED).includes(error)) return { outcome: "refused", reason: "not-resumable" };
+	if (error === SUBAGENT_RESUME_ERROR) return { outcome: "refused", reason: "not-master" };
 	// A paused receiver refuses wake-triggering dispatches with a structured refusal (no free text is kept).
 	if (response.paused === true) return { outcome: "refused", reason: "paused" };
 	if (error.includes("is protected and cannot be changed remotely")) return { outcome: "refused", reason: "protected-setting" };

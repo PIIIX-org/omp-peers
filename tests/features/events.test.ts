@@ -541,12 +541,12 @@ describe("retries and failures", () => {
 describe("targets: paused, locked, refusing, absent", () => {
 	test("a paused session is never messaged: not delivered: paused, retried within the bound, delivered after resume", async () => {
 		await configured();
-		await pauseSession(home, A, A, now, "maintenance");
+		await pauseSession(home, A, "user", now, "maintenance");
 		await ingest();
 		await tick(host());
 		expect(sent).toEqual([]);
 		expect(logOutcomes()).toEqual([`ci/evt-1/r1->${A}: not delivered: paused`]);
-		await resumeSession(home, A);
+		await resumeSession(home, A, "user");
 		now += RETRY_DELAYS_MS[0];
 		await tick(host());
 		expect(sent).toEqual([{ to: A, text: frame(), dependency: true }]);
@@ -554,7 +554,7 @@ describe("targets: paused, locked, refusing, absent", () => {
 
 	test("a session that stays paused loses the event after three attempts and is never messaged", async () => {
 		await configured();
-		await pauseSession(home, A, A, now);
+		await pauseSession(home, A, "user", now);
 		await ingest();
 		await tick(host());
 		now += RETRY_DELAYS_MS[0];
@@ -706,7 +706,7 @@ describe("work dispatch", () => {
 
 	test("approving into a paused, locked or refusing target is not delivered, keeps the item and never wakes it; three failures drop it", async () => {
 		await configuredWork();
-		await pauseSession(home, A, A, now);
+		await pauseSession(home, A, "user", now);
 		await ingest();
 		expect(await run("approve i1")).toBe([
 			`i1 not delivered to worker-a (${A}): paused; nothing reached it`,
@@ -714,7 +714,7 @@ describe("work dispatch", () => {
 		].join("\n"));
 		expect(sent).toEqual([]);
 		live = live.map(peer => (peer.id === A ? { ...peer, acceptsRemote: false } : peer));
-		await resumeSession(home, A);
+		await resumeSession(home, A, "user");
 		expect(await run("approve i1")).toContain("does not accept remote requests");
 		expect(await run("approve i1")).toContain("used all 3 attempts and was dropped (failed: retries exhausted)");
 		expect(stored().queue).toEqual([]);
@@ -924,7 +924,7 @@ describe("test command (dry run)", () => {
 
 	test("shows blockers, the work approval path, rate limits and rejections", async () => {
 		await configuredWork();
-		await pauseSession(home, A, A, now);
+		await pauseSession(home, A, "user", now);
 		const out = await run("test");
 		expect(out).toContain("route w1 (work): would queue i1 awaiting your approval; nothing is sent until /peers events approve i1. Approval would send (exactly):");
 		expect(out).toContain("delivery to worker-a (p00000000000000a1) would be blocked: paused (outcome: not delivered: paused)");

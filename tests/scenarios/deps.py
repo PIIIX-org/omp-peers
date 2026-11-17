@@ -172,7 +172,7 @@ def run(h):
     assert [(e["id"], e["outcome"]) for e in ledger()] == [("t1", "delivered"), ("t2", "pending")]
     target_start = len(target.frames)
     not_delivered = h.say(master, "/peers deps approve t2")
-    assert not_delivered == (f"t2 not delivered: session is paused; nothing reached worker-b ({tid}) (only that session's own user can /peers resume). "
+    assert not_delivered == (f"t2 not delivered: session is paused; nothing reached worker-b ({tid}) (paused by its user: only its user can resume it). "
                              "Fix the cause and run /peers deps approve t2 again, or /peers deps reject t2"), not_delivered
     assert [(e["id"], e["outcome"]) for e in ledger()] == [("t1", "delivered"), ("t2", "not delivered: session is paused")]
     assert h.row(target)["paused"] is True

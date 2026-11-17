@@ -20,7 +20,7 @@ A private, local record of which control operation reached which session and how
 
 ## What is recorded
 
-Every control operation that reaches a session's control path is recorded by the **receiving** session, and by the **sending** session for each target it sent to. Control operations are `prompt`, `abort`, `compact`, `model`, `effort`, `subagents`, `setting`, `rename`, `tail`, `shutdown` and `pause`. `status`, plain messages and `resume` are not recorded: `resume` is not a remote operation at all, only the paused session's own `/peers resume`; a remote `resume` request is refused and not recorded. A control request refused because the receiver is paused (see `reason` below) is recorded like any other refusal. A control command that the sending session refuses locally because it is not the master (`Not the master...`) is never sent and is not recorded.
+Every control operation that reaches a session's control path is recorded by the **receiving** session, and by the **sending** session for each target it sent to. Control operations are `prompt`, `abort`, `compact`, `model`, `effort`, `subagents`, `setting`, `rename`, `tail`, `shutdown`, `pause` and `resume`. `status` and plain messages are not recorded. A control request refused because the receiver is paused (see `reason` below) is recorded like any other refusal, and so is a `resume` the receiver refused because the pause was not the master's (`reason` `not-resumable`; see [pause.md](pause.md)). A control command that the sending session refuses locally because it is not the master (`Not the master...`) is never sent and is not recorded.
 
 Each operation produces an `attempted` record when it starts and a `completed` record with the result. A sender's and a receiver's records for one operation share the same `request` id, so one operation is up to four lines (sender attempted, receiver attempted, receiver completed, sender completed). A receiver also records requests that did not come through a sender, for example a refused request written straight to its socket; those have only the two receiver lines.
 
@@ -44,7 +44,7 @@ One JSON object per line (version 1):
 
 Outcomes: `ok` finished; `deferred` accepted but finishing later (`compact`, `shutdown`, a prompt queued behind running work); `refused` by policy; `failed` after being accepted; `unreachable` the target could not be contacted (sender only); `unknown` the sender sent the request but never got a usable answer (timeout, closed connection, bad response), so it cannot say whether the operation ran. Compare it with the receiver's own records.
 
-Reasons come from this fixed list and are never copied from a message: `not-master`, `locked`, `inbound-refused`, `not-ready`, `paused`, `protected-setting`, `invalid-argument`, `unavailable-model`, `no-credentials`, `busy`, `error`, `unreachable`, `timeout`, `connection-closed`, `bad-response`, `response-too-large`.
+Reasons come from this fixed list and are never copied from a message: `not-master` (also a `resume` a subagent sent), `locked`, `inbound-refused`, `not-ready`, `paused`, `not-resumable` (a `resume` for a pause the master did not set), `protected-setting`, `invalid-argument`, `unavailable-model`, `no-credentials`, `busy`, `error`, `unreachable`, `timeout`, `connection-closed`, `bad-response`, `response-too-large`.
 
 ### Claims are not authenticated
 
@@ -64,7 +64,7 @@ Not stored: tokens or credentials, prompt or task text, `tail` output or any tra
 | `model` | `selector`, the requested model selector |
 | `effort` | `effort`, the requested level |
 | `tail` | `n`, the requested count |
-| `abort`, `compact`, `shutdown` | none |
+| `abort`, `compact`, `resume`, `shutdown` | none |
 
 Every string is stripped of control characters and capped: names 60 characters, `selector` and `effort` 80, `key` 80. A name, selector or key that looks like a credential (token prefixes, `key=value` assignments, bearer tokens, private-key headers, URL passwords, or an unbroken run of 32 or more letters, digits, `+` or `/`) is stored as `[redacted]`; a selector or key with characters outside the usual identifier set is stored as `[redacted]` too. This is a conservative screen, not a guarantee. The content limits (which fields are kept, the caps above, the screen and the 4096-byte line limit) are fixed in the code; only the retention limits are configurable, and nothing makes the log store more. A record line never exceeds 4096 bytes. `tail` re-validates each line and skips anything that is not exactly a version 1 record.
 

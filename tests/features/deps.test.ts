@@ -462,15 +462,15 @@ describe("blocked targets", () => {
 	});
 
 	test("a paused target gets nothing: not delivered, never un-paused, delivered once after its own user resumes", async () => {
-		await pauseSession(home, B, B, T0, "reviewing");
+		await pauseSession(home, B, "user", T0, "reviewing");
 		const preview = await run("preview t1");
 		expect(preview).toContain("delivery would be blocked: session is paused (outcome: not delivered: session is paused)");
-		expect(await run("approve t1")).toBe(`t1 not delivered: session is paused; nothing reached worker-b (${B}) (only that session's own user can /peers resume). Fix the cause and run /peers deps approve t1 again, or /peers deps reject t1`);
+		expect(await run("approve t1")).toBe(`t1 not delivered: session is paused; nothing reached worker-b (${B}) (paused by its user: only its user can resume it). Fix the cause and run /peers deps approve t1 again, or /peers deps reject t1`);
 		expect(sendCalls).toBe(0);
 		expect(outcomes()).toEqual(["t1:not delivered: session is paused"]);
 		expect(JSON.parse(fs.readFileSync(path.join(stateRoot(home), "pause.json"), "utf8")).sessions[B]).toBeDefined();
 		expect(await run("pending")).toContain("t1  not delivered: session is paused");
-		await resumeSession(home, B);
+		await resumeSession(home, B, "user");
 		expect(await run("approve t1")).toContain("t1 delivered to worker-b");
 		expect(sent).toEqual([{ to: B, text: message("t1") }]);
 		expect(await run("approve t1")).toBe("error: t1 was already delivered; it is never sent twice");
@@ -489,9 +489,9 @@ describe("blocked targets", () => {
 		live = live.filter(peer => peer.id !== B);
 		expect(await run("preview t1")).toContain("delivery would be blocked: target is not running");
 		expect(await run("approve t1")).toContain(`t1 not delivered: target is not running; nothing reached ${B} (not running)`);
-		await pauseSession(home, B, B, T0);
+		await pauseSession(home, B, "user", T0);
 		expect(await run("preview t1")).toContain("delivery would be blocked: target is not running; session is paused");
-		await resumeSession(home, B);
+		await resumeSession(home, B, "user");
 		live = [...live, { id: B, name: "worker-b", refusesInbound: false, acceptsRemote: false }];
 		expect(await run("preview t1")).toContain("delivery would be blocked: target locked (control refused) (outcome: not delivered: target locked (control refused))");
 		expect(await run("approve t1")).toContain("t1 not delivered: target locked (control refused); nothing reached worker-b");

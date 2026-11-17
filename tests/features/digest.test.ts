@@ -181,7 +181,7 @@ describe("content: only explicit reports and status, unknown stays unknown", () 
 		await askQuestion(host(B), { question: "Ship it?", context: "release train, details only for the master" });
 		await askQuestion(host(A), { question: "Which db?" });
 		await deferQuestion(host(), "q2", "later");
-		await pauseSession(home, C, C, T0);
+		await pauseSession(home, C, "user", T0);
 	};
 
 	test("renders the board, pending decisions and paused sessions exactly; sessions without a report are unknown, never idle or done", async () => {
@@ -729,7 +729,7 @@ describe("delivery and duplicates", () => {
 
 	test("a master that is paused or refuses remote requests gets the digest as a notification only, never in a prompt", async () => {
 		await enable();
-		await pauseSession(home, MASTER, MASTER, T0);
+		await pauseSession(home, MASTER, "user", T0);
 		await tick(S1);
 		expect(notes).toHaveLength(1);
 		expect(notes[0]).toEndWith("\n(not delivered to any prompt: this session is paused, so the digest is not added to any prompt)");
@@ -748,7 +748,7 @@ describe("delivery and duplicates", () => {
 	test("a queued digest is held, not injected, while the master is paused or refusing, and is injected once afterwards", async () => {
 		await enable();
 		await tick(S1);
-		await pauseSession(home, MASTER, MASTER, T0);
+		await pauseSession(home, MASTER, "user", T0);
 		expect(await run("status")).toContain("queued: digest #1 for this session's next agent start (held while this session is paused or refuses remote requests)");
 		expect(await digestContext(host())).toBeUndefined();
 		fs.rmSync(pauseFile(home));
@@ -770,7 +770,7 @@ describe("delivery and duplicates", () => {
 	});
 
 	test("a digest never sends a message to any session, paused or not, and never touches another session's pause state", async () => {
-		await pauseSession(home, A, A, T0);
+		await pauseSession(home, A, "user", T0);
 		const pausedBefore = fs.readFileSync(pauseFile(home), "utf8");
 		for (const destination of ["master", "human"]) {
 			await run(`set destination ${destination}`);
@@ -807,7 +807,7 @@ describe("delivery and duplicates", () => {
 		expect(await run("now")).toBe("manual digest #1: notification shown (it does not use up a scheduled slot)");
 		expect(notes).toHaveLength(1);
 		await run("set destination master");
-		await pauseSession(home, MASTER, MASTER, T0);
+		await pauseSession(home, MASTER, "user", T0);
 		expect(await run("now")).toStartWith("manual digest #2: not delivered: this session is paused");
 		expect(stored().pending).toBeUndefined();
 	});
@@ -923,7 +923,7 @@ describe("preview mirrors the real digest and writes nothing", () => {
 	test("the preview body is the text a real scheduled digest has at the same instant; the slot id is the only difference", async () => {
 		seedBoard([boardEntry(A, { status: "blocked", task: "build it", updatedAt: T0 - HOUR }), boardEntry(B, { status: "assigned", source: "assignment", task: "docs", updatedAt: T0 - 30 * HOUR })]);
 		await askQuestion(host(B), { question: "Ship it?" });
-		await pauseSession(home, C, C, T0);
+		await pauseSession(home, C, "user", T0);
 		await enable();
 		const previewAtSlot = (await run("preview", Object.assign(host(), { now: () => S1 }))).split("\n\n").slice(1).join("\n\n");
 		await tick(S1);

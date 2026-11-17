@@ -78,11 +78,13 @@ try {
 	assert.equal(exitAfterStart, exitBefore + 1, "extension registers exactly one exit listener");
 	assert.deepEqual(registry().map(p => p.sessionId), ["worker-a"]);
 
-	// (c) A default session persists no metadata at all.
-	assert.deepEqual(files(saved, /\.json$/), [], "default bind must not write peer-sessions metadata");
+	// (c) A default session persists only its run record: `clean: false` while it runs, nothing else beyond the defaults.
+	const record = (sessionId: string, extra: Record<string, unknown> = {}) => ({ sessionId, name: "", restoreMaster: false, routingPolicy: "keep", clean: false, managed: false, ...extra });
+	assert.deepEqual(files(saved, /\.json$/), [path.basename(stored("worker-a"))], "a bound session writes its run record");
+	assert.deepEqual(JSON.parse(fs.readFileSync(stored("worker-a"), "utf8")), record("worker-a"));
 	assert.match(await command("master", a.ctx), /now the master/);
 	assert.equal(masterClaim(), stablePeerId("worker-a"));
-	assert.deepEqual(files(saved, /\.json$/), [], "claiming master without --restore persists nothing");
+	assert.deepEqual(JSON.parse(fs.readFileSync(stored("worker-a"), "utf8")), record("worker-a"), "claiming master without --restore changes nothing");
 
 	// (a) A second session manager in the same process cannot swap identity or the master claim.
 	const pinned = registry()[0]!.id;
@@ -112,7 +114,10 @@ try {
 		await until(() => registry().length === 1 && registry()[0]!.sessionId === a.manager.id);
 	}
 	assert.equal(process.listeners("exit").length, exitAfterStart, "rebinds register no further exit listeners");
-	assert.deepEqual(files(saved, /\.json$/), [], "switching default sessions still persists nothing");
+	const visited = ["worker-a", "worker-a2", "worker-a3"].map(id => path.basename(stored(id))).sort();
+	assert.deepEqual(files(saved, /\.json$/), visited, "switching default sessions persists only their run records");
+	assert.deepEqual(JSON.parse(fs.readFileSync(stored("worker-a2"), "utf8")), record("worker-a2", { clean: true }), "a session left by a switch is recorded as exited cleanly");
+	assert.deepEqual(JSON.parse(fs.readFileSync(stored("worker-a3"), "utf8")), record("worker-a3"), "the running session is not clean");
 
 	// (c) Non-default state persists, survives a switch round trip, and never touches other ids.
 	a.manager.id = "worker-a";
@@ -121,13 +126,13 @@ try {
 	sessionName = "frontend-worker";
 	await emit("turn_end", a.ctx);
 	assert.deepEqual(JSON.parse(fs.readFileSync(stored("worker-a"), "utf8")),
-		{ sessionId: "worker-a", name: "frontend-worker", restoreMaster: false, routingPolicy: "keep" });
+		record("worker-a", { name: "frontend-worker" }));
 	assert.equal(fs.statSync(stored("worker-a")).mode & 0o777, 0o600);
 	sessionName = "";
 	a.manager.id = "worker-a2";
 	await emit("session_switch", a.ctx);
 	await until(() => registry()[0]?.sessionId === "worker-a2");
-	assert.deepEqual(files(saved, /\.json$/), [path.basename(stored("worker-a"))], "only the named session has metadata");
+	assert.deepEqual(files(saved, /\.json$/), visited, "every visited session has a run record, and no other id is touched");
 	assert.match(await command("master --restore", a.ctx), /Restore on resume enabled/);
 	assert.equal(JSON.parse(fs.readFileSync(stored("worker-a2"), "utf8")).restoreMaster, true);
 	assert.match(await command("release", a.ctx), /restore on resume disabled/);
