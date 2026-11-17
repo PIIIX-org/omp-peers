@@ -12,6 +12,7 @@ import { locks } from "./locks";
 import { pause, resume } from "./pause";
 import { rules } from "./rules";
 import { templates } from "./templates";
+import { watchdog } from "./watchdog";
 
 /** An LLM tool a feature contributes. The extension registers it; the feature never imports host runtime values. */
 export interface ToolSpec {
@@ -35,7 +36,9 @@ export interface Feature {
 	onReport?(report: Report, from: { id: string; name: string }, host: FeatureHost): Promise<void>;
 	/** LLM tools registered once at extension load; each call receives the calling session's host. */
 	tools?(): ToolSpec[];
+	/** Periodic work, run from the master session's 5 s refresh only. May throw: the extension warns once and carries on. */
+	tick?(host: FeatureHost): Promise<void>;
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates];
+export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, watchdog];
