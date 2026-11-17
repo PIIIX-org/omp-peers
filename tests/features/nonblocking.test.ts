@@ -37,7 +37,7 @@ describe("readers of user-writable files never block on a FIFO", () => {
 		const fifo = path.join(home, ".omp", "agent", "peers.json");
 		mkfifo(fifo);
 		// `timeout` kills the child if a read blocks on the FIFO, so a regression fails this test instead of hanging the suite.
-		const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "child_fifo.ts"), home, fifo], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
+		const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "child_fifo.ts"), home, fifo], { stdout: "pipe", stderr: "pipe", timeout: 4_000 });
 		const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
 		expect(code, err).toBe(0);
 		const result: unknown = JSON.parse(out);
