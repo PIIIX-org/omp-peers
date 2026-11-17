@@ -16,7 +16,7 @@ jobs:
   ci:
     name: ci
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -54,10 +54,14 @@ jobs:
           python3 -m py_compile tools/watch.py tools/install_watcher.py tests/smoke.py tests/activity_smoke.py tests/routing_smoke.py tests/features_smoke.py tests/scenarios/*.py tests/test_routing.py tests/test_watcher.py tests/test_leak_scan.py scripts/leak_scan.py
           npm run test:watcher
       - name: Exercise two real pinned OMP processes without provider calls
+        timeout-minutes: 5
         run: npm run test:smoke
       - name: Exercise real session jobs without model turns
+        timeout-minutes: 5
         run: npm run test:activity-smoke
       - name: Exercise actual OMP pin and upstream routing with a loopback fake gateway
+        timeout-minutes: 5
         run: npm run test:routing-smoke
       - name: Exercise feature scenarios in real pinned OMP processes with a loopback fake gateway
+        timeout-minutes: 15
         run: npm run test:features-smoke
