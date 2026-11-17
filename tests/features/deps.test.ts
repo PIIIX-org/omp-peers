@@ -28,11 +28,13 @@ let sent: Array<{ to: string; text: string }>;
 let sendResult: SendResult;
 let sendCalls: number;
 let sendGate: Promise<void> | undefined;
+let dependencyFlags: boolean[];
 let onSend: (() => void) | undefined;
 beforeEach(() => {
 	home = fs.mkdtempSync(path.join("/tmp", "opf-"));
 	now = T0;
 	sent = [];
+	dependencyFlags = [];
 	sendCalls = 0;
 	sendResult = { status: "delivered" };
 	live = [{ id: MASTER, name: "master" }, { id: A, name: "worker-a" }, { id: B, name: "worker-b" }, { id: C, name: "worker-c" }];
@@ -52,6 +54,7 @@ function host(self = MASTER, opts: { master?: boolean; accepts?: boolean } = {})
 		send: async (to, req) => {
 			sendCalls++;
 			sent.push({ to, text: req.text });
+			dependencyFlags.push(req.dependency === true);
 			onSend?.();
 			await sendGate;
 			return sendResult;
@@ -568,6 +571,30 @@ describe("blocked targets", () => {
 		expect(await run("approve t1")).toContain("has an unknown outcome (a dispatch was interrupted)");
 		expect(await run("reject t1")).toBe("rejected t1; nothing was sent and it will not be sent");
 		expect(sendCalls).toBe(0);
+	});
+});
+
+describe("dispatch marks authorized work and preview numbering", () => {
+	test("every dependency dispatch carries dependency: true so the receiver can enforce its own control lock", async () => {
+		await ok(addRule(master(), input()));
+		await report();
+		expect(await run("approve t1")).toContain("t1 delivered");
+		expect(dependencyFlags).toEqual([true]);
+		const auto = await ok(addRule(master(), input({ from: "worker-b", unit: "Docs", to: "worker-c", auto: true })));
+		expect(auto.rule.mode).toBe("auto");
+		await report({ ...done, unit: "Docs" }, B);
+		expect(dependencyFlags).toEqual([true, true]);
+	});
+
+	test("preview names the trigger id each of several rules matching one report would get, in rule order", async () => {
+		await ok(addRule(master(), input({ to: "worker-b" })));
+		await ok(addRule(master(), input({ to: "worker-c" })));
+		const second = await run("preview d2");
+		const first = await run("preview d1");
+		expect(first).toContain("queued as t1;");
+		expect(second).toContain("queued as t2;");
+		await report();
+		expect(stored().ledger.map(entry => `${entry.id}:${entry.ruleId}`)).toEqual(["t1:d1", "t2:d2"]);
 	});
 });
 

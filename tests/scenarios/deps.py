@@ -264,6 +264,11 @@ def run(h):
     assert locked == (f"t4 not delivered: {locked_reason}; nothing reached worker-b ({tid}). "
                       "Fix the cause and run /peers deps approve t4 again, or /peers deps reject t4"), locked
     quiet(target, target_start, requests)
+    # The receiver itself refuses dependency deliveries while locked, even from a sender that never ran the preflight
+    # (a lock set after the sender's check but before receipt).
+    bypass = rpc(target_row, {"op": "message", "text": "bypass attempt", "dependency": True, "from": {"id": mid, "name": master_name}})
+    assert bypass == {"ok": False, "error": "peer is locked (control refused)"}, bypass
+    quiet(target, target_start, requests)
     assert h.say(target, "/peers unlock") == "Control from master: allowed"
     wait_for(lambda: h.row(target)["control"] is True)
     attempted_preview = h.say(master, "/peers deps preview t4")

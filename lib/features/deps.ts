@@ -375,7 +375,7 @@ export async function dispatchTrigger(host: FeatureHost, triggerId: string): Pro
 			reason = reasonText(blockers.join("; "));
 		} else {
 			sending = true;
-			const sent = await host.send(rule.to, { text: dispatchText(rule, triggerId) });
+			const sent = await host.send(rule.to, { text: dispatchText(rule, triggerId), dependency: true });
 			if (sent.status === "delivered") status = "delivered";
 			else {
 				reason = reasonText(sent.status === "offline" ? "target is not running" : sent.reason);
@@ -451,7 +451,11 @@ export async function onReport(report: Report, from: { id: string; name: string 
 
 const inflight = new Set<Promise<void>>();
 
-/** Resolves once every auto dispatch started by a report has finished (tests and orderly shutdown). */
+/**
+ * Resolves once every auto dispatch started by a report has finished (tests and orderly shutdown). A background
+ * dispatch that cannot even claim its trigger sends nothing: the trigger stays `pending` or `not delivered` and shows in
+ * `/peers deps pending` and `/peers deps ledger`.
+ */
 export async function settled(): Promise<void> {
 	await Promise.all([...inflight]);
 }
