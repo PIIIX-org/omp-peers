@@ -189,6 +189,8 @@ def run(h):
     ]), added
     report(done("Lint pass"))
     requests = len(h.gateway.requests)
+    # An auto dispatch records the outcome `sending` first and the final outcome after the send.
+    wait_for(lambda: [(e["id"], e["outcome"]) for e in ledger()][2:] == [("t3", "not delivered: session is paused")])
     assert [(e["id"], e["outcome"]) for e in ledger()][2:] == [("t3", "not delivered: session is paused")]
     quiet(target, target_start, requests)
     print("PASS an --auto rule previews its blockers at add time and an auto dispatch into a paused target is not delivered")
