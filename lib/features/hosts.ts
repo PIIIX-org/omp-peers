@@ -19,7 +19,7 @@ import type { FeatureHost } from "./host";
 import type { Feature } from "./index";
 import {
 	BRIDGE_COMMAND, BRIDGE_VERSION, HOST_ID_RE, HOST_NAME_RE, MAX_HOSTS, MAX_SESSIONS_LISTED, MAX_TEXT_BYTES, PEER_ID_RE,
-	cleanName, ensureHostId, hasOnlyKeys, hostLabel, isReason, isRecord, type Reason,
+	ensureHostId, hasOnlyKeys, hasPeerMessageMarker, hostLabel, isReason, isRecord, safeName, type Reason,
 } from "./hosts_wire";
 import { looksLikeSecret } from "./secrets";
 import { readState, stateRoot, updateState } from "./store";
@@ -399,8 +399,6 @@ const USAGE = [
 	"  <name>: 1-24 characters a-z 0-9 '-'; <ssh>: an ssh config alias or user@host. add/remove/test/pin are master only.",
 ].join("\n");
 const MASTER_ONLY = "only the master session may change or test hosts; run /peers master first";
-/** The header the receiving session puts on a peer message; text containing it is a forwarded message, never relayed. */
-const PEER_MESSAGE_MARKER = "[Message from peer session";
 
 const NOT_DELIVERED: Record<string, (target: string) => string> = {
 	"session paused": target => `not delivered: ${target} is paused; resend after its user resumes it`,
@@ -448,10 +446,9 @@ function readSessions(data: Record<string, unknown>): Array<{ id: string; name: 
 	const rows: Array<{ id: string; name: string; busy?: boolean; paused?: boolean; inbound?: "accept" | "refuse" }> = [];
 	for (const row of data.sessions.slice(0, MAX_SESSIONS_LISTED)) {
 		if (!isRecord(row) || typeof row.id !== "string" || !PEER_ID_RE.test(row.id) || typeof row.name !== "string") return undefined;
-		const name = cleanName(row.name);
 		rows.push({
 			id: row.id,
-			name: looksLikeSecret(name) ? "[withheld]" : name,
+			name: safeName(row.name),
 			...(typeof row.busy === "boolean" ? { busy: row.busy } : {}),
 			...(typeof row.paused === "boolean" ? { paused: row.paused } : {}),
 			...(row.inbound === "accept" || row.inbound === "refuse" ? { inbound: row.inbound } : {}),
@@ -587,7 +584,7 @@ export function createHosts(deps: HostsDeps): Feature {
 		const peerId = target.slice(colon + 1);
 		if (!PEER_ID_RE.test(peerId)) return "error: the remote session must be given as <name>:<peer-id> (see /peers hosts sessions <name>)";
 		// A message from another session is never forwarded onward: only text typed here is sent.
-		if (text.includes(PEER_MESSAGE_MARKER)) return "error: refusing to relay a peer message; type your own text";
+		if (hasPeerMessageMarker(text)) return "error: refusing to relay a peer message; type your own text";
 		const bytes = Buffer.byteLength(text);
 		if (bytes > MAX_TEXT_BYTES) return `error: message is ${bytes} bytes; the limit is ${MAX_TEXT_BYTES}`;
 		if (looksLikeSecret(text)) return "error: the message looks like a credential or token; not sent. Describe it instead of including it";
@@ -596,7 +593,8 @@ export function createHosts(deps: HostsDeps): Feature {
 		const found = await pinnedHost(name, host);
 		if ("error" in found) return found.error;
 		const { entry } = found;
-		const outcome = await exchange(deps, host, entry, { op: "message", to: peerId, text, from: { id: self.id, name: cleanName(self.name) } }, entry.remoteId);
+		// The sender name goes out only after the credential screen saw the whole raw name (a token as a session name is withheld).
+		const outcome = await exchange(deps, host, entry, { op: "message", to: peerId, text, from: { id: self.id, name: safeName(self.name) } }, entry.remoteId);
 		const label = `${entry.name}:${peerId}`;
 		if (outcome.kind !== "ok") return failureText(outcome, entry.name, label);
 		// An answer that is not an explicit delivery is not a delivery.

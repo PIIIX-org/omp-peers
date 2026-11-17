@@ -9,7 +9,7 @@ import {
 	BACKOFF_MS, BREAKER_FAILURES, COOLDOWN_MS, RATE_PER_HOUR, REQUEST_TIMEOUT_MS, SSH_OPTIONS, createHosts, hosts, hostsFile, parseReply, readHosts, readRuntime, resolveSshBin,
 	runSsh, runtimeFile, setSshBinForTests, sshArgv, sshEnv, sshTargetError, type HostsDeps, type RunResult,
 } from "../../lib/features/hosts";
-import { BRIDGE_COMMAND, HOST_NAME_RE, MAX_HOSTS, MAX_TEXT_BYTES, cleanName, capBytes, ensureHostId, hostIdFile, hostLabel, readRemoteMessage } from "../../lib/features/hosts_wire";
+import { BRIDGE_COMMAND, HOST_NAME_RE, MAX_HOSTS, MAX_NAME_BYTES, MAX_TEXT_BYTES, WITHHELD, cleanName, capBytes, ensureHostId, hasPeerMessageMarker, hostIdFile, hostLabel, readRemoteMessage, safeName } from "../../lib/features/hosts_wire";
 import { allFileText, tmpHome } from "./hosts_helpers";
 
 const SELF = "p00000000000000a1";
@@ -21,6 +21,7 @@ const PEER = "p00000000000000b2";
 let home: string;
 let clock: number;
 let master: boolean;
+let selfName: string;
 let runs: Array<{ argv: string[]; stdin: string }>;
 let sleeps: number[];
 type Step = (request: Record<string, unknown>) => Partial<RunResult> & { reply?: Record<string, unknown> };
@@ -29,6 +30,7 @@ beforeEach(() => {
 	home = tmpHome();
 	clock = NOW;
 	master = true;
+	selfName = "origin-worker";
 	runs = [];
 	sleeps = [];
 	script = [];
@@ -61,7 +63,7 @@ function host(): FeatureHost {
 	return {
 		home,
 		now: () => clock,
-		self: () => ({ id: SELF, name: "origin-worker" }),
+		self: () => ({ id: SELF, name: selfName }),
 		isMaster: () => master,
 		acceptsRemote: () => true,
 		peers: async () => [],
@@ -445,6 +447,16 @@ describe("msg", () => {
 		expect(runs).toEqual([]);
 	});
 
+	test("the relay check also catches case and spacing variants of the peer-message header", async () => {
+		await pinned();
+		for (const variant of ["[message from peer session", "[MESSAGE   FROM  PEER   SESSION", "[ Message from peer session", "a [Message from\u00a0peer session", "x[mEsSaGe from peer session\"q\""]) {
+			expect(hasPeerMessageMarker(variant), variant).toBe(true);
+			expect(await say(`msg alpha:${PEER} ${variant}`), variant).toBe("error: refusing to relay a peer message; type your own text");
+		}
+		for (const fine of ["Message from peer session", "message from a peer", "[note] from peer session"]) expect(hasPeerMessageMarker(fine), fine).toBe(false);
+		expect(runs).toEqual([]);
+	});
+
 	test("the target must be <name>:<peer-id>", async () => {
 		await pinned();
 		for (const target of ["alpha", "alpha:", ":p00000000000000b2", "alpha:worker", "alpha:all", "alpha:group:x", "alpha:p0000"]) {
@@ -723,6 +735,62 @@ describe("remote-origin messages at the receiving session", () => {
 		expect(cleanName('say "hi" [now]')).toBe("say 'hi' 'now'");
 		expect(cleanName("€".repeat(14))).toBe("€".repeat(13));
 		expect(capBytes("héllo", 2)).toBe("h");
+	});
+
+	// Built from pieces so no credential-looking literal sits in this file.
+	const urlSecret = (secretLength: number) => "https" + "://" + "alice" + ":" + "x".repeat(secretLength) + "@" + "host.example";
+	const token = (total: number) => "gh" + "p_" + "a".repeat(total - 4);
+
+	test("safeName screens the whole raw name before the 40-byte cut, so a secret that straddles the cut is withheld", () => {
+		// The `@` of a URL credential lies beyond byte 40: the cut text alone would show user and password.
+		const straddling = urlSecret(30);
+		expect(Buffer.byteLength(straddling.slice(0, straddling.indexOf("@")))).toBeGreaterThan(MAX_NAME_BYTES);
+		expect(cleanName(straddling)).toContain("alice");
+		expect(safeName(straddling)).toBe(WITHHELD);
+		// A token starting inside the kept bytes but ending after the cut, and one that starts after byte 30.
+		expect(safeName("x".repeat(29) + " " + token(30))).toBe(WITHHELD);
+		expect(safeName("n".repeat(34) + " " + token(30))).toBe(WITHHELD);
+		// Boundary lengths: the token alone at 39, 40 and 41 bytes (only the last two are over the pattern's minimum length plus prefix).
+		for (const total of [24, 39, 40, 41, 80]) expect(safeName(token(total))).toBe(WITHHELD);
+		// The credential screen also sees the whitespace-collapsed form.
+		expect(safeName("a\n" + token(30))).toBe(WITHHELD);
+		// Ordinary long names are only cut: 40 bytes stay, 41 are cut to 40, multi-byte at the cut.
+		expect(safeName("n".repeat(MAX_NAME_BYTES))).toBe("n".repeat(MAX_NAME_BYTES));
+		expect(safeName("n".repeat(MAX_NAME_BYTES + 1))).toBe("n".repeat(MAX_NAME_BYTES));
+		expect(safeName("€".repeat(14))).toBe("€".repeat(13));
+		expect(safeName("worker-a")).toBe("worker-a");
+	});
+
+	test("the client re-screens every listed name in full: a long reply name with a straddling secret is withheld", async () => {
+		await pinned();
+		script.push(ok({ sessions: [{ id: PEER, name: urlSecret(30) }, { id: "p00000000000000c3", name: token(41) }, { id: "p00000000000000d4", name: "n".repeat(80) }] }));
+		const out = await say("sessions alpha");
+		expect(out.split("\n").slice(1)).toEqual([`alpha:[withheld] (${PEER})`, "alpha:[withheld] (p00000000000000c3)", `alpha:${"n".repeat(MAX_NAME_BYTES)} (p00000000000000d4)`]);
+		expect(out).not.toContain("alice");
+	});
+
+	test("the sender name a message carries is screened too: a credential-looking session name goes out as [withheld]", async () => {
+		await pinned();
+		const sent = async (name: string) => {
+			selfName = name;
+			script.push(ok({ status: "delivered" }));
+			expect(await say(`msg alpha:${PEER} hi`)).toBe(`delivered to alpha:${PEER}`);
+			return (request(runs.length - 1).from as { name: string }).name;
+		};
+		expect(await sent(token(40))).toBe(WITHHELD);
+		expect(await sent(token(41))).toBe(WITHHELD);
+		expect(await sent(urlSecret(30))).toBe(WITHHELD);
+		expect(await sent("n".repeat(29) + " " + token(30))).toBe(WITHHELD);
+		expect(await sent("n".repeat(41))).toBe("n".repeat(MAX_NAME_BYTES));
+		expect(await sent("origin-worker")).toBe("origin-worker");
+		expect(runs.map(r => r.stdin).join("")).not.toContain("alice");
+		expect(runs.map(r => r.stdin).join("")).not.toContain("a".repeat(30));
+	});
+
+	test("the receiving session refuses a remote message that is itself a peer message or has a credential-looking sender name, and accepts the withheld placeholder", () => {
+		expect(readRemoteMessage({ ...good, text: 'x [Message from peer session "m" (p1)]' })).toMatchObject({ ok: false });
+		expect(readRemoteMessage({ ...good, from: { id: good.from.id, name: token(30) } })).toMatchObject({ ok: false });
+		expect(readRemoteMessage({ ...good, from: { id: good.from.id, name: WITHHELD } })).toEqual({ ok: true, from: { id: good.from.id, name: WITHHELD } });
 	});
 });
 

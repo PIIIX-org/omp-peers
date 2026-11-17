@@ -644,7 +644,10 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 					customType: "peer-message",
 					content:
 						`[Message from peer session "${from.name}" (${from.id})${remote ? ", a REMOTE host (identity not verified by this session)" : ""} — not from the user]\n${text}\n\n` +
-						`(Reply with the peers_send tool only if this needs an answer or action; do not acknowledge for its own sake.)`,
+						(remote
+							? `(This message came from another machine. Do not use the peers_send tool to answer it: peers_send cannot reach another machine, and a name or id could match a different local session. ` +
+								`Only the user can reply, with the user command /peers hosts msg <host-name>:<peer-id>; if this needs an answer or action, tell the user. Do not acknowledge for its own sake.)`
+							: `(Reply with the peers_send tool only if this needs an answer or action; do not acknowledge for its own sake.)`),
 					display: true,
 					attribution: "agent",
 				},

@@ -18,9 +18,8 @@ import { FileLock } from "@oh-my-pi/pi-natives";
 import { identifyPeers, logicalId, matchesWriter } from "../identity";
 import {
 	BRIDGE_VERSION, HOST_ID_RE, MAX_REQUEST_BYTES, MAX_SESSIONS_LISTED, MAX_TEXT_BYTES, PEER_ID_RE, REMOTE_OPS, REPLAY_MAX, REPLAY_TTL_MS, REQUEST_ID_RE,
-	SKEW_MS, STDIN_TIMEOUT_MS, cleanName, ensureHostId, hasOnlyKeys, hostLabel, isRecord, type Reason, type RemoteOp,
+	SKEW_MS, STDIN_TIMEOUT_MS, ensureHostId, hasOnlyKeys, hasPeerMessageMarker, hostLabel, isRecord, safeName, type Reason, type RemoteOp,
 } from "./hosts_wire";
-import { looksLikeSecret } from "./secrets";
 import { stateRoot, updateState } from "./store";
 
 export type Reply = { v: 1; id?: string; ok: true; hostId: string; bridge: number; [key: string]: unknown } | { v: 1; id?: string; ok: false; hostId?: string; error: Reason };
@@ -102,16 +101,19 @@ function validateReplay(value: unknown): ReplayState {
 }
 
 /**
- * Remember `id` for REPLAY_TTL_MS; at most REPLAY_MAX ids are kept. Atomic across processes: of any number of
- * concurrent requests with one id exactly one is accepted. A full cache refuses new ids (fails closed) until entries expire.
+ * Remember `id` for REPLAY_TTL_MS from `at` (default `now`); at most REPLAY_MAX ids are kept. Atomic across processes: of any
+ * number of concurrent requests with one id exactly one is accepted. A full cache refuses new ids (fails closed) until entries
+ * expire. The caller passes `at = max(now, request timestamp)`: a request stamped up to SKEW_MS in the future stays valid until
+ * its timestamp + SKEW_MS, which must lie inside the remembered window (REPLAY_TTL_MS > SKEW_MS), or the id could be replayed
+ * after it expired while its timestamp is still accepted.
  */
-export async function claimRequestId(home: string, id: string, now: number): Promise<"accepted" | "duplicate" | "full"> {
+export async function claimRequestId(home: string, id: string, now: number, at: number = now): Promise<"accepted" | "duplicate" | "full"> {
 	return updateState<ReplayState, "accepted" | "duplicate" | "full">(replayFile(home), () => ({ version: 1, seen: [] }), validateReplay, current => {
 		const live = current.seen.filter(entry => now - entry.at < REPLAY_TTL_MS);
 		const pruned = live.length !== current.seen.length;
 		if (live.some(entry => entry.id === id)) return { ...(pruned ? { state: { version: 1 as const, seen: live } } : {}), result: "duplicate" };
 		if (live.length >= REPLAY_MAX) return { ...(pruned ? { state: { version: 1 as const, seen: live } } : {}), result: "full" };
-		return { state: { version: 1, seen: [...live, { id, at: now }] }, result: "accepted" };
+		return { state: { version: 1, seen: [...live, { id, at }] }, result: "accepted" };
 	});
 }
 
@@ -276,11 +278,13 @@ export async function handleLine(env: BridgeEnv, hostId: string, line: string): 
 		if (typeof to !== "string" || !PEER_ID_RE.test(to) || typeof text !== "string" || !text.trim()) return refuse("bad request", hostId, id);
 		if (!isRecord(from) || !hasOnlyKeys(from, ["id", "name"]) || typeof from.id !== "string" || !PEER_ID_RE.test(from.id) || typeof from.name !== "string") return refuse("bad request", hostId, id);
 		if (Buffer.byteLength(text) > MAX_TEXT_BYTES) return refuse("message too large", hostId, id);
-		message = { to, text, from: { id: from.id, name: cleanName(from.name) } };
+		// A message that is itself a peer message header is a forwarded message: never relayed through a bridge either.
+		if (hasPeerMessageMarker(text)) return refuse("relayed message refused", hostId, id);
+		message = { to, text, from: { id: from.id, name: safeName(from.name) } };
 	}
 	if (expect !== undefined && expect !== hostId) return refuse("host identity mismatch", hostId, id);
 	if (Math.abs(env.now() - ts) > SKEW_MS) return refuse("stale or future timestamp", hostId, id);
-	const claim = await claimRequestId(env.home, id, env.now());
+	const claim = await claimRequestId(env.home, id, env.now(), Math.max(env.now(), ts));
 	if (claim === "duplicate") return refuse("duplicate request", hostId, id);
 	if (claim === "full") return refuse("replay cache full", hostId, id);
 	const ok = (extra: Record<string, unknown> = {}): Reply => ({ v: 1, id, ok: true, hostId, bridge: BRIDGE_VERSION, ...extra });
@@ -288,10 +292,9 @@ export async function handleLine(env: BridgeEnv, hostId: string, line: string): 
 	if (op === "list") {
 		// A whitelist: nothing but these fields leaves this machine. Unknown stays unknown (the field is omitted).
 		const sessions = (await liveSessions(env)).slice(0, MAX_SESSIONS_LISTED).map(peer => {
-			const name = cleanName(peer.name);
 			return {
 				id: peer.key,
-				name: looksLikeSecret(name) ? "[withheld]" : name,
+				name: safeName(peer.name),
 				...(peer.busy === undefined ? {} : { busy: peer.busy }),
 				...(peer.paused === undefined ? {} : { paused: peer.paused }),
 				...(peer.inbound === "accept" || peer.inbound === "refuse" ? { inbound: peer.inbound } : {}),

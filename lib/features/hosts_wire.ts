@@ -7,6 +7,7 @@
  */
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
+import { looksLikeSecret } from "./secrets";
 import { stateRoot, updateState } from "./store";
 
 export const BRIDGE_VERSION = 1;
@@ -54,6 +55,7 @@ export const REASONS = [
 	"session rate limited",
 	"delivery unknown",
 	"delivery failed",
+	"relayed message refused",
 	"bridge unavailable",
 ] as const;
 export type Reason = (typeof REASONS)[number];
@@ -84,6 +86,20 @@ export function cleanName(raw: string): string {
 	return capBytes(collapsed, MAX_NAME_BYTES).trim() || "unnamed";
 }
 
+/** Shown instead of a name that looks like a credential. */
+export const WITHHELD = "[withheld]";
+
+/**
+ * `cleanName`, except that a name which looks like a credential becomes WITHHELD. The credential screen sees the whole
+ * raw name (and its whitespace-collapsed form) BEFORE the byte cap, so a secret that straddles the cut is still caught.
+ */
+export function safeName(raw: string): string {
+	return looksLikeSecret(raw) || looksLikeSecret(raw.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ")) ? WITHHELD : cleanName(raw);
+}
+
+/** The header a receiving session puts on a peer message. Any text containing it (case, spacing variants too) is a forwarded message and is never relayed. */
+export const PEER_MESSAGE_MARKER = /\[\s*message\s+from\s+peer\s+session/i;
+export const hasPeerMessageMarker = (text: string): boolean => PEER_MESSAGE_MARKER.test(text);
 /** The label a machine puts in front of its sessions' ids: derived from its host id, so the claimed label and id cannot disagree. */
 export const hostLabel = (hostId: string): string => `host-${hostId.slice(0, 8)}`;
 
@@ -112,8 +128,9 @@ export function readRemoteMessage(req: { from?: unknown; hops?: unknown; report?
 		return { ok: false, error: "remote messages cannot be reports, dependency triggers or control requests" };
 	}
 	if (typeof req.text !== "string" || Buffer.byteLength(req.text) > MAX_TEXT_BYTES) return { ok: false, error: `remote message text is longer than ${MAX_TEXT_BYTES} bytes` };
+	if (hasPeerMessageMarker(req.text)) return { ok: false, error: "remote message text is itself a peer message" };
 	const from = req.from;
-	if (!isRecord(from) || typeof from.id !== "string" || typeof from.name !== "string" || !REMOTE_SENDER_RE.test(from.id) || cleanName(from.name) !== from.name) {
+	if (!isRecord(from) || typeof from.id !== "string" || typeof from.name !== "string" || !REMOTE_SENDER_RE.test(from.id) || (from.name !== WITHHELD && (cleanName(from.name) !== from.name || looksLikeSecret(from.name)))) {
 		return { ok: false, error: "remote message has an invalid sender" };
 	}
 	return { ok: true, from: { id: from.id, name: from.name } };
