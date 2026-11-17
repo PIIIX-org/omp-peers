@@ -8,6 +8,7 @@ Busy/idle and agent_end do not establish task completion or background quiescenc
 """
 import argparse
 import datetime
+import errno
 import fcntl
 import hashlib
 import json
@@ -32,9 +33,26 @@ class PeerPaused(ConnectionError):
     """The peer is explicitly paused: its wake gate refused the request. Not a fault; retry after it resumes."""
 
 
+def open_regular(path):
+    """Open `path` for reading without ever blocking: O_NONBLOCK, then only a regular file is accepted.
+
+    A FIFO planted by a same-user process would otherwise hang the watcher in open() or read(); it is refused with OSError,
+    which every caller already treats as "unreadable".
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def read_json(path):
     try:
-        value = json.loads(path.read_text())
+        with open_regular(path) as source:
+            value = json.loads(source.read().decode("utf-8"))
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -217,7 +235,7 @@ class Watcher:
                 position = max(0, info.st_size - 4 * 1024 * 1024) if cursor is None and baseline and not self.restored else 0
                 if cursor and cursor[0] == info.st_ino and cursor[1] <= info.st_size:
                     position = cursor[1]
-                with path.open("rb") as source:
+                with open_regular(path) as source:
                     source.seek(max(0, position - 1))
                     if position and source.read(1) != b"\n":
                         while True:
@@ -292,7 +310,7 @@ class Watcher:
                         position = info.st_size if baseline else 0
                     else:
                         position = cursor[1] if cursor[0] == info.st_ino and cursor[1] <= info.st_size else 0
-                    with path.open("rb") as source:
+                    with open_regular(path) as source:
                         source.seek(position)
                         for _ in range(2000):
                             start = source.tell()

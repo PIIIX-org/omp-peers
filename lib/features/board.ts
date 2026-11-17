@@ -9,13 +9,12 @@
  * Writers are not authenticated: `updatedBy` is the id the writer claimed (a report's `from`), and
  * every rendering says "claimed by".
  */
-import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Report } from "../reports";
 import type { FeatureHost, PeerView } from "./host";
 import type { Feature } from "./index";
 import { looksLikeSecret as screenText } from "./secrets";
-import { readState, stateRoot, updateState } from "./store";
+import { readRegularFile, readState, stateRoot, updateState } from "./store";
 
 export const STATUSES = ["assigned", "in-progress", "blocked", "waiting", "decision", "done", "unknown"] as const;
 export type BoardStatus = (typeof STATUSES)[number];
@@ -97,10 +96,12 @@ export function staleConfig(home: string): StaleConfig {
 	const file = path.join(home, ".omp", "agent", "peers.json");
 	let text: string;
 	try {
-		text = fs.readFileSync(file, "utf8");
+		text = readRegularFile(file);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { hours: DEFAULT_STALE_HOURS };
-		return { hours: DEFAULT_STALE_HOURS, warning: `peers.json could not be read (${(error as NodeJS.ErrnoException).code ?? "error"}); using ${DEFAULT_STALE_HOURS}h` };
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return { hours: DEFAULT_STALE_HOURS };
+		if (code === "NOT_REGULAR") return { hours: DEFAULT_STALE_HOURS, warning: `peers.json is not a regular file; using ${DEFAULT_STALE_HOURS}h` };
+		return { hours: DEFAULT_STALE_HOURS, warning: `peers.json could not be read (${code ?? "error"}); using ${DEFAULT_STALE_HOURS}h` };
 	}
 	let config: unknown;
 	try {
