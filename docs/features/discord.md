@@ -132,7 +132,8 @@ The bridge sends nothing to any session and never causes a model turn.
 
 ## Credentials
 
-- Keep the webhook URL or bot token in a file outside the repository and outside the plugin directory (a path inside the plugin directory is refused). The file must be a regular file owned by you, mode 0600 or stricter, not a symlink (the final path component is never followed), 16 to 256 bytes after one trailing newline is removed. A FIFO or other special file is refused without blocking. Put it in a directory only you can write to: a parent directory is not checked.
+- Keep the webhook URL or bot token in a file outside the repository and outside the plugin directory (a path inside the plugin directory is refused). The file must be a regular file owned by you, mode 0600 or stricter, not a symlink (the final path component is never followed), 16 to 256 bytes after one trailing newline is removed. A FIFO or other special file is refused without blocking.
+- **Limits of the file check.** It inspects the opened file only. It does not check the parent directories: a symlink in a parent directory (for example a link to another location) is followed, and a directory that others can write to would let them replace the file between checks. It does not detect a hard link: a second name for the same inode, in a place other people can read, exposes the same content. Keep the file in a directory only you can write to, created by you, and do not hard-link it.
 - Only the **path** is stored in `peer-state/discord.json`. `status` shows the path and, for a webhook, `…/webhooks/<id>/<redacted>`; the token is shown nowhere: not in state, the log, command output, notices or any file.
 - The credential is read when a request is made, so rotating it is replacing the file. A file that becomes unreadable, wrong-shaped or too permissive makes the request fail (and count toward the breaker) without sending anything.
 - **Bot tokens only.** The bot request uses `Authorization: Bot <token>`. A user-account token (self-botting) violates Discord's terms, is unsupported, and the bridge cannot detect one: do not use it. The `Bot` scheme makes Discord reject a user token.
@@ -158,7 +159,7 @@ The bridge also stops itself on HTTP 401/403 and pauses for 30 minutes after 5 c
 | Attempts | 4 per message (the first plus 3 retries) |
 | Backoff | 30 s, 2 min, 10 min after attempts 1, 2, 3 |
 | 5xx, network error, timeout | retried on the schedule above |
-| HTTP 429 | waits `Retry-After` (header or `retry_after` in the body), at least 1 s, at most 10 min; counts as an attempt |
+| HTTP 429 | waits `Retry-After` (header or `retry_after` in the body; without a usable value the backoff step for that attempt), at least 1 s, at most 10 min; counts as an attempt. **All sending and polling stop for that wait**, not only the message that was refused (`status` shows `discord rate-limit hold`); `on` clears it |
 | 4xx other than 401/403/429, 3xx | the message is dropped and logged as `failed: http <code>`; no retry |
 | 401, 403 | bridge stops (`auth failed: bridge stopped`), queue discarded |
 | Circuit breaker | 5 consecutive failed requests (sends and polls) pause all requests for 30 min and show a notice; a success resets the count |
@@ -168,7 +169,7 @@ The bridge also stops itself on HTTP 401/403 and pauses for 30 minutes after 5 c
 | `list` | 10 sessions, then `… N more` |
 | Log | last 20 entries (`/peers discord log`), no message content |
 
-A crash between starting a request and recording its result can make the next process send that one message again after its 30 s lease expires (delivery is at least once).
+A crash between starting a request and recording its result can make the next process send that one message again after its 30 s lease expires (delivery is at least once). A message whose 4 attempts have all been started is never started again: if the 4th attempt never reported back (crash, handoff) the message is dropped, counted in `dropped` and logged as `gave up after 4 attempts (no result recorded)`.
 
 ## Concurrency
 
@@ -176,7 +177,9 @@ One cross-process-locked state file. A send or poll is claimed under the lock be
 
 ## Test-only seam
 
-For the plugin's own tests, `OMP_PEERS_DISCORD_API_BASE` can point the API base at a fake server **on this machine**: it is honoured only when it is exactly `http://127.0.0.1:<port>` (loopback, plain HTTP, no path); any other value is ignored with a warning notice and the real Discord API is used. It is read once when the process starts and cannot be set by any command, tool or remote operation. A credential is only ever sent to that loopback address while it is set. Do not set it in normal use.
+The Discord endpoint is fixed: `https://discord.com/api/v10` for a bot, and the host of the validated webhook URL for a webhook. **No environment variable, setting, command, tool or remote operation changes it**, so a credential cannot be redirected by what a session inherits or by anything configured at run time (setting `OMP_PEERS_DISCORD_API_BASE` has no effect; a test proves it).
+
+The plugin's own tests replace the endpoint through code, not configuration: unit tests inject a fake HTTP client, and the real-OMP scenario starts its master with an extra, test-only extension (`tests/scenarios/_discord_endpoint_ext.ts`, not shipped) that calls the module's exported `setTestEndpoint`. That function accepts exactly `http://127.0.0.1:<port>` (anything else throws) and the value is re-validated on every read. Only code running inside the OMP process can call it, which already has everything the plugin has. The scenario also points `HTTPS_PROXY` at a closed port so that any request missing the fake server fails closed.
 
 ## What this does not do
 

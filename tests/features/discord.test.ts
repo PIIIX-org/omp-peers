@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { FEATURES } from "../../lib/features";
 import {
 	AUTH_STOPPED, BACKOFF_MS, BREAKER_FAILURES, BREAKER_PAUSE_MS, buildPayload, cleanText, credential, discord, discordFile, formatReport, HELP_REPLY, MAX_ATTEMPTS, MAX_COMMAND_AGE_MS, MAX_FUTURE_SKEW_MS, MAX_INBOUND_BYTES, MAX_LOG,
-	MAX_NAME_BYTES, MAX_QUEUE, MAX_SUMMARY_BYTES, MAX_WAIT_MS, parseCommand, POLL_INTERVAL_MS, readDiscord, redactedWebhook, resolveApiBase, setTestSeam, TEST_MESSAGE, UNKNOWN_REPLY, USER_COMMANDS, WEBHOOK_RE,
+	MAX_NAME_BYTES, MAX_QUEUE, MAX_SUMMARY_BYTES, MAX_WAIT_MS, parseCommand, POLL_INTERVAL_MS, readDiscord, redactedWebhook, setTestEndpoint, setTestSeam, TEST_MESSAGE, UNKNOWN_REPLY, USER_COMMANDS, WEBHOOK_RE,
 	type DiscordState,
 } from "../../lib/features/discord";
 import type { FeatureHost, PeerView } from "../../lib/features/host";
@@ -47,6 +47,7 @@ beforeEach(() => {
 });
 afterEach(() => {
 	setTestSeam();
+	setTestEndpoint(undefined);
 	fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -549,6 +550,8 @@ describe("outbound", () => {
 		await enableBot();
 		await accept(done("Unit", "ok"), { id: WORKER, name: "worker-a" });
 		await tick();
+		// Inbound is a separate switch: bot mode with inbound off never polls.
+		expect(fake.gets()).toEqual([]);
 		const [req] = fake.requests;
 		expect(req.url).toBe(`https://discord.com/api/v10/channels/${CHANNEL}/messages`);
 		expect(req.headers.Authorization).toBe(`Bot ${BOT_TOKEN}`);
@@ -1234,17 +1237,204 @@ describe("inbound", () => {
 
 // ---- Test seam ------------------------------------------------------------------------------------
 
-describe("API base override", () => {
-	test("only exactly http://127.0.0.1:<port> is honoured", () => {
-		expect(resolveApiBase(undefined)).toEqual({ base: "https://discord.com/api/v10", override: false });
-		expect(resolveApiBase("")).toEqual({ base: "https://discord.com/api/v10", override: false });
-		expect(resolveApiBase("http://127.0.0.1:8080")).toEqual({ base: "http://127.0.0.1:8080/api/v10", override: true });
-		for (const value of ["http://127.0.0.1", "http://127.0.0.1:8080/", "http://127.0.0.1:8080/x", "https://127.0.0.1:8080", "http://localhost:8080", "http://127.0.0.1.evil.example:80", "http://user@127.0.0.1:8080", "http://127.0.0.1:8080?x=1", "http://[::1]:8080", "http://127.0.0.2:8080", "https://discord.com", "http://127.0.0.1:123456", " http://127.0.0.1:8080"]) {
-			const result = resolveApiBase(value);
-			expect(result.override).toBe(false);
-			expect(result.base).toBe("https://discord.com/api/v10");
-			expect(result.warning).toContain("ignored");
+describe("endpoint", () => {
+	test("the environment cannot steer the endpoint: a set OMP_PEERS_DISCORD_API_BASE changes nothing", async () => {
+		const name = "OMP_PEERS_DISCORD_API_BASE";
+		const previous = process.env[name];
+		process.env[name] = "http://127.0.0.1:9";
+		try {
+			// Neither the already loaded module nor a freshly loaded copy reads it.
+			await enableBot();
+			await accept();
+			await tick();
+			expect(fake.requests.map(r => r.url)).toEqual([`https://discord.com/api/v10/channels/${CHANNEL}/messages`]);
+			expect(fake.requests[0].headers.Authorization).toBe(`Bot ${BOT_TOKEN}`);
+			// A runtime-selected specifier: the query makes the loader evaluate the module afresh with the variable already set.
+			const fresh = await import(`../../lib/features/discord.ts?fresh=${Date.now()}`);
+			expect(fresh.postTarget({ mode: "bot", token: BOT_TOKEN, channel: CHANNEL }).url).toBe(`https://discord.com/api/v10/channels/${CHANNEL}/messages`);
+			expect(fresh.postTarget({ mode: "webhook", url: WEBHOOK_URL, id: WEBHOOK_ID }).url).toBe(WEBHOOK_URL);
+		} finally {
+			if (previous === undefined) delete process.env[name];
+			else process.env[name] = previous;
 		}
+		const source = fs.readFileSync(path.join(REPO, "lib", "features", "discord.ts"), "utf8");
+		expect(source).not.toContain(name);
+		expect(source).not.toContain("process.env");
+	});
+
+	test("the webhook goes to the URL from the credential file, host included", async () => {
+		await enableWebhook();
+		await accept();
+		await tick();
+		expect(new URL(fake.requests[0].url).host).toBe("discord.com");
+		expect(fake.requests[0].url).toBe(WEBHOOK_URL);
+	});
+
+	test("the test endpoint accepts exactly http://127.0.0.1:<port> and is restorable", async () => {
+		for (const value of ["http://127.0.0.1", "http://127.0.0.1:8080/", "http://127.0.0.1:8080/x", "https://127.0.0.1:8080", "http://localhost:8080", "http://127.0.0.1.evil.example:80", "http://user" + "@127.0.0.1:8080", "http://127.0.0.1:8080?x=1", "http://[::1]:8080", "http://127.0.0.2:8080", "https://discord.com", "http://127.0.0.1:123456", " http://127.0.0.1:8080", ""]) expect(() => setTestEndpoint(value)).toThrow("must be exactly http://127.0.0.1:<port>");
+		await enableBot();
+		setTestEndpoint("http://127.0.0.1:8080");
+		try {
+			await accept();
+			await tick();
+			expect(fake.requests[0].url).toBe(`http://127.0.0.1:8080/api/v10/channels/${CHANNEL}/messages`);
+		} finally {
+			setTestEndpoint(undefined);
+		}
+		await accept();
+		clock += 1;
+		await tick();
+		expect(fake.requests[1].url).toBe(`https://discord.com/api/v10/channels/${CHANNEL}/messages`);
+		expect(fs.readFileSync(path.join(REPO, "package.json"), "utf8")).not.toContain("setTestEndpoint");
+	});
+
+	test("with the test endpoint a webhook keeps its validated path and only the origin changes", async () => {
+		await enableWebhook();
+		setTestEndpoint("http://127.0.0.1:8081");
+		try {
+			await accept();
+			await tick();
+		} finally {
+			setTestEndpoint(undefined);
+		}
+		expect(fake.requests[0].url).toBe(`http://127.0.0.1:8081/api/webhooks/${WEBHOOK_ID}/${WEBHOOK_TOKEN}`);
+	});
+});
+
+describe("hardening", () => {
+	const writeState = (mutate: (s: DiscordState) => void) => {
+		const state = stored();
+		mutate(state);
+		fs.writeFileSync(discordFile(home), JSON.stringify(state));
+	};
+	const failThrice = async () => {
+		fake.post = () => new Response("", { status: 503 });
+		for (const at of [0, BACKOFF_MS[0], BACKOFF_MS[0] + BACKOFF_MS[1]]) {
+			clock = T0 + at;
+			await tick();
+		}
+		expect(fake.posts()).toHaveLength(3);
+		expect(stored().queue[0].attempts).toBe(3);
+	};
+
+	test("a message whose 4th attempt never reported back is dropped, never sent a 5th time", async () => {
+		await enableWebhook();
+		await accept();
+		await failThrice();
+		// Crash or handoff during attempt 4: claimed (attempts 4, live lease) but never settled.
+		const lease = clock + 30_000;
+		writeState(s => {
+			s.queue[0].attempts = 4;
+			s.queue[0].leaseUntil = lease;
+		});
+		clock += 10_000;
+		await tick();
+		expect(fake.posts()).toHaveLength(3);
+		expect(stored().queue).toHaveLength(1);
+		clock = lease;
+		await tick();
+		expect(fake.posts()).toHaveLength(3);
+		const state = stored();
+		expect(state.queue).toEqual([]);
+		expect(state.dropped).toBe(1);
+		expect(state.log.at(-1)!.text).toBe("failed #1: gave up after 4 attempts (no result recorded)");
+		clock += HOUR;
+		await tick();
+		expect(fake.posts()).toHaveLength(3);
+	});
+
+	test("an over-limit attempt count never breaks status, log or off, and the message is dropped", async () => {
+		await enableWebhook();
+		await accept();
+		await accept();
+		writeState(s => {
+			s.queue[0].attempts = 5;
+			s.queue[1].attempts = 999;
+		});
+		expect(await run("status")).toContain("queued: 2 of 100");
+		expect(await run("log")).toContain("bridge on");
+		expect(readDiscord(host()).queue.map(q => q.attempts)).toEqual([MAX_ATTEMPTS, MAX_ATTEMPTS]);
+		await tick();
+		expect(fake.posts()).toEqual([]);
+		expect(stored().queue).toEqual([]);
+		expect(stored().dropped).toBe(2);
+		await accept();
+		writeState(s => void (s.queue[0].attempts = 7));
+		expect(await run("off")).toContain("1 queued message(s) discarded");
+		expect(stored().enabled).toBe(false);
+	});
+
+	test("an exhausted message does not block the next one", async () => {
+		await enableWebhook();
+		await accept(done("Old"));
+		await accept(done("Fresh"));
+		writeState(s => void (s.queue[0].attempts = 4));
+		await tick();
+		expect(fake.contents()).toEqual([`**DONE** ${WORKER}: Fresh: Offline checks passed`]);
+		expect(stored().dropped).toBe(1);
+	});
+
+	test("a 429 holds every send, not only its own message", async () => {
+		await enableWebhook();
+		await accept(done("First"));
+		await accept(done("Second"));
+		fake.post = () => new Response("", { status: 429, headers: { "Retry-After": "60" } });
+		await tick();
+		expect(fake.posts()).toHaveLength(1);
+		expect(stored().holdUntil).toBe(T0 + 60_000);
+		fake.post = undefined;
+		for (const at of [5000, 59_999]) {
+			clock = T0 + at;
+			await tick();
+			expect(fake.posts()).toHaveLength(1);
+		}
+		expect(await run("test")).toBe("not delivered: Discord asked the bridge to slow down for 1 more second(s); nothing was sent");
+		expect(await run("status")).toContain("discord rate-limit hold (HTTP 429): nothing is sent or polled until");
+		expect(fake.posts()).toHaveLength(1);
+		clock = T0 + 60_000;
+		await tick();
+		expect(fake.posts()).toHaveLength(2);
+		clock += 1;
+		await tick();
+		expect(fake.contents().map(c => c.split(": ")[1])).toEqual(["First", "First", "Second"]);
+	});
+
+	test("a 429 caps the hold at 10 minutes and `on` clears it", async () => {
+		await enableWebhook();
+		await accept();
+		fake.post = () => new Response("", { status: 429, headers: { "Retry-After": "86400" } });
+		await tick();
+		expect(stored().holdUntil).toBe(T0 + MAX_WAIT_MS);
+		await run("off");
+		await run("on");
+		expect(stored().holdUntil).toBeUndefined();
+	});
+
+	test("a 429 without Retry-After holds for the backoff step", async () => {
+		await enableWebhook();
+		await accept();
+		fake.post = () => new Response("", { status: 429 });
+		await tick();
+		expect(stored().holdUntil).toBe(T0 + BACKOFF_MS[0]);
+	});
+
+	test("a 429 on a send also holds polling", async () => {
+		await enableInbound();
+		await tick();
+		await accept();
+		fake.post = () => new Response("", { status: 429, headers: { "Retry-After": "60" } });
+		clock += POLL_INTERVAL_MS;
+		await tick();
+		const gets = fake.gets().length;
+		fake.post = undefined;
+		clock += POLL_INTERVAL_MS;
+		await tick();
+		expect(fake.gets()).toHaveLength(gets);
+		expect(fake.posts()).toHaveLength(1);
+		clock = stored().holdUntil!;
+		await tick();
+		expect(fake.gets()).toHaveLength(gets + 1);
+		expect(fake.posts()).toHaveLength(2);
 	});
 });
 

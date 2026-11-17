@@ -85,22 +85,36 @@ const PEER_ID_RE = /^p[0-9a-f]{16}$/;
 const CREDENTIAL_RE = /^[\x21-\x7e]+$/;
 
 const DEFAULT_BASE = "https://discord.com/api/v10";
-const LOOPBACK_BASE_RE = /^http:\/\/127\.0\.0\.1:[0-9]{1,5}$/;
+const LOOPBACK_ORIGIN_RE = /^http:\/\/127\.0\.0\.1:[0-9]{1,5}$/;
 
-// ---- API base (test seam) ----------------------------------------------------------------------
+// ---- Endpoint (test seam) -----------------------------------------------------------------------
 
 /**
- * The Discord API base. `OMP_PEERS_DISCORD_API_BASE` exists ONLY so the real-OMP scenario can point the master at a fake
- * server on this machine: it is honoured solely when it is exactly `http://127.0.0.1:<port>`; any other value is ignored
- * with a warning. It is read once, when the process starts, and no command or remote operation can set it.
+ * Where requests go: the real Discord API, always, unless test code calls `setTestEndpoint`. Nothing in the environment,
+ * the state file, a command or a remote operation can change it: a credential is never sent anywhere but Discord by
+ * configuration. The test value lives on a process-wide symbol (not a module variable) because the host may evaluate this
+ * file once for the plugin and again for a test extension; it is re-validated on every read.
  */
-export function resolveApiBase(value: string | undefined): { base: string; override: boolean; warning?: string } {
-	if (value === undefined || value === "") return { base: DEFAULT_BASE, override: false };
-	if (LOOPBACK_BASE_RE.test(value)) return { base: `${value}/api/v10`, override: true };
-	return { base: DEFAULT_BASE, override: false, warning: "OMP_PEERS_DISCORD_API_BASE ignored: only http://127.0.0.1:<port> is accepted (test-only); using the real Discord API" };
+const ENDPOINT_KEY = Symbol.for("omp-peers.discord.test-endpoint");
+
+/** The test origin if one is set and valid, else undefined (the real API). */
+function testOrigin(): string | undefined {
+	const value = (globalThis as Record<symbol, unknown>)[ENDPOINT_KEY];
+	return typeof value === "string" && LOOPBACK_ORIGIN_RE.test(value) ? value : undefined;
 }
-const API = resolveApiBase(process.env.OMP_PEERS_DISCORD_API_BASE);
-let warnedBase = false;
+const apiBase = (): string => {
+	const origin = testOrigin();
+	return origin ? `${origin}/api/v10` : DEFAULT_BASE;
+};
+
+/**
+ * Test-only: send requests to a fake Discord on this machine. Accepts exactly `http://127.0.0.1:<port>` (anything else
+ * throws); `undefined` restores the real API. Called only by test code (unit tests and the scenario's test extension).
+ */
+export function setTestEndpoint(origin: string | undefined): void {
+	if (origin !== undefined && !LOOPBACK_ORIGIN_RE.test(origin)) throw new Error("the test endpoint must be exactly http://127.0.0.1:<port>");
+	(globalThis as Record<symbol, unknown>)[ENDPOINT_KEY] = origin;
+}
 
 type Fetch = (url: string, init: RequestInit) => Promise<Response>;
 interface Seam {
@@ -184,6 +198,8 @@ export interface DiscordState {
 	failures: number;
 	/** Circuit breaker: nothing is sent or polled before this time. */
 	pausedUntil?: number;
+	/** Discord asked us to slow down (HTTP 429): nothing is sent or polled before this time. Separate from the circuit breaker. */
+	holdUntil?: number;
 	/** Newest Discord message id already examined. */
 	cursor?: string;
 	/** Last time a poll was claimed (epoch ms). */
@@ -225,7 +241,7 @@ function validateConfig(value: unknown): Config {
 function validateItem(value: unknown): QueueItem {
 	const q = value as Partial<QueueItem> | null;
 	const ok = !!q && typeof q === "object" && Number.isInteger(q.id) && q.id! >= 1 && KINDS.includes(q.kind as string) && typeof q.text === "string" && q.text.length > 0 &&
-		Buffer.byteLength(q.text) <= MAX_MESSAGE_BYTES && isCount(q.attempts, MAX_ATTEMPTS) && isTime(q.notBefore) && (q.leaseUntil === undefined || isTime(q.leaseUntil));
+		Buffer.byteLength(q.text) <= MAX_MESSAGE_BYTES && isCount(q.attempts) && isTime(q.notBefore) && (q.leaseUntil === undefined || isTime(q.leaseUntil));
 	if (!ok) throw new Error("malformed queue entry");
 	return q as QueueItem;
 }
@@ -234,7 +250,7 @@ function validateState(value: unknown): DiscordState {
 	const s = value as Partial<DiscordState> | null;
 	if (!s || typeof s !== "object" || s.version !== 1) throw new Error("unsupported version (expected 1)");
 	const ok = typeof s.enabled === "boolean" && Number.isInteger(s.nextId) && s.nextId! >= 1 && isCount(s.dropped) && isCount(s.sent) && Array.isArray(s.sentTimes) && s.sentTimes.length <= MAX_RATE &&
-		s.sentTimes.every(isTime) && isCount(s.failures, BREAKER_FAILURES) && (s.pausedUntil === undefined || isTime(s.pausedUntil)) &&
+		s.sentTimes.every(isTime) && isCount(s.failures, BREAKER_FAILURES) && (s.pausedUntil === undefined || isTime(s.pausedUntil)) && (s.holdUntil === undefined || isTime(s.holdUntil)) &&
 		(s.cursor === undefined || (typeof s.cursor === "string" && CURSOR_RE.test(s.cursor))) && isTime(s.lastPollAt) && (s.stopped === undefined || (typeof s.stopped === "string" && s.stopped.length <= 80)) &&
 		Array.isArray(s.queue) && s.queue.length <= MAX_QUEUE && Array.isArray(s.log) && s.log.length <= MAX_LOG && !!s.userHits && typeof s.userHits === "object" && !Array.isArray(s.userHits);
 	if (!ok) throw new Error("malformed fields");
@@ -242,6 +258,8 @@ function validateState(value: unknown): DiscordState {
 	const ids = new Set<number>();
 	for (const item of s.queue!) {
 		validateItem(item);
+		// An over-limit count (a crash during the last attempt, an older version) must never make the file unreadable: pump drops such a message.
+		if (item.attempts > MAX_ATTEMPTS) item.attempts = MAX_ATTEMPTS;
 		if (ids.has(item.id) || item.id >= s.nextId!) throw new Error("duplicate queue id or id beyond nextId");
 		ids.add(item.id);
 	}
@@ -457,10 +475,11 @@ export function classify(reply: Reply | { error: string }): Outcome {
 export function postTarget(cred: Credential): { url: string; headers: Record<string, string> } {
 	const common = { "Content-Type": "application/json", "User-Agent": agent() };
 	if (cred.mode === "webhook") {
-		const url = API.override ? `${API.base.replace(/\/api\/v10$/, "")}${new URL(cred.url).pathname}` : cred.url;
+		const origin = testOrigin();
+		const url = origin ? `${origin}${new URL(cred.url).pathname}` : cred.url;
 		return { url, headers: common };
 	}
-	return { url: `${API.base}/channels/${cred.channel}/messages`, headers: { ...common, Authorization: `Bot ${cred.token}` } };
+	return { url: `${apiBase()}/channels/${cred.channel}/messages`, headers: { ...common, Authorization: `Bot ${cred.token}` } };
 }
 
 // ---- Sending ------------------------------------------------------------------------------------
@@ -476,6 +495,7 @@ const windowTimes = (s: DiscordState, now: number) => s.sentTimes.filter(t => t 
 function sendBlock(s: DiscordState, now: number): string | undefined {
 	if (!s.enabled) return "the bridge is off";
 	if (s.pausedUntil !== undefined && now < s.pausedUntil) return `the circuit breaker is open for ${Math.ceil((s.pausedUntil - now) / 60_000)} more minute(s)`;
+	if (s.holdUntil !== undefined && now < s.holdUntil) return `Discord asked the bridge to slow down for ${Math.ceil((s.holdUntil - now) / 1000)} more second(s)`;
 	if (inFlight(s, now)) return "another send is in progress";
 	const used = windowTimes(s, now).length;
 	if (used >= s.config.rateLimit) return `the rate limit is reached (${used}/${s.config.rateLimit} requests in the last hour)`;
@@ -544,6 +564,9 @@ function settle(s: DiscordState, item: { id: number; kind: Kind }, outcome: Outc
 		case "retry": {
 			const reason = outcome.kind === "rate" ? "http 429" : outcome.reason;
 			failed(s, now, notices);
+			const wait = outcome.kind === "rate" && outcome.waitMs !== undefined ? outcome.waitMs : BACKOFF_MS[Math.min((queued?.attempts ?? 1) - 1, BACKOFF_MS.length - 1)];
+			// A 429 slows every send and poll, not only this message.
+			if (outcome.kind === "rate") s.holdUntil = Math.max(s.holdUntil ?? 0, now + wait);
 			if (!queued) return reason;
 			if (item.kind === "test" || queued.attempts >= MAX_ATTEMPTS) {
 				remove();
@@ -551,7 +574,6 @@ function settle(s: DiscordState, item: { id: number; kind: Kind }, outcome: Outc
 				note(s, now, item.kind === "test" ? `failed #${item.id}: ${reason}` : `failed #${item.id}: gave up after ${queued.attempts} attempts (${reason})`);
 				return reason;
 			}
-			const wait = outcome.kind === "rate" && outcome.waitMs !== undefined ? outcome.waitMs : BACKOFF_MS[queued.attempts - 1];
 			queued.notBefore = now + wait;
 			delete queued.leaseUntil;
 			note(s, now, `retry #${item.id} in ${Math.ceil(wait / 1000)} s (${reason}, attempt ${queued.attempts} of ${MAX_ATTEMPTS})`);
@@ -587,9 +609,15 @@ async function transmit(host: FeatureHost, item: { id: number; kind: Kind; text:
 export async function pump(host: FeatureHost): Promise<void> {
 	const now = host.now();
 	const picked = await update(host, s => {
-		if (sendBlock(s, now) !== undefined) return { result: undefined };
-		const item = s.queue.find(q => q.notBefore <= now);
-		if (!item) return { result: undefined };
+		// A message whose last attempt never reported back (crash, handoff) has used all its attempts: drop it, never send it again.
+		const exhausted = s.queue.filter(q => q.attempts >= MAX_ATTEMPTS && (q.leaseUntil === undefined || q.leaseUntil <= now));
+		if (exhausted.length) {
+			s.queue = s.queue.filter(q => !exhausted.includes(q));
+			s.dropped = Math.min(s.dropped + exhausted.length, COUNTER_CAP);
+			for (const q of exhausted) note(s, now, `failed #${q.id}: gave up after ${MAX_ATTEMPTS} attempts (no result recorded)`);
+		}
+		const item = sendBlock(s, now) === undefined ? s.queue.find(q => q.notBefore <= now && q.attempts < MAX_ATTEMPTS) : undefined;
+		if (!item) return { state: exhausted.length ? s : undefined, result: undefined };
 		claim(s, item, now);
 		return { state: s, result: { item: { id: item.id, kind: item.kind, text: item.text }, config: s.config } };
 	});
@@ -697,6 +725,7 @@ export async function poll(host: FeatureHost): Promise<void> {
 	const claimed = await update(host, s => {
 		if (!s.enabled || !s.config.inbound || modeOf(s.config) !== "bot") return { result: undefined };
 		if (s.pausedUntil !== undefined && now < s.pausedUntil) return { result: undefined };
+		if (s.holdUntil !== undefined && now < s.holdUntil) return { result: undefined };
 		if (now - s.lastPollAt < POLL_INTERVAL_MS) return { result: undefined };
 		s.lastPollAt = now;
 		return { state: s, result: { cursor: s.cursor, config: s.config } };
@@ -708,7 +737,7 @@ export async function poll(host: FeatureHost): Promise<void> {
 		const cred = credential(claimed.config);
 		if (cred.mode !== "bot") return;
 		const query = claimed.cursor === undefined ? "limit=1" : `limit=${POLL_LIMIT}&after=${claimed.cursor}`;
-		reply = await call(`${API.base}/channels/${cred.channel}/messages?${query}`, { method: "GET", headers: { "User-Agent": agent(), Authorization: `Bot ${cred.token}` } });
+		reply = await call(`${apiBase()}/channels/${cred.channel}/messages?${query}`, { method: "GET", headers: { "User-Agent": agent(), Authorization: `Bot ${cred.token}` } });
 	} catch (error) {
 		reply = { error: `credential: ${(error as Error).message}`.slice(0, 120) };
 	}
@@ -722,7 +751,7 @@ export async function poll(host: FeatureHost): Promise<void> {
 		}
 		if (outcome.kind !== "ok" || !messages) {
 			const reason = outcome.kind === "ok" ? "invalid response" : outcome.kind === "rate" ? "http 429" : outcome.reason;
-			if (outcome.kind === "rate") s.lastPollAt = now + (outcome.waitMs ?? POLL_INTERVAL_MS) - POLL_INTERVAL_MS;
+			if (outcome.kind === "rate") s.holdUntil = Math.max(s.holdUntil ?? 0, now + (outcome.waitMs ?? POLL_INTERVAL_MS));
 			note(s, now, `poll failed: ${reason}`);
 			failed(s, now, notices);
 			return { state: s, result: [] };
@@ -766,10 +795,6 @@ async function onReport(report: Report, from: { id: string; name: string }, host
 }
 
 async function tick(host: FeatureHost): Promise<void> {
-	if (!warnedBase) {
-		warnedBase = true;
-		if (API.warning) host.notify(API.warning);
-	}
 	if (!host.isMaster() || !readDiscord(host).enabled) return;
 	await poll(host);
 	await pump(host);
@@ -808,6 +833,7 @@ function renderStatus(host: FeatureHost): string {
 	const used = windowTimes(s, now).length;
 	lines.push(`queued: ${s.queue.length} of ${MAX_QUEUE}; sent: ${s.sent}; dropped: ${s.dropped}; requests in last hour: ${used}/${s.config.rateLimit}`);
 	lines.push(s.pausedUntil !== undefined && now < s.pausedUntil ? `circuit breaker: open until ${fmtTime(s.pausedUntil)}` : `circuit breaker: closed (${s.failures} consecutive failure(s) of ${BREAKER_FAILURES})`);
+	if (s.holdUntil !== undefined && now < s.holdUntil) lines.push(`discord rate-limit hold (HTTP 429): nothing is sent or polled until ${fmtTime(s.holdUntil)}`);
 	if (s.config.inbound) lines.push(`inbound cursor: ${s.cursor ? "recorded" : "none (the first poll records the channel position and runs nothing)"}`);
 	lines.push(`role: ${host.isMaster() ? "this session is the master and runs the bridge" : "this session is not the master; the bridge runs in the master only"}`);
 	return lines.join("\n");
@@ -839,6 +865,7 @@ async function turnOn(host: FeatureHost): Promise<string> {
 		s.enabled = true;
 		s.failures = 0;
 		delete s.pausedUntil;
+		delete s.holdUntil;
 		delete s.stopped;
 		s.lastPollAt = 0;
 		note(s, now, "bridge on");
