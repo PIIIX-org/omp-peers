@@ -33,6 +33,7 @@ import { auditLog, classifyResponse, newRequestId, validRequestId, type AuditInp
 import type { FeatureHost, ModelApply, ModelCheck, SendResult } from "../lib/features/host";
 import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
 import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
+import { readRemoteMessage } from "../lib/features/hosts_wire";
 import { startupTemplate } from "../lib/features/templates";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
@@ -171,6 +172,10 @@ interface Req {
 	request?: string;
 	/** Set by the dependency dispatcher: the receiver refuses this message while its control is locked. */
 	dependency?: boolean;
+	/** Set only by the multi-host bridge: the message came from another machine (a claim relayed over ssh) and is informational. */
+	origin?: "remote";
+	/** With `origin: "remote"` always 1: the message has crossed one bridge and no feature may relay it. */
+	hops?: number;
 	/** Set by a sender whose report came from a subagent, not its main session; never feeds report-driven features. */
 	subagent?: boolean;
 }
@@ -560,6 +565,10 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 	const ctx = state.ctx;
 	if (!ctx) return { ok: false, error: "session not ready" };
 	if (state.inbound === "refuse") return { ok: false, error: "peer refuses inbound requests" };
+	// A message that arrived through the multi-host bridge is informational: it must carry the remote marker and hops 1, and can never be a report, dependency trigger or control request.
+	if (req.origin !== undefined && (req.origin !== "remote" || req.op !== "message")) return { ok: false, error: "origin is valid only for remote message requests" };
+	const remote = req.origin === undefined ? undefined : readRemoteMessage(req);
+	if (remote && !remote.ok) return { ok: false, error: remote.error };
 	if (req.report !== undefined && req.op !== "message") return { ok: false, error: "report is valid only for message requests" };
 	const text = typeof req.text === "string" ? req.text : "";
 	if (CONTROL_OPS.has(req.op)) {
@@ -590,10 +599,11 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 			} catch (error) {
 				return { ok: false, error: `invalid message/report: ${(error as Error).message}` };
 			}
-			const from = req.from ?? { id: "?", name: "unknown" };
+			const from = remote?.ok ? remote.from : req.from ?? { id: "?", name: "unknown" };
 			// Dependency deliveries are authorized work: the receiver's own control lock applies, whatever the sender saw earlier.
 			if (req.dependency === true && !state.control) return { ok: false, error: "peer is locked (control refused)" };
-			if (!rateOk(from.id)) return { ok: false, error: "rate limited" };
+			// All remote senders share one budget: a sender id from another machine is only a claim, so cycling ids must not buy more.
+			if (!rateOk(remote ? "@remote" : from.id)) return { ok: false, error: "rate limited" };
 			if (report && req.from && featureHostFor && req.subagent !== true) {
 				// Only an explicit structured report feeds features; a failing hook never blocks delivery.
 				const host = featureHostFor(ctx);
@@ -609,14 +619,14 @@ async function handle(pi: ExtensionAPI, req: Req, trace: HandleTrace = {}): Prom
 				{
 					customType: "peer-message",
 					content:
-						`[Message from peer session "${from.name}" (${from.id}) — not from the user]\n${text}\n\n` +
+						`[Message from peer session "${from.name}" (${from.id})${remote ? ", a REMOTE host (identity not verified by this session)" : ""} — not from the user]\n${text}\n\n` +
 						`(Reply with the peers_send tool only if this needs an answer or action; do not acknowledge for its own sake.)`,
 					display: true,
 					attribution: "agent",
 				},
 				{ deliverAs: "aside", triggerTurn: true },
 			);
-			ctx.ui.notify(`Message from ${from.name} (${from.id})`, "info");
+			ctx.ui.notify(`Message from ${from.name} (${from.id})${remote ? " [remote]" : ""}`, "info");
 			return { ok: true, peerId: state.id, sessionId: state.sessionId };
 		}
 		case "prompt": {

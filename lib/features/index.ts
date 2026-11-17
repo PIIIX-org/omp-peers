@@ -8,6 +8,7 @@ import { deps } from "./deps";
 import { digest } from "./digest";
 import { groups } from "./groups";
 import type { FeatureHost } from "./host";
+import { hosts } from "./hosts";
 import { audit } from "./audit";
 import { inbox } from "./inbox";
 import { locks } from "./locks";
@@ -43,4 +44,4 @@ export interface Feature {
 }
 
 // One line per feature; a new feature adds its module and one entry here.
-export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, watchdog, autocompact, digest];
+export const FEATURES: Feature[] = [rules, inbox, board, pause, resume, locks, groups, audit, deps, templates, watchdog, autocompact, digest, hosts];
