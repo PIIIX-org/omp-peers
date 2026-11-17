@@ -28,9 +28,10 @@ import { formatActivity, initializeActivityHost, readActivity, type PeerActivity
 import { readMessage, sendIngressParameters, sendParameters, type Report } from "../lib/reports";
 import { identifyPeers, identityFlags, logicalId, matchesWriter, resolvePeerTargets, skippedLine, stablePeerId, type IdentityStatus, type Skipped } from "../lib/identity";
 import { FEATURES } from "../lib/features";
-import type { FeatureHost, SendResult } from "../lib/features/host";
+import type { FeatureHost, ModelApply, ModelCheck, SendResult } from "../lib/features/host";
 import { CONTROL_OPS, groupTargeting, groupsOf } from "../lib/features/groups";
 import { pauseSession, readPause, wakeGate } from "../lib/features/pause";
+import { startupTemplate } from "../lib/features/templates";
 
 const ROOT = path.join(os.homedir(), ".omp", "run", "peers");
 const MASTER_FILE = path.join(ROOT, "master.json");
@@ -485,6 +486,21 @@ async function applyRouting(
 	return { ok: true, routed };
 }
 
+/** Check a selector like a routed model change does: among the available models, credentials present, no substitution. */
+async function checkModel(pi: ExtensionAPI, ctx: ExtensionContext, selector: string): Promise<{ check: ModelCheck; model?: NonNullable<ExtensionContext["model"]> }> {
+	const resolved = resolveModelRoleValue(selector, ctx.models.list(), { settings: pi.pi.settings });
+	const model = resolved.model;
+	if (!model || resolved.warning) return { check: { ok: false, error: "not among the available models (unknown, unauthenticated or invalid selector)" } };
+	if (resolved.explicitThinkingLevel) return { check: { ok: false, error: "the selector carries a thinking level; templates do not set one" } };
+	try {
+		if (!(await ctx.modelRegistry.getApiKey(model))) return { check: { ok: false, error: "no credentials for this model" } };
+	} catch {
+		return { check: { ok: false, error: "authentication failed for this model" } };
+	}
+	const current = ctx.models.current();
+	return { check: { ok: true, model: formatModelStringWithRouting(model), current: current ? formatModelStringWithRouting(current) : undefined }, model };
+}
+
 /** Resolve a tier name (light|standard|heavy) to its configured model[:effort]; pass other specs through. */
 function expandSpec(spec: string): string {
 	const tier = TIERS.find(t => t === spec.trim().toLowerCase());
@@ -770,6 +786,15 @@ export default function peers(pi: ExtensionAPI) {
 		refresh(ctx);
 		if (state.timer) ctx.clearTimer(state.timer as never);
 		state.timer = ctx.setInterval(() => refresh(state.ctx ?? ctx), 5_000);
+		// A template named in the environment is applied only to a brand new session, and only when also confirmed there.
+		if (process.env.OMP_PEERS_TEMPLATE?.trim()) {
+			const fresh = !fs.existsSync(sessionPath()) && !ctx.sessionManager.getEntries().some(entry => entry.type === "message");
+			const text = state.sessionLock?.acquired
+				? await startupTemplate(featureHost(ctx), process.env, fresh)
+				: `template not applied: ${state.identityError || "session identity unavailable"}`;
+			if (text) ctx.ui.notify(text, "info");
+			publish(pi);
+		}
 	});
 	const refreshAfterEvent = async (_event: unknown, ctx: ExtensionContext) => {
 		if (ctx.agent.kind === "main" && state.server) refresh(ctx);
@@ -810,6 +835,17 @@ export default function peers(pi: ExtensionAPI) {
 			},
 			send: (to, req) => sendTo(to, req.text),
 			acceptsRemote: () => state.inbound === "accept" && state.control,
+			resolveModel: async selector => (await checkModel(pi, ctx, selector)).check,
+			applyModel: async (selector): Promise<ModelApply> => {
+				const { check, model } = await checkModel(pi, ctx, selector);
+				if (!check.ok || !model) return { ok: false, error: check.ok ? "model unavailable" : check.error };
+				const effort = pi.getThinkingLevel();
+				if (!(await pi.setModel(model))) return { ok: false, error: "no credentials for this model" };
+				// setModel may reset thinking; a template does not set one, so keep the session's.
+				if (effort && pi.getThinkingLevel() !== effort) pi.setThinkingLevel(effort);
+				publish(pi);
+				return { ok: true, model: check.model, previous: check.current };
+			},
 		};
 	};
 	featureHostFor = featureHost;

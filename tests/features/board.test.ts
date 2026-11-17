@@ -42,6 +42,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 		},
 		groupsOf: () => [],
 		resolveGroup: async () => ({ recipients: [], skipped: [] }),
+		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }), applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		send: async () => ({ status: "offline" }),
 	};
 }

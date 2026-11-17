@@ -28,6 +28,18 @@ export type SendResult =
 	/** The peer is live but refused or could not be reached (inbound refuse, rate limit, socket error, ...). */
 	| { status: "failed"; reason: string };
 
+/** A model selector checked against the models available now; nothing was changed. */
+export type ModelCheck =
+	/** `model` is the canonical `provider/id` the selector resolves to; `current` is this session's model, if it has one. */
+	| { ok: true; model: string; current?: string }
+	| { ok: false; error: string };
+
+/** Outcome of switching this session's model. */
+export type ModelApply =
+	/** `previous` is the model before the switch (a valid selector to switch back), if there was one. */
+	| { ok: true; model: string; previous?: string }
+	| { ok: false; error: string };
+
 /**
  * What a feature may ask of the extension. Features take this instead of importing host runtime
  * values so they unit-test with a fake. Extend additively: add a member only when a feature uses it.
@@ -53,4 +65,12 @@ export interface FeatureHost {
 	 * session that is not live.
 	 */
 	send(to: string, req: { text: string }): Promise<SendResult>;
+	/**
+	 * Resolve `selector` (a model id, `provider/id` or role alias, no thinking-level suffix) against the available
+	 * models and check its credentials, the way a routed model change is validated. Read-only: never substitutes
+	 * another model and never changes the session.
+	 */
+	resolveModel(selector: string): Promise<ModelCheck>;
+	/** Switch this session to `selector` after the same checks as `resolveModel`; the thinking level is kept. No substitution on failure. */
+	applyModel(selector: string): Promise<ModelApply>;
 }

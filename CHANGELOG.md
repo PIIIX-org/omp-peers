@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Session templates
+
+- Add `/peers templates add|show|list|remove|apply|launch` (private `templates.json`, 32 templates): a template names an optional model, a role prompt, up to 8 rules and up to 8 groups. It is applied only to the session that runs `apply <name> --yes` (or a brand new session started with `OMP_PEERS_TEMPLATE` and `OMP_PEERS_TEMPLATE_CONFIRM=yes`): the model is switched only if available with credentials (never substituted), the role and rules become session-scoped rules and the groups are joined, all or nothing. `show` and `apply` without `--yes` print the same read-only plan; `launch` prints the shell line and starts nothing.
+
 ### Session groups
 
 - Add `/peers groups list|add|remove|delete|members|preview` (private `groups.json`, keyed by stable session id, 64 groups of 64 members) and a `group:<name>` target for `/peers msg|report|do`, `peers_send` and `peers_control`: recipients that are paused (from the published registry flag; the receiver's wake gate stays authoritative), refusing inbound, locked (control ops) or ambiguous are skipped and listed as `skipped: <name> (<reason>)`; unknown, empty and no-recipient groups are explicit errors and `all` is unchanged. Group-scoped standing rules now match real membership.
