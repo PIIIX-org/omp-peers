@@ -79,7 +79,7 @@ function validateState(value: unknown): RulesState {
 	return state as RulesState;
 }
 
-function readRules(host: FeatureHost): RulesState {
+export function readRules(host: FeatureHost): RulesState {
 	return readState(rulesFile(host.home), emptyState, validateState);
 }
 
@@ -170,7 +170,7 @@ export function screenText(text: string): string | undefined {
 		: undefined;
 }
 
-function normalizeText(raw: string): { text?: string; error?: string } {
+export function normalizeText(raw: string): { text?: string; error?: string } {
 	let text = raw.trim().replace(/\s+/g, " ");
 	if (text.length > 1 && /^(["'])[\s\S]*\1$/.test(text)) text = text.slice(1, -1).trim();
 	if (!text) return { error: "rule text is empty" };
@@ -192,6 +192,13 @@ export async function resolvePeer(host: FeatureHost, spec: string, allowOffline:
 }
 
 // ---- Operations --------------------------------------------------------------------------------
+
+/** Why one more rule in `scope` would be refused (the global or per-scope limit); undefined when it fits. */
+function limitError(rules: Rule[], scope: string): string | undefined {
+	if (rules.length >= MAX_RULES) return `rule limit reached (${MAX_RULES}); remove a rule first`;
+	if (rules.filter(rule => rule.scope === scope).length >= MAX_SCOPE_RULES) return `scope limit reached (${MAX_SCOPE_RULES} rules for ${scope}); remove a rule first`;
+	return undefined;
+}
 
 export type AddResult =
 	| { ok: true; rule: Rule; conflicts: Rule[] }
@@ -220,12 +227,41 @@ export async function addRule(host: FeatureHost, scopeSpec: string, rawText: str
 	return updateState<RulesState, AddResult>(rulesFile(host.home), emptyState, validateState, current => {
 		const existing = current.rules.find(rule => rule.scope === scope && rule.text === text);
 		if (existing) return { result: { ok: false, error: `duplicate: ${existing.id} already has this scope and text`, existing: existing.id } };
-		if (current.rules.length >= MAX_RULES) return { result: { ok: false, error: `rule limit reached (${MAX_RULES}); remove a rule first` } };
-		if (current.rules.filter(rule => rule.scope === scope).length >= MAX_SCOPE_RULES) return { result: { ok: false, error: `scope limit reached (${MAX_SCOPE_RULES} rules for ${scope}); remove a rule first` } };
+		const full = limitError(current.rules, scope);
+		if (full) return { result: { ok: false, error: full } };
 		const rule: Rule = { id: `r${current.nextId}`, scope, text, ...(key ? { key } : {}), addedBy, createdAt };
 		const rules = [...current.rules, rule];
 		return { state: { version: 1, nextId: current.nextId + 1, rules }, result: { ok: true, rule, conflicts: potentialConflicts(rules, rule) } };
 	});
+}
+
+export type OwnRulePlan = { action: "add" } | { action: "present"; id: string } | { action: "refuse"; error: string };
+
+/**
+ * Read-only mirror of `addRule` for rules this session adds to its own scope, in order: for each entry
+ * whether `addRule` would add it, find it already present (same scope and text), or refuse it (a limit, or
+ * another rule of this session already holds the same key with different text and would silently win).
+ * `omitted` is how many active rules the injection byte cap would leave out once all are added.
+ */
+export function planOwnRules(host: FeatureHost, entries: { text: string; key?: string }[]): { steps: OwnRulePlan[]; omitted: number } {
+	const self = host.self().id;
+	const scope = `session:${self}`;
+	const current = readRules(host);
+	const rules = [...current.rules];
+	let nextId = current.nextId;
+	const steps = entries.map((entry): OwnRulePlan => {
+		const existing = rules.find(rule => rule.scope === scope && rule.text === entry.text);
+		if (existing) return { action: "present", id: existing.id };
+		const holder = entry.key ? rules.find(rule => rule.scope === scope && rule.key === entry.key) : undefined;
+		if (holder) return { action: "refuse", error: `${holder.id} already holds key "${entry.key}" in this session with different text; remove it first with /peers rules remove ${holder.id}` };
+		const full = limitError(rules, scope);
+		if (full) return { action: "refuse", error: full };
+		rules.push({ id: `r${nextId++}`, scope, text: entry.text, ...(entry.key ? { key: entry.key } : {}), addedBy: self, createdAt: host.now() });
+		return { action: "add" };
+	});
+	// Same selection as agentContext: a session that refuses others only receives rules it added itself.
+	const own = host.acceptsRemote() ? rules : rules.filter(rule => rule.addedBy === self);
+	return { steps, omitted: planInjection(effectiveRules(own, self, host.groupsOf(self))).omitted };
 }
 
 export type RemoveResult = { ok: true; rule: Rule } | { ok: false; error: string };

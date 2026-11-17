@@ -57,6 +57,8 @@ function host(self: string, master = self === "master"): FeatureHost {
 			return { recipients: result.peers.map(p => ({ id: logicalId(p), name: p.name })), skipped: result.skipped ?? [], error: result.error };
 		},
 		send: async () => ({ status: "offline" }),
+		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }),
+		applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 	};
 }
 const say = (args: string, self = "master") => groups.command(args.split(/\s+/).filter(Boolean), host(self));

@@ -54,11 +54,12 @@ class Harness:
                                    capture_output=True, text=True, timeout=60)
         assert installed.returncode == 0, installed.stdout + installed.stderr
 
-    def start(self, resume=None):
-        peer = Peer(self.env, str(self.home), resume=resume)
+    def start(self, resume=None, env=None):
+        """Start a peer. `env` adds environment variables; such a peer is used as launched (no `new_session`)."""
+        peer = Peer({**self.env, **(env or {})}, str(self.home), resume=resume)
         self.peers.append(peer)
         peer.call("get_state")
-        if resume is None:
+        if resume is None and not env:
             peer.call("new_session")
         return peer
 

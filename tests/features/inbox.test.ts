@@ -37,6 +37,7 @@ function host(self: string, master = self === MASTER): FeatureHost {
 		peers: async () => live.map(id => ({ id, name: NAMES[id] })),
 		groupsOf: () => [],
 		resolveGroup: async () => ({ recipients: [], skipped: [] }),
+		resolveModel: async () => ({ ok: false, error: "not exercised by this suite" }), applyModel: async () => ({ ok: false, error: "not exercised by this suite" }),
 		send: async (to, req) => {
 			sent.push({ to, text: req.text });
 			return outcome;
