@@ -320,14 +320,27 @@ export interface AuditSettings {
 
 export const peersConfigFile = (home: string) => path.join(home, ".omp", "agent", "peers.json");
 
+/** Read a user config file without ever blocking: O_NONBLOCK open, then only a regular file is read (a FIFO is refused). */
+function readRegularFile(file: string): string {
+	const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+	try {
+		if (!fs.fstatSync(fd).isFile()) throw Object.assign(new Error("not a regular file"), { code: "NOT_REGULAR" });
+		return fs.readFileSync(fd, "utf8");
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
 /** Retention limits from `~/.omp/agent/peers.json` `audit`; invalid values fall back to the default and are reported. Never throws. */
 export function loadSettings(home: string): AuditSettings {
 	const settings: AuditSettings = { maxBytes: DEFAULT_MAX_BYTES, maxAgeDays: DEFAULT_MAX_AGE_DAYS, warnings: [] };
 	let text: string;
 	try {
-		text = fs.readFileSync(peersConfigFile(home), "utf8");
+		text = readRegularFile(peersConfigFile(home));
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") settings.warnings.push("peers.json is unreadable; audit limits use their defaults");
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "NOT_REGULAR") settings.warnings.push("peers.json is not a regular file; audit limits use their defaults");
+		else if (code !== "ENOENT") settings.warnings.push("peers.json is unreadable; audit limits use their defaults");
 		return settings;
 	}
 	let section: unknown;
@@ -472,24 +485,41 @@ function prunePrevious(paths: AuditPaths, cutoff: number): void {
 }
 
 /**
- * Under the lock, before an append: rotate when the log would exceed `maxBytes` or its oldest record has expired.
- * Rotation atomically replaces the single previous file and then prunes expired records from it.
+ * A live file whose first line cannot be parsed (a crashed write fragment, hand editing) has an unknown age. Repair it in
+ * place under the append lock: keep only parseable, unexpired records. It is never rotated over the previous file, so
+ * archived records that have not expired survive.
+ */
+function repairLive(paths: AuditPaths, cutoff: number): void {
+	const lines = readLines(paths.live);
+	if (!lines) return;
+	const kept = lines.filter(line => (parseRecord(line)?.ts ?? -1) >= cutoff);
+	if (kept.length === 0) fs.rmSync(paths.live, { force: true });
+	else replaceFile(paths.live, `${kept.join("\n")}\n`);
+}
+
+function inspectLive(paths: AuditPaths): { size: number; first: number | undefined } {
+	const fd = openIfPresent(paths.live);
+	if (fd === undefined) return { size: 0, first: undefined };
+	try {
+		const size = fs.fstatSync(fd).size;
+		return { size, first: size > 0 ? firstTimestamp(fd) : undefined };
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+/**
+ * Under the lock, before an append: repair an unparseable live file, then rotate when the log would exceed `maxBytes` or
+ * its oldest record has expired. Rotation atomically replaces the single previous file and then prunes expired records.
  */
 function maintain(paths: AuditPaths, settings: AuditSettings, incoming: number, now: number): void {
 	const cutoff = now - settings.maxAgeDays * DAY_MS;
-	let size = 0;
-	let first: number | undefined;
-	const fd = openIfPresent(paths.live);
-	if (fd !== undefined) {
-		try {
-			size = fs.fstatSync(fd).size;
-			if (size > 0) first = firstTimestamp(fd);
-		} finally {
-			fs.closeSync(fd);
-		}
+	let { size, first } = inspectLive(paths);
+	if (size > 0 && first === undefined) {
+		repairLive(paths, cutoff);
+		({ size, first } = inspectLive(paths));
 	}
-	// An unreadable first line (first undefined) must not pin expired records in the live file: rotate and prune it too.
-	if (size > 0 && (size + incoming > settings.maxBytes || first === undefined || first < cutoff)) {
+	if (size > 0 && (size + incoming > settings.maxBytes || (first !== undefined && first < cutoff))) {
 		fs.renameSync(paths.live, paths.prev);
 		prunePrevious(paths, cutoff);
 		return;

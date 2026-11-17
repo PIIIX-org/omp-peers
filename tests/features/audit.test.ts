@@ -357,14 +357,38 @@ describe("retention", () => {
 		expect(records(paths().prev)).toHaveLength(1);
 	});
 
-	test("a malformed first live line cannot keep expired records alive: the live file rotates and is pruned", async () => {
+	test("a malformed first live line is repaired in place: expired and unparseable lines go, nothing is rotated over the previous file", async () => {
 		await enable();
 		configure({ maxAgeDays: 30 });
 		fs.mkdirSync(paths().dir, { recursive: true, mode: 0o700 });
+		fs.writeFileSync(paths().prev, line(T0 + 35 * DAY, 8), { mode: 0o600 });
 		fs.writeFileSync(paths().live, `not json\n${line(T0, 1)}${line(T0 + 39 * DAY, 2)}`, { mode: 0o600 });
 		await record(new AuditLog(), T0 + 40 * DAY, 3);
-		expect(records(paths().prev).map(r => r.params!.selector)).toEqual(["provider/model-2"]);
-		expect(records().map(r => r.params!.selector)).toEqual(["provider/model-3"]);
+		expect(records().map(r => r.params!.selector)).toEqual(["provider/model-2", "provider/model-3"]);
+		expect(records(paths().prev).map(r => r.params!.selector)).toEqual(["provider/model-8"]);
+	});
+
+	test("a fragment-only live file never overwrites a fresh previous file: archived records survive", async () => {
+		await enable();
+		configure({ maxAgeDays: 30 });
+		fs.mkdirSync(paths().dir, { recursive: true, mode: 0o700 });
+		const archived = line(T0 + 36 * DAY, 5) + line(T0 + 38 * DAY, 6);
+		fs.writeFileSync(paths().prev, archived, { mode: 0o600 });
+		fs.writeFileSync(paths().live, '{"v":1,"ts":17', { mode: 0o600 });
+		await record(new AuditLog(), T0 + 40 * DAY, 7);
+		expect(fs.readFileSync(paths().prev, "utf8")).toBe(archived);
+		expect(records().map(r => r.params!.selector)).toEqual(["provider/model-7"]);
+	});
+
+	test("a FIFO as peers.json cannot hang recording or status: defaults apply with a warning", async () => {
+		await enable();
+		fs.mkdirSync(path.join(home, ".omp", "agent"), { recursive: true });
+		execFileSync("mkfifo", [path.join(home, ".omp", "agent", "peers.json")]);
+		const started = Date.now();
+		await record(new AuditLog(), T0, 1);
+		expect(records()).toHaveLength(1);
+		expect(await cmd("status")).toContain("peers.json is not a regular file; audit limits use their defaults");
+		expect(Date.now() - started).toBeLessThan(5000);
 	});
 
 	test("an unreadable first line cannot keep expired records alive in the previous file", async () => {
