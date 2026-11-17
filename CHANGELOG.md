@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Board pruning
+
+- The task board now prunes itself on writes: `done` entries (and `unknown` entries of sessions that are not running) older than `board.pruneDays` (default 7) are dropped, and at `board.maxEntries` (default 200, 10-1000) the oldest such entries make room for a new session. Entries with owed work (`assigned`, `in-progress`, `blocked`, `waiting`, `decision`) and running sessions' unknown entries are never dropped; read-only commands never prune.
+
 ### Test infrastructure
 
 - The feature-scenario runner prints `START scenario X` and `PASS scenario X in N.Ns` unbuffered and enforces a per-scenario timeout (default 240 s, `FEATURES_SMOKE_SCENARIO_TIMEOUT` seconds) that names the scenario on expiry; CI has step-level timeouts. The watchdog scenario waits for the delivery outcome as well as the emitted alert (they are recorded by two separate state updates).

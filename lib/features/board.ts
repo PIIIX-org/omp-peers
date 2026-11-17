@@ -15,7 +15,7 @@ import type { Report } from "../reports";
 import type { FeatureHost, PeerView } from "./host";
 import type { Feature } from "./index";
 import { looksLikeSecret as screenText } from "./secrets";
-import { readState, stateRoot, updateState } from "./store";
+import { readRegularFile, readState, stateRoot, updateState } from "./store";
 
 export const STATUSES = ["assigned", "in-progress", "blocked", "waiting", "decision", "done", "unknown"] as const;
 export type BoardStatus = (typeof STATUSES)[number];
@@ -48,7 +48,13 @@ export const DEFAULT_STALE_HOURS = 24;
 const MAX_STALE_HOURS = 8760;
 const MAX_TASK = 200;
 const MAX_NAME = 48;
-const MAX_ENTRIES = 200;
+/** Hard ceiling of the stored board; the effective cap is `board.maxEntries` (default 200, 10 to 1000). */
+const HARD_MAX_ENTRIES = 1000;
+export const DEFAULT_MAX_ENTRIES = 200;
+const MIN_MAX_ENTRIES = 10;
+/** Finished (and not-running unknown) entries older than this are pruned on the next board write; 0 disables the age rule. */
+export const DEFAULT_PRUNE_DAYS = 7;
+const MAX_PRUNE_DAYS = 3650;
 const PEER_ID_RE = /^p(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
 const MASTER_ONLY = "only the master session may assign tasks; run /peers master first";
 const NOT_ALLOWED = "only the master session or the session itself may change this entry";
@@ -61,7 +67,7 @@ const emptyState = (): BoardState => ({ version: 1, entries: [] });
 function validateState(value: unknown): BoardState {
 	const state = value as Partial<BoardState> | null;
 	if (!state || typeof state !== "object" || state.version !== 1 || !Array.isArray(state.entries)) throw new Error("unsupported version or malformed fields");
-	if (state.entries.length > MAX_ENTRIES) throw new Error("too many entries");
+	if (state.entries.length > HARD_MAX_ENTRIES) throw new Error("too many entries");
 	const seen = new Set<string>();
 	for (const entry of state.entries as BoardEntry[]) {
 		const text = (field: unknown, max: number) => field === undefined || (typeof field === "string" && field.length <= max);
@@ -116,6 +122,83 @@ export function staleConfig(home: string): StaleConfig {
 		: { hours };
 }
 
+export interface PruneConfig {
+	maxEntries: number;
+	pruneDays: number;
+	/** Unusable configured values, each naming the default that applies. */
+	warnings: string[];
+}
+
+/** `board.maxEntries` and `board.pruneDays` from `~/.omp/agent/peers.json`; a missing key or file means the defaults. Never throws. */
+export function pruneConfig(home: string): PruneConfig {
+	const config: PruneConfig = { maxEntries: DEFAULT_MAX_ENTRIES, pruneDays: DEFAULT_PRUNE_DAYS, warnings: [] };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readRegularFile(path.join(home, ".omp", "agent", "peers.json")));
+	} catch (error) {
+		const code = error instanceof Error && "code" in error ? String(error.code) : "";
+		if (code && code !== "ENOENT") config.warnings.push(`peers.json could not be read; board prune settings use their defaults`);
+		else if (!code) config.warnings.push("peers.json is not valid JSON; board prune settings use their defaults");
+		return config;
+	}
+	const board = typeof parsed === "object" && parsed !== null && "board" in parsed ? parsed.board : undefined;
+	if (typeof board !== "object" || board === null) return config;
+	if ("maxEntries" in board) {
+		const value = board.maxEntries;
+		if (typeof value === "number" && Number.isInteger(value) && value >= MIN_MAX_ENTRIES && value <= HARD_MAX_ENTRIES) config.maxEntries = value;
+		else config.warnings.push(`board.maxEntries must be an integer from ${MIN_MAX_ENTRIES} to ${HARD_MAX_ENTRIES}; using ${DEFAULT_MAX_ENTRIES}`);
+	}
+	if ("pruneDays" in board) {
+		const value = board.pruneDays;
+		if (typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= MAX_PRUNE_DAYS) config.pruneDays = value;
+		else config.warnings.push(`board.pruneDays must be a number from 0 (never by age) to ${MAX_PRUNE_DAYS}; using ${DEFAULT_PRUNE_DAYS}`);
+	}
+	return config;
+}
+
+/** Statuses that mean work is still owed: such an entry is never pruned, whether or not its session is running. */
+const PENDING: ReadonlySet<BoardStatus> = new Set(["assigned", "in-progress", "blocked", "waiting", "decision"]);
+
+/**
+ * Whether `entry` may be dropped to keep the board small: it is finished (`done`), or its status is `unknown` and its session is
+ * not running. `running` undefined (liveness could not be read) leaves only finished entries prunable. An entry whose session is
+ * running and has not finished is active and never pruned.
+ */
+export function isPrunable(entry: BoardEntry, running: ReadonlySet<string> | undefined): boolean {
+	if (PENDING.has(entry.status)) return false;
+	if (entry.status === "done") return true;
+	return running !== undefined && !running.has(entry.session);
+}
+
+export interface PruneInput {
+	now: number;
+	running: ReadonlySet<string> | undefined;
+	maxEntries: number;
+	pruneDays: number;
+	/** The session being written; it is never pruned, and a new one needs room under the cap. */
+	incoming: string;
+}
+
+/**
+ * Entries to drop before a write. First every prunable entry at least `pruneDays` old (0 disables); then, only while a NEW session
+ * would exceed `maxEntries`, the oldest prunable entries (ties by session id). Pending and running entries are never returned.
+ */
+export function pruneCandidates(entries: readonly BoardEntry[], input: PruneInput): BoardEntry[] {
+	const prunable = entries.filter(entry => entry.session !== input.incoming && isPrunable(entry, input.running));
+	const ageMs = input.pruneDays * 86_400_000;
+	const drop = new Set<BoardEntry>(input.pruneDays > 0 ? prunable.filter(entry => input.now - entry.updatedAt >= ageMs) : []);
+	if (!entries.some(entry => entry.session === input.incoming)) {
+		const oldestFirst = prunable.filter(entry => !drop.has(entry)).sort((a, b) => a.updatedAt - b.updatedAt || (a.session < b.session ? -1 : 1));
+		let size = entries.length - drop.size;
+		for (const entry of oldestFirst) {
+			if (size < input.maxEntries) break;
+			drop.add(entry);
+			size--;
+		}
+	}
+	return entries.filter(entry => drop.has(entry));
+}
+
 // ---- Text --------------------------------------------------------------------------------------
 
 function cleanName(raw: unknown): string {
@@ -159,11 +242,19 @@ function resolve(spec: string, live: PeerView[], entries: BoardEntry[]): Resolve
 
 // ---- Operations --------------------------------------------------------------------------------
 
-export type BoardResult = { ok: true; entry: BoardEntry } | { ok: false; error: string };
+export type BoardResult = { ok: true; entry: BoardEntry; /** Old finished entries dropped by this write. */ pruned?: number } | { ok: false; error: string };
 
 function upsert(entries: BoardEntry[], entry: BoardEntry): BoardEntry[] {
 	return entries.some(e => e.session === entry.session) ? entries.map(e => (e.session === entry.session ? entry : e)) : [...entries, entry];
 }
+
+/** The entries that remain after pruning for a write to `incoming`, and how many were dropped. */
+function pruned(entries: BoardEntry[], config: PruneConfig, incoming: string, now: number, running: ReadonlySet<string> | undefined): { entries: BoardEntry[]; dropped: number } {
+	const drop = new Set(pruneCandidates(entries, { now, running, maxEntries: config.maxEntries, pruneDays: config.pruneDays, incoming }));
+	return { entries: drop.size ? entries.filter(entry => !drop.has(entry)) : entries, dropped: drop.size };
+}
+
+const fullMessage = (cap: number) => `board limit reached (${cap} entries) and no finished entry can be pruned; clear an entry first`;
 
 /** Master only. Records the assignment; sends nothing and wakes nobody. */
 export async function assignTask(host: FeatureHost, spec: string, rawTask: string): Promise<BoardResult> {
@@ -177,11 +268,14 @@ export async function assignTask(host: FeatureHost, spec: string, rawTask: strin
 	const name = cleanName(live.find(peer => peer.id === id)?.name);
 	const updatedAt = host.now();
 	const updatedBy = host.self().id;
+	const config = pruneConfig(host.home);
+	const running = new Set(live.map(peer => peer.id));
 	return updateState<BoardState, BoardResult>(boardFile(host.home), emptyState, validateState, current => {
 		const existing = current.entries.find(e => e.session === id);
-		if (!existing && current.entries.length >= MAX_ENTRIES) return { result: { ok: false, error: `board limit reached (${MAX_ENTRIES} entries); clear an entry first` } };
+		const kept = pruned(current.entries, config, id, updatedAt, running);
+		if (!existing && kept.entries.length >= config.maxEntries) return { result: { ok: false, error: fullMessage(config.maxEntries) } };
 		const entry: BoardEntry = { session: id, name: name || existing?.name || "", task: text, status: "assigned", source: "assignment", updatedAt, updatedBy };
-		return { state: { version: 1, entries: upsert(current.entries, entry) }, result: { ok: true, entry } };
+		return { state: { version: 1, entries: upsert(kept.entries, entry) }, result: { ok: true, entry, ...(kept.dropped ? { pruned: kept.dropped } : {}) } };
 	});
 }
 
@@ -203,14 +297,17 @@ export async function setStatus(host: FeatureHost, spec: string, status: string,
 	if (id !== self.id && !host.isMaster()) return { ok: false, error: NOT_ALLOWED };
 	const liveName = cleanName(live.find(peer => peer.id === id)?.name);
 	const updatedAt = host.now();
+	const config = pruneConfig(host.home);
+	const running = new Set(live.map(peer => peer.id));
 	return updateState<BoardState, BoardResult>(boardFile(host.home), emptyState, validateState, current => {
 		const existing = current.entries.find(e => e.session === id);
 		if (!existing) return { result: { ok: false, error: `no board entry for ${id}; assign it a task first` } };
+		const kept = pruned(current.entries, config, id, updatedAt, running);
 		const entry: BoardEntry = { ...existing, name: liveName || existing.name, status: next as BoardStatus, source: "assignment", updatedAt, updatedBy: self.id };
 		// A note describes one status; a new status starts without the previous note.
 		if (note) entry.note = note;
 		else delete entry.note;
-		return { state: { version: 1, entries: upsert(current.entries, entry) }, result: { ok: true, entry } };
+		return { state: { version: 1, entries: upsert(kept.entries, entry) }, result: { ok: true, entry, ...(kept.dropped ? { pruned: kept.dropped } : {}) } };
 	});
 }
 
@@ -237,9 +334,17 @@ export async function recordReport(host: FeatureHost, report: Report, from: { id
 	const unit = storableUnit(report.unit);
 	const name = cleanName(from.name);
 	const updatedAt = host.now();
+	const config = pruneConfig(host.home);
+	let running: Set<string> | undefined;
+	try {
+		running = new Set((await host.peers()).map(peer => peer.id));
+	} catch {
+		running = undefined; // liveness unknown: only finished entries may be pruned
+	}
 	await updateState<BoardState, void>(boardFile(host.home), emptyState, validateState, current => {
 		const existing = current.entries.find(e => e.session === from.id);
-		if (!existing && current.entries.length >= MAX_ENTRIES) throw new Error(`board limit reached (${MAX_ENTRIES} entries); report from ${from.id} not recorded`);
+		const kept = pruned(current.entries, config, from.id, updatedAt, running);
+		if (!existing && kept.entries.length >= config.maxEntries) throw new Error(`${fullMessage(config.maxEntries)}; report from ${from.id} not recorded`);
 		const entry: BoardEntry = {
 			session: from.id,
 			name: name || existing?.name || "",
@@ -250,7 +355,7 @@ export async function recordReport(host: FeatureHost, report: Report, from: { id
 			updatedAt,
 			updatedBy: from.id,
 		};
-		return { state: { version: 1, entries: upsert(current.entries, entry) }, result: undefined };
+		return { state: { version: 1, entries: upsert(kept.entries, entry) }, result: undefined };
 	});
 }
 
@@ -295,6 +400,8 @@ function renderEntries(entries: BoardEntry[], live: PeerView[], now: number, hou
 	});
 }
 
+const prunedNote = (result: { pruned?: number }) => (result.pruned ? `; pruned ${result.pruned} old finished entr${result.pruned === 1 ? "y" : "ies"}` : "");
+
 const USAGE = "usage: /peers board [list] | assign <peer> <task> | set <peer> <status> [note] | clear <peer> | stale [<hours>]";
 
 async function command(args: string[], host: FeatureHost): Promise<string> {
@@ -314,14 +421,14 @@ async function command(args: string[], host: FeatureHost): Promise<string> {
 				if (!peer || !task.length) return USAGE;
 				const result = await assignTask(host, peer, task.join(" "));
 				if (!result.ok) return `error: ${result.error}`;
-				return `assigned ${result.entry.name ? `${result.entry.name} ` : ""}(${result.entry.session}): ${result.entry.task}; recorded only: nothing was sent to that session`;
+				return `assigned ${result.entry.name ? `${result.entry.name} ` : ""}(${result.entry.session}): ${result.entry.task}; recorded only: nothing was sent to that session${prunedNote(result)}`;
 			}
 			case "set": {
 				const [peer, status, ...note] = rest;
 				if (!peer || !status) return USAGE;
 				const result = await setStatus(host, peer, status, note.join(" "));
 				if (!result.ok) return `error: ${result.error}`;
-				return `set ${result.entry.name ? `${result.entry.name} ` : ""}(${result.entry.session}) to ${result.entry.status}; recorded only: nothing was sent to that session`;
+				return `set ${result.entry.name ? `${result.entry.name} ` : ""}(${result.entry.session}) to ${result.entry.status}; recorded only: nothing was sent to that session${prunedNote(result)}`;
 			}
 			case "clear": {
 				if (rest.length !== 1) return USAGE;

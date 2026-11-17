@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { FEATURES } from "../../lib/features";
-import { assignTask, board, boardFile, clearEntry, formatAge, isStale, recordReport, setStatus, staleConfig, type BoardState, type BoardStatus } from "../../lib/features/board";
+import { assignTask, board, boardFile, clearEntry, formatAge, isPrunable, isStale, pruneConfig, recordReport, setStatus, staleConfig, type BoardState, type BoardStatus } from "../../lib/features/board";
 import type { FeatureHost, PeerView } from "../../lib/features/host";
 import type { Report } from "../../lib/reports";
 import { stateRoot } from "../../lib/features/store";
@@ -329,13 +329,161 @@ describe("command output", () => {
 		expect(await run("clear worker-a")).toBe(`cleared worker-a (${A})`);
 	});
 
-	test("the board is capped and a full board rejects new entries without losing old ones", async () => {
-		const entries = Array.from({ length: 200 }, (_, i) => ({ session: `p${String(i).padStart(16, "0")}`, name: `s${i}`, status: "done", source: "report", updatedAt: T0, updatedBy: A }));
-		fs.mkdirSync(stateRoot(home), { recursive: true });
-		fs.writeFileSync(boardFile(home), JSON.stringify({ version: 1, entries }));
-		expect(await assignTask(master(), "worker-a", "one more")).toEqual({ ok: false, error: "board limit reached (200 entries); clear an entry first" });
-		await expect(recordReport(master(), done, { id: A, name: "worker-a" })).rejects.toThrow("board limit reached");
+	test("a board full of pending work is capped: new entries are rejected and nothing is lost", async () => {
+		putEntries(200, "blocked");
+		expect(await assignTask(master(), "worker-a", "one more")).toEqual({ ok: false, error: "board limit reached (200 entries) and no finished entry can be pruned; clear an entry first" });
+		await expect(recordReport(master(), done, { id: A, name: "worker-a" })).rejects.toThrow("board limit reached (200 entries) and no finished entry can be pruned; clear an entry first; report from");
 		expect(stored().entries).toHaveLength(200);
+		expect(stored().entries.every(e => e.status === "blocked")).toBe(true);
+	});
+});
+
+const DAY = 24 * HOUR;
+const sid = (i: number) => `p${String(i).padStart(16, "0")}`;
+function putEntries(count: number, status: BoardStatus, updatedAt = T0, offset = 0): void {
+	const entries = Array.from({ length: count }, (_, i) => ({ session: sid(i + offset), name: `s${i + offset}`, status, source: "report", updatedAt, updatedBy: A }));
+	fs.mkdirSync(stateRoot(home), { recursive: true });
+	fs.writeFileSync(boardFile(home), JSON.stringify({ version: 1, entries }));
+}
+function putBoard(entries: Array<{ session: string; status: BoardStatus; updatedAt: number }>): void {
+	fs.mkdirSync(stateRoot(home), { recursive: true });
+	fs.writeFileSync(boardFile(home), JSON.stringify({ version: 1, entries: entries.map(e => ({ ...e, name: `n-${e.session.slice(-3)}`, source: "report", updatedBy: A })) }));
+}
+function putConfig(board: unknown): void {
+	const cfg = path.join(home, ".omp", "agent");
+	fs.mkdirSync(cfg, { recursive: true });
+	fs.writeFileSync(path.join(cfg, "peers.json"), JSON.stringify({ board }));
+}
+
+describe("auto-prune of old finished entries", () => {
+	test("classification: pending work is never prunable; finished is; unknown only when the session is not running", () => {
+		const make = (status: BoardStatus) => ({ session: A, name: "a", status, source: "report" as const, updatedAt: T0, updatedBy: A });
+		const running = new Set([A]);
+		for (const status of ["assigned", "in-progress", "blocked", "waiting", "decision"] as BoardStatus[]) {
+			expect(isPrunable(make(status), running)).toBe(false);
+			expect(isPrunable(make(status), new Set())).toBe(false);
+			expect(isPrunable(make(status), undefined)).toBe(false);
+		}
+		expect(isPrunable(make("done"), running)).toBe(true);
+		expect(isPrunable(make("done"), undefined)).toBe(true);
+		expect(isPrunable(make("unknown"), running)).toBe(false);
+		expect(isPrunable(make("unknown"), new Set())).toBe(true);
+		expect(isPrunable(make("unknown"), undefined)).toBe(false); // liveness unreadable: never guess
+	});
+
+	test("old finished entries are dropped on the next write; fresh finished, pending and running entries stay", async () => {
+		now = T0 + 30 * DAY;
+		live = [{ id: MASTER, name: "master" }, { id: A, name: "worker-a" }, { id: B, name: "worker-b" }];
+		putBoard([
+			{ session: sid(1), status: "done", updatedAt: T0 }, // 30 days: dropped
+			{ session: sid(2), status: "done", updatedAt: now - 6 * DAY }, // fresh enough: kept
+			{ session: sid(3), status: "blocked", updatedAt: T0 }, // pending: kept however old
+			{ session: sid(4), status: "unknown", updatedAt: T0 }, // not running, old: dropped
+			{ session: B, status: "unknown", updatedAt: T0 }, // running: kept
+			{ session: sid(5), status: "assigned", updatedAt: T0 },
+		]);
+		const result = await ok(assignTask(master(), "worker-a", "next job"));
+		expect(result.pruned).toBe(2);
+		expect(stored().entries.map(e => e.session).sort()).toEqual([sid(2), sid(3), sid(5), A, B].sort());
+		expect(await run("assign worker-b again")).toBe(`assigned worker-b (${B}): again; recorded only: nothing was sent to that session`);
+	});
+
+	test("the output says how many entries a write pruned", async () => {
+		now = T0 + 30 * DAY;
+		putBoard([{ session: sid(1), status: "done", updatedAt: T0 }, { session: sid(2), status: "done", updatedAt: T0 }]);
+		expect(await run("assign worker-a job")).toBe(`assigned worker-a (${A}): job; recorded only: nothing was sent to that session; pruned 2 old finished entries`);
+		putBoard([{ session: sid(1), status: "done", updatedAt: T0 }, { session: A, status: "assigned", updatedAt: T0 }]);
+		expect(await run("set worker-a in-progress")).toBe(`set worker-a (${A}) to in-progress; recorded only: nothing was sent to that session; pruned 1 old finished entry`);
+	});
+
+	test("at the cap the oldest finished entries make room, oldest first with ties by id; pending entries survive", async () => {
+		putConfig({ maxEntries: 10, pruneDays: 0 });
+		putBoard([
+			...Array.from({ length: 4 }, (_, i) => ({ session: sid(i + 1), status: "blocked" as BoardStatus, updatedAt: T0 + i })),
+			{ session: sid(20), status: "done", updatedAt: T0 + 50 },
+			{ session: sid(21), status: "done", updatedAt: T0 + 10 },
+			{ session: sid(22), status: "done", updatedAt: T0 + 10 }, // same time as 21: the lower id goes first
+			{ session: sid(23), status: "done", updatedAt: T0 + 30 },
+			{ session: sid(24), status: "assigned", updatedAt: T0 + 5 },
+			{ session: sid(25), status: "decision", updatedAt: T0 + 6 },
+		]);
+		expect(stored().entries).toHaveLength(10);
+		const first = await ok(assignTask(master(), "worker-a", "makes room"));
+		expect(first.pruned).toBe(1);
+		expect(stored().entries.map(e => e.session)).not.toContain(sid(21));
+		expect(stored().entries).toHaveLength(10);
+		now += 1;
+		const second = await ok(assignTask(master(), "worker-b", "makes more room"));
+		expect(second.pruned).toBe(1);
+		expect(stored().entries.map(e => e.session)).not.toContain(sid(22));
+		// Pending work was never touched.
+		for (const id of [1, 2, 3, 4, 24, 25]) expect(stored().entries.map(e => e.session)).toContain(sid(id));
+		expect(stored().entries).toHaveLength(10);
+	});
+
+	test("updating an existing entry at the cap prunes only by age and never needs room", async () => {
+		putConfig({ maxEntries: 10, pruneDays: 0 });
+		putBoard([...Array.from({ length: 9 }, (_, i) => ({ session: sid(i + 1), status: "blocked" as BoardStatus, updatedAt: T0 })), { session: A, status: "assigned", updatedAt: T0 }]);
+		const result = await ok(setStatus(master(), "worker-a", "done"));
+		expect(result.pruned).toBeUndefined();
+		expect(stored().entries).toHaveLength(10);
+	});
+
+	test("a report from a new session prunes to fit, and with unreadable liveness it prunes only finished entries", async () => {
+		putConfig({ maxEntries: 10, pruneDays: 0 });
+		putBoard([...Array.from({ length: 8 }, (_, i) => ({ session: sid(i + 1), status: "blocked" as BoardStatus, updatedAt: T0 })), { session: sid(30), status: "unknown", updatedAt: T0 }, { session: sid(31), status: "done", updatedAt: T0 + 5 }]);
+		const h = master();
+		const broken: FeatureHost = { ...h, peers: async () => { throw new Error("registry unreadable"); } };
+		await recordReport(broken, done, { id: A, name: "worker-a" });
+		// Only the finished entry was a candidate: the unknown one might belong to a running session.
+		expect(stored().entries.map(e => e.session)).toContain(sid(30));
+		expect(stored().entries.map(e => e.session)).not.toContain(sid(31));
+		expect(entry(A)).toMatchObject({ status: "done" });
+		await recordReport(h, done, { id: B, name: "worker-b" });
+		expect(stored().entries.map(e => e.session)).not.toContain(sid(30)); // running registry readable: unknown + not running is prunable
+		expect(stored().entries).toHaveLength(10);
+	});
+
+	test("the cap and the age come from peers.json board.maxEntries and board.pruneDays; bad values fall back with a warning", () => {
+		expect(pruneConfig(home)).toEqual({ maxEntries: 200, pruneDays: 7, warnings: [] });
+		putConfig({ maxEntries: 10, pruneDays: 0 });
+		expect(pruneConfig(home)).toEqual({ maxEntries: 10, pruneDays: 0, warnings: [] });
+		putConfig({ maxEntries: 1000, pruneDays: 3650 });
+		expect(pruneConfig(home)).toEqual({ maxEntries: 1000, pruneDays: 3650, warnings: [] });
+		for (const bad of [9, 1001, 10.5, "50", null]) {
+			putConfig({ maxEntries: bad });
+			expect(pruneConfig(home)).toEqual({ maxEntries: 200, pruneDays: 7, warnings: ["board.maxEntries must be an integer from 10 to 1000; using 200"] });
+		}
+		for (const bad of [-1, 3651, "7", Number.NaN]) {
+			putConfig({ pruneDays: bad });
+			expect(pruneConfig(home).pruneDays).toBe(7);
+			expect(pruneConfig(home).warnings).toEqual(["board.pruneDays must be a number from 0 (never by age) to 3650; using 7"]);
+		}
+		fs.writeFileSync(path.join(home, ".omp", "agent", "peers.json"), "{broken");
+		expect(pruneConfig(home)).toEqual({ maxEntries: 200, pruneDays: 7, warnings: ["peers.json is not valid JSON; board prune settings use their defaults"] });
+	});
+
+	test("a larger configured cap lets the board grow past 200 and a stored board above the old cap still loads", async () => {
+		putConfig({ maxEntries: 300 });
+		putEntries(250, "blocked");
+		expect(await ok(assignTask(master(), "worker-a", "fits"))).toMatchObject({ ok: true });
+		expect(stored().entries).toHaveLength(251);
+	});
+
+	test("lowering the cap below the stored size never drops pending entries; new sessions are refused until room appears", async () => {
+		putConfig({ maxEntries: 10 });
+		putEntries(20, "blocked");
+		expect(await assignTask(master(), "worker-a", "nope")).toEqual({ ok: false, error: "board limit reached (10 entries) and no finished entry can be pruned; clear an entry first" });
+		expect(stored().entries).toHaveLength(20);
+	});
+
+	test("pruning is not done by read-only commands", async () => {
+		now = T0 + 30 * DAY;
+		putBoard([{ session: sid(1), status: "done", updatedAt: T0 }]);
+		const before = fs.readFileSync(boardFile(home));
+		await run("list");
+		await run("stale");
+		expect(fs.readFileSync(boardFile(home)).equals(before)).toBe(true);
 	});
 });
 
