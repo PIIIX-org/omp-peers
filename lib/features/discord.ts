@@ -21,7 +21,6 @@
  * - State is one cross-process-locked file. A send or a poll is CLAIMED under the lock before the network is
  *   touched, so two processes never both do the same work.
  */
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Report } from "../reports";
